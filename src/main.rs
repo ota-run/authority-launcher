@@ -5,6 +5,8 @@
 
 #[cfg(unix)]
 mod config;
+#[cfg(test)]
+mod reference_peer;
 #[cfg(unix)]
 mod unix;
 
@@ -63,12 +65,19 @@ fn run(authority_id: &str, ota_args: &[String]) -> Result<u8, String> {
             .map_err(|error| error.to_string())?;
         let core_binding = config::load_core_binding(CROSSING_BROKER_STORE_PATH, authority_id)
             .map_err(|error| error.to_string())?;
-        let broker_session_descriptor = config
+        let session = config
             .session(authority_id)
-            .map_err(|error| error.to_string())?
-            .broker_session_descriptor;
-        unix::launch(config, broker_session_descriptor, core_binding, ota_args)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        let broker_session_descriptor = session.broker_session_descriptor;
+        let expected_peer = session.expected_peer;
+        unix::launch(
+            config,
+            broker_session_descriptor,
+            expected_peer,
+            core_binding,
+            ota_args,
+        )
+        .map_err(|error| error.to_string())
     }
 
     #[cfg(not(unix))]

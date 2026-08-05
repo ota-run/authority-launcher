@@ -51,6 +51,14 @@ pub(crate) struct RunAs {
 pub(crate) struct LauncherSessionBinding {
     pub authority_id: String,
     pub broker_session_descriptor: i32,
+    pub expected_peer: SessionPeer,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionPeer {
+    pub uid: u32,
+    pub gid: u32,
 }
 
 impl LauncherConfig {
@@ -247,6 +255,7 @@ mod tests {
             sessions: vec![LauncherSessionBinding {
                 authority_id: String::from("release"),
                 broker_session_descriptor: 4,
+                expected_peer: SessionPeer { uid: 0, gid: 0 },
             }],
         };
         assert!(validate_launcher_config(&config).is_err());
@@ -260,10 +269,12 @@ mod tests {
                 LauncherSessionBinding {
                     authority_id: String::from("release"),
                     broker_session_descriptor: 4,
+                    expected_peer: SessionPeer { uid: 0, gid: 0 },
                 },
                 LauncherSessionBinding {
                     authority_id: String::from("release"),
                     broker_session_descriptor: 5,
+                    expected_peer: SessionPeer { uid: 0, gid: 0 },
                 },
             ],
             ..config

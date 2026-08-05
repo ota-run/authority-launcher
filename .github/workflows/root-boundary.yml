@@ -6,6 +6,7 @@
 name: Root boundary proof
 
 on:
+  pull_request:
   workflow_dispatch:
 
 permissions:

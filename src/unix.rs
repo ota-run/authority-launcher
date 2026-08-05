@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-use crate::config::{CoreBindingSelection, LauncherConfig};
+use crate::config::{CoreBindingSelection, LauncherConfig, SessionPeer};
 
 #[derive(Debug, Error)]
 pub(crate) enum LauncherError {
@@ -25,6 +25,8 @@ pub(crate) enum LauncherError {
     MissingBrokerSession,
     #[error("the protected broker session is not a connected Unix stream")]
     InvalidBrokerSession,
+    #[error("the protected broker session peer does not match administrator-owned configuration")]
+    BrokerPeerMismatch,
     #[error("the Ota launcher session could not be created")]
     SessionCreation,
     #[error("the protected Ota process could not be started")]
@@ -42,25 +44,33 @@ pub(crate) enum LauncherError {
 pub(crate) fn launch(
     config: LauncherConfig,
     broker_session_descriptor: RawFd,
+    expected_peer: SessionPeer,
     core_binding: CoreBindingSelection,
     ota_args: &[String],
 ) -> Result<u8, LauncherError> {
     if unsafe { libc::geteuid() } != 0 {
         return Err(LauncherError::RootRequired);
     }
-    launch_inner(config, broker_session_descriptor, core_binding, ota_args)
+    launch_inner(
+        config,
+        broker_session_descriptor,
+        expected_peer,
+        core_binding,
+        ota_args,
+    )
 }
 
 fn launch_inner(
     config: LauncherConfig,
     broker_session_descriptor: RawFd,
+    expected_peer: SessionPeer,
     core_binding: CoreBindingSelection,
     ota_args: &[String],
 ) -> Result<u8, LauncherError> {
     if broker_session_descriptor == core_binding.ota_session_descriptor {
         return Err(LauncherError::InvalidBrokerSession);
     }
-    let broker = take_connected_unix_stream(broker_session_descriptor)?;
+    let broker = take_connected_unix_stream(broker_session_descriptor, expected_peer)?;
     let (launcher, ota) = UnixStream::pair().map_err(|_| LauncherError::SessionCreation)?;
     set_cloexec(launcher.as_raw_fd(), true).map_err(|_| LauncherError::SessionCreation)?;
     set_cloexec(ota.as_raw_fd(), true).map_err(|_| LauncherError::SessionCreation)?;
@@ -219,7 +229,10 @@ fn copy_and_shutdown(
     Ok(())
 }
 
-fn take_connected_unix_stream(descriptor: RawFd) -> Result<UnixStream, LauncherError> {
+fn take_connected_unix_stream(
+    descriptor: RawFd,
+    expected_peer: SessionPeer,
+) -> Result<UnixStream, LauncherError> {
     if descriptor < 3 {
         return Err(LauncherError::MissingBrokerSession);
     }
@@ -229,9 +242,45 @@ fn take_connected_unix_stream(descriptor: RawFd) -> Result<UnixStream, LauncherE
     }
     reject_standard_stream_alias(descriptor)?;
     verify_connected_unix_stream(descriptor)?;
+    verify_peer_identity(descriptor, expected_peer)?;
     set_cloexec(descriptor, true).map_err(|_| LauncherError::InvalidBrokerSession)?;
     // SAFETY: F_GETFD proved this descriptor is open, and the launcher now takes sole ownership.
     Ok(unsafe { UnixStream::from_raw_fd(descriptor) })
+}
+
+#[cfg(target_os = "linux")]
+fn verify_peer_identity(descriptor: RawFd, expected: SessionPeer) -> Result<(), LauncherError> {
+    let mut observed: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            descriptor,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut observed as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 || observed.uid != expected.uid || observed.gid != expected.gid {
+        return Err(LauncherError::BrokerPeerMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_peer_identity(descriptor: RawFd, expected: SessionPeer) -> Result<(), LauncherError> {
+    let mut uid = 0_u32;
+    let mut gid = 0_u32;
+    let result = unsafe { libc::getpeereid(descriptor, &mut uid, &mut gid) };
+    if result != 0 || uid != expected.uid || gid != expected.gid {
+        return Err(LauncherError::BrokerPeerMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn verify_peer_identity(_descriptor: RawFd, _expected: SessionPeer) -> Result<(), LauncherError> {
+    Err(LauncherError::BrokerPeerMismatch)
 }
 
 fn reject_standard_stream_alias(descriptor: RawFd) -> Result<(), LauncherError> {
@@ -427,17 +476,37 @@ mod tests {
     use super::*;
     use crate::config::{LauncherConfig, RunAs};
 
+    fn current_peer() -> SessionPeer {
+        SessionPeer {
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+        }
+    }
+
     #[test]
     fn connected_unix_stream_is_required_and_made_non_inheritable() {
         let (stream, _peer) = UnixStream::pair().expect("socket pair");
         let descriptor = stream.into_raw_fd();
-        let owned = take_connected_unix_stream(descriptor).expect("connected stream");
+        let owned =
+            take_connected_unix_stream(descriptor, current_peer()).expect("connected stream");
         let flags = unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_GETFD) };
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
 
+        let (mismatched, _peer) = UnixStream::pair().expect("mismatched pair");
+        let descriptor = mismatched.into_raw_fd();
+        let mut wrong_peer = current_peer();
+        wrong_peer.uid = wrong_peer.uid.saturating_add(1);
+        assert!(matches!(
+            take_connected_unix_stream(descriptor, wrong_peer),
+            Err(LauncherError::BrokerPeerMismatch)
+        ));
+        unsafe {
+            libc::close(descriptor);
+        }
+
         let mut pipe = [0_i32; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-        assert!(take_connected_unix_stream(pipe[0]).is_err());
+        assert!(take_connected_unix_stream(pipe[0], current_peer()).is_err());
         unsafe {
             libc::close(pipe[0]);
             libc::close(pipe[1]);
@@ -445,14 +514,14 @@ mod tests {
 
         let datagram = UnixDatagram::unbound().expect("Unix datagram");
         let datagram_descriptor = datagram.into_raw_fd();
-        assert!(take_connected_unix_stream(datagram_descriptor).is_err());
+        assert!(take_connected_unix_stream(datagram_descriptor, current_peer()).is_err());
         unsafe {
             libc::close(datagram_descriptor);
         }
 
         let unconnected = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
         assert!(unconnected >= 0);
-        assert!(take_connected_unix_stream(unconnected).is_err());
+        assert!(take_connected_unix_stream(unconnected, current_peer()).is_err());
         unsafe {
             libc::close(unconnected);
         }
@@ -493,6 +562,61 @@ mod tests {
     }
 
     #[test]
+    fn bridge_preserves_core_protocol_frames_byte_for_byte() {
+        fn frame(payload: &[u8]) -> Vec<u8> {
+            let mut framed = Vec::with_capacity(4 + payload.len());
+            framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            framed.extend_from_slice(payload);
+            framed
+        }
+
+        let request_payloads: [&[u8]; 3] = [
+            br#"{"message_kind":"challenge_request"}"#,
+            br#"{"message_kind":"authorization_request"}"#,
+            br#"{"message_kind":"lease_consume"}"#,
+        ];
+        let response_payloads: [&[u8]; 4] = [
+            br#"{"message_kind":"attestation_response"}"#,
+            br#"{"message_kind":"authorization_decision"}"#,
+            br#"{"message_kind":"lease_issuance"}"#,
+            br#"{"message_kind":"lease_consume_response"}"#,
+        ];
+        let requests = request_payloads
+            .iter()
+            .flat_map(|payload| frame(payload))
+            .collect::<Vec<_>>();
+        let responses = response_payloads
+            .iter()
+            .flat_map(|payload| frame(payload))
+            .collect::<Vec<_>>();
+
+        let (mut ota_client, ota_launcher) = UnixStream::pair().expect("ota pair");
+        let (broker_launcher, mut broker_server) = UnixStream::pair().expect("broker pair");
+        let bridge = start_bridge(&ota_launcher, &broker_launcher).expect("bridge");
+
+        ota_client.write_all(requests.as_slice()).expect("requests");
+        ota_client.shutdown(Shutdown::Write).expect("ota shutdown");
+        let mut observed_requests = Vec::new();
+        broker_server
+            .read_to_end(&mut observed_requests)
+            .expect("read requests");
+        assert_eq!(observed_requests, requests);
+
+        broker_server
+            .write_all(responses.as_slice())
+            .expect("responses");
+        broker_server
+            .shutdown(Shutdown::Write)
+            .expect("broker shutdown");
+        let mut observed_responses = Vec::new();
+        ota_client
+            .read_to_end(&mut observed_responses)
+            .expect("read responses");
+        assert_eq!(observed_responses, responses);
+        finish_bridge(bridge).expect("bridge joins");
+    }
+
+    #[test]
     fn child_exec_inherits_only_the_ota_session_descriptor() {
         const OTA_DESCRIPTOR: RawFd = 197;
         const BROKER_DESCRIPTOR: RawFd = 198;
@@ -529,6 +653,7 @@ mod tests {
         let result = launch_inner(
             config,
             BROKER_DESCRIPTOR,
+            current_peer(),
             CoreBindingSelection {
                 ota_session_descriptor: OTA_DESCRIPTOR,
             },
@@ -553,6 +678,7 @@ mod tests {
             launch(
                 config,
                 999,
+                current_peer(),
                 CoreBindingSelection {
                     ota_session_descriptor: 3,
                 },
@@ -639,6 +765,7 @@ mod tests {
         let result = launch_inner(
             config,
             BROKER_DESCRIPTOR,
+            current_peer(),
             CoreBindingSelection {
                 ota_session_descriptor: OTA_DESCRIPTOR,
             },

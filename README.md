@@ -134,7 +134,8 @@ has this initial shape:
   "sessions": [
     {
       "authority_id": "platform-release-authority",
-      "broker_session_descriptor": 4
+      "broker_session_descriptor": 4,
+      "expected_peer": { "uid": 0, "gid": 0 }
     }
   ]
 }
