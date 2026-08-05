@@ -1,0 +1,232 @@
+#                █████
+#               ░░███
+#       ██████  ███████    ██████
+#      ███░░███░░░███░    ░░░░░███
+#     ░███ ░███  ░███      ███████
+#     ░███ ░███  ░███ ███ ███░░███
+#     ░░██████   ░░█████ ░░████████
+#      ░░░░░░     ░░░░░   ░░░░░░░░
+#
+#   Copyright (C) 2026 — 2026, Ota. All Rights Reserved.
+#
+#   DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+#
+#   Licensed under the Apache License, Version 2.0. See LICENSE for the full license text.
+#   You may not use this file except in compliance with the License.
+#   Unless required by applicable law or agreed to in writing, software distributed under the
+#   License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+#   either express or implied. See the License for the specific language governing permissions
+#   and limitations under the License.
+#
+#   If you need additional information or have any questions, please email: os@ota.run
+
+name: Root boundary proof
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  root-boundary:
+    name: Prove root-to-job-principal boundary
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+          components: clippy,rustfmt
+
+      - name: Install contract-selected Ota
+        id: ota
+        uses: ota-run/setup@493cba84bf7f7c11c9e8e996d832d93a89c62184
+        with:
+          source: contract
+          contract-path: ota.yaml
+
+      - name: Verify exact Ota source identity
+        env:
+          EXPECTED_OTA_REVISION: 2d22d9804c30ef66376a5349e5ae3290b8664006
+          OBSERVED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
+        run: test "$OBSERVED_OTA_REVISION" = "$EXPECTED_OTA_REVISION"
+
+      - name: Prove root boundary
+        env:
+          ROOT_TEST_TARGET: ${{ runner.temp }}/authority-launcher-root-target
+        run: |
+          CARGO_BIN_DIR="$(dirname "$(command -v cargo)")"
+          OBSERVED_RUSTUP_HOME="$(rustup show home)"
+          sudo env \
+            PATH="$CARGO_BIN_DIR:/usr/bin:/bin" \
+            RUSTUP_HOME="$OBSERVED_RUSTUP_HOME" \
+            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            CARGO_TARGET_DIR="$ROOT_TEST_TARGET" \
+            cargo test unix::tests::root_launch_drops_uid_gid_and_supplementary_groups -- --exact
+
+      - name: Build pressure-only signed peer
+        run: cargo build --features pressure-peer --bins
+
+      - name: Install protected pressure binaries and authority binding
+        run: |
+          sudo install -d -o root -g root -m 0755 /usr/lib/ota-authority/bin
+          sudo install -d -o root -g root -m 0755 /etc/ota /var/lib/ota
+          sudo install -o root -g root -m 0755 "$(command -v ota)" /usr/lib/ota-authority/bin/ota-pressure-core
+          sudo install -o root -g root -m 0755 target/debug/ota-authority-launcher /usr/lib/ota-authority/bin/ota-authority-launcher
+          sudo install -o root -g root -m 0755 target/debug/ota-authority-pressure-peer /usr/lib/ota-authority/bin/ota-authority-pressure-peer
+          sudo /usr/lib/ota-authority/bin/ota-authority-pressure-peer provision \
+            --ota-binary /usr/lib/ota-authority/bin/ota-pressure-core \
+            --run-uid "$(id -u)" \
+            --run-gid "$(id -g)" \
+            --run-home "$HOME"
+          test "$(stat -c '%U:%G:%a' /etc/ota/crossing-brokers.json)" = "root:root:644"
+          test "$(stat -c '%U:%G:%a' /etc/ota/authority-launcher.json)" = "root:root:600"
+          namei -l /etc/ota/authority-launcher.json /etc/ota/crossing-brokers.json /usr/lib/ota-authority/bin/ota-pressure-core
+
+      - name: Exercise signed live and adversarial broker scenarios
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/authority-pressure-evidence
+          PRESSURE_ROOT: ${{ runner.temp }}/authority-pressure-repos
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR" "$PRESSURE_ROOT"
+
+          make_repo() {
+            local scenario="$1"
+            local repo="$PRESSURE_ROOT/$scenario"
+            mkdir -p "$repo"
+            cat > "$repo/ota.yaml" <<'YAML'
+          version: 1
+          project:
+            name: authority-pressure
+          governance:
+            crossing_authority:
+              authority_id: platform-release-authority
+          tasks:
+            publish:
+              command:
+                exe: ./pressure-task.sh
+              safe_for_agent: false
+          YAML
+            cat > "$repo/pressure-task.sh" <<'SH'
+          #!/bin/sh
+          set -eu
+          for fd in /proc/$$/fd/*; do
+            target=$(readlink "$fd" 2>/dev/null || true)
+            case "$target" in
+              socket:*) echo "broker descriptor leaked into task" >&2; exit 97 ;;
+            esac
+          done
+          touch broker-executed
+          SH
+            chmod 0755 "$repo/pressure-task.sh"
+            printf '.ota/\n' > "$repo/.gitignore"
+            (
+              cd "$repo"
+              find . -path './.ota' -prune -o -printf '%y %P %l\n' | sort
+              find . -path './.ota' -prune -o -type f -print0 | sort -z | xargs -0 sha256sum
+            ) > "$EVIDENCE_DIR/$scenario.before"
+          }
+
+          for scenario in live expired revoked wrong-scope replay; do
+            make_repo "$scenario"
+            repo="$PRESSURE_ROOT/$scenario"
+            output="$EVIDENCE_DIR/$scenario.output"
+            if [[ "$scenario" == live ]]; then
+              (
+                cd "$repo"
+                sudo /usr/lib/ota-authority/bin/ota-authority-pressure-peer execute \
+                  --launcher /usr/lib/ota-authority/bin/ota-authority-launcher \
+                  --scenario "$scenario" \
+                  -- run publish --grant platform-release-authority --reason pressure
+              ) >"$output" 2>&1
+              test -f "$repo/broker-executed"
+              (
+                cd "$repo"
+                ota receipt --history --json
+              ) > "$EVIDENCE_DIR/live.receipt-history.json"
+              jq -e '.summary.archive_count == 1 and .summary.invalid_archive_count == 0' \
+                "$EVIDENCE_DIR/live.receipt-history.json"
+              archive_path=$(jq -r '.archives[0].archive_path' "$EVIDENCE_DIR/live.receipt-history.json")
+              if [[ "$archive_path" != /* ]]; then
+                archive_path="$repo/$archive_path"
+              fi
+              jq -e '
+                .receipt.crossing.authority.authority_carrier == "authority_broker" and
+                .receipt.crossing.authority.transaction.state == "completed" and
+                .receipt.crossing.authority.transaction.broker_consumption.consume_response.payload.state == "consumed" and
+                .receipt.crossing.id == .receipt.crossing.authority.transaction.transaction_id and
+                .receipt.crossing.authority.transaction.identity == .receipt.crossing.authority.archive_evidence.transaction.identity
+              ' "$archive_path"
+              cp "$archive_path" "$EVIDENCE_DIR/live.receipt-archive.json"
+            else
+              if (
+                cd "$repo"
+                sudo /usr/lib/ota-authority/bin/ota-authority-pressure-peer execute \
+                  --launcher /usr/lib/ota-authority/bin/ota-authority-launcher \
+                  --scenario "$scenario" \
+                  -- run publish --grant platform-release-authority --reason pressure
+              ) >"$output" 2>&1; then
+                echo "$scenario unexpectedly executed" >&2
+                exit 1
+              fi
+              test ! -e "$repo/broker-executed"
+              (
+                cd "$repo"
+                find . -path './.ota' -prune -o -printf '%y %P %l\n' | sort
+                find . -path './.ota' -prune -o -type f -print0 | sort -z | xargs -0 sha256sum
+              ) > "$EVIDENCE_DIR/$scenario.after"
+              cmp "$EVIDENCE_DIR/$scenario.before" "$EVIDENCE_DIR/$scenario.after"
+              test ! -e "$repo/.ota/receipts"
+              test ! -e "$repo/.ota/contracts"
+              case "$scenario" in
+                expired)
+                  test ! -e "$repo/.ota"
+                  grep -q 'crossing_broker_admission_refused' "$output"
+                  grep -q 'pressure-peer-scenario: expired-decision' "$output"
+                  ;;
+                wrong-scope)
+                  test ! -e "$repo/.ota"
+                  grep -q 'crossing_broker_admission_refused' "$output"
+                  grep -q 'pressure-peer-scenario: wrong-scope-decision' "$output"
+                  ;;
+                revoked)
+                  test -d "$repo/.ota/state/crossings"
+                  test -z "$(cd "$repo" && find .ota -mindepth 1 \
+                    ! -path '.ota/state' \
+                    ! -path '.ota/state/crossings' \
+                    ! -path '.ota/state/crossings/*' -print -quit)"
+                  grep -q 'crossing_broker_consumption_refused' "$output"
+                  grep -q 'pressure-peer-scenario: revoked-consume' "$output"
+                  ;;
+                replay)
+                  test -d "$repo/.ota/state/crossings"
+                  test -z "$(cd "$repo" && find .ota -mindepth 1 \
+                    ! -path '.ota/state' \
+                    ! -path '.ota/state/crossings' \
+                    ! -path '.ota/state/crossings/*' -print -quit)"
+                  grep -q 'crossing_broker_consumption_refused' "$output"
+                  grep -q 'pressure-peer-scenario: already-consumed' "$output"
+                  ;;
+              esac
+            fi
+          done
+
+          ota --version --json > "$EVIDENCE_DIR/ota-version.json"
+          jq -e \
+            '.source_build == true and .dirty == false and .commit == "2d22d9804"' \
+            "$EVIDENCE_DIR/ota-version.json"
+
+      - name: Upload bounded pressure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: authority-launcher-pressure-${{ github.run_id }}
+          path: ${{ runner.temp }}/authority-pressure-evidence
+          if-no-files-found: error
+          retention-days: 14
