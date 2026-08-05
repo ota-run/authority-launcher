@@ -58,6 +58,7 @@ jobs:
       - name: Install protected pressure binaries and authority binding
         run: |
           sudo install -d -o root -g root -m 0755 /opt/ota-authority/bin
+          sudo install -d -o root -g root -m 0755 /etc/ota /var/lib/ota
           sudo install -o root -g root -m 0755 "$(command -v ota)" /opt/ota-authority/bin/ota-pressure-core
           sudo install -o root -g root -m 0755 target/debug/ota-authority-launcher /opt/ota-authority/bin/ota-authority-launcher
           sudo install -o root -g root -m 0755 target/debug/ota-authority-pressure-peer /opt/ota-authority/bin/ota-authority-pressure-peer
@@ -68,6 +69,7 @@ jobs:
             --run-home "$HOME"
           test "$(stat -c '%U:%G:%a' /etc/ota/crossing-brokers.json)" = "root:root:600"
           test "$(stat -c '%U:%G:%a' /etc/ota/authority-launcher.json)" = "root:root:600"
+          namei -l /etc/ota/authority-launcher.json /etc/ota/crossing-brokers.json /opt/ota-authority/bin/ota-pressure-core
 
       - name: Exercise signed live and adversarial broker scenarios
         env:
