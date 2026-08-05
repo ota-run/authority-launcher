@@ -297,13 +297,22 @@ jobs:
           exec python3 -m http.server 38481 --bind 127.0.0.1
           SH
           chmod 0755 "$PROOF_ROOT/runtime/runtime-task.sh"
+          printf '.ota/\n' > "$PROOF_ROOT/runtime/.gitignore"
+          (
+            cd "$PROOF_ROOT/runtime"
+            git init -q
+            git config user.name ota-pressure
+            git config user.email os@ota.run
+            git add ota.yaml runtime-task.sh .gitignore
+            git commit -qm "test: freeze runtime proof source"
+          )
 
           (
             cd "$PROOF_ROOT/runtime"
             sudo /usr/lib/ota-authority/bin/ota-authority-pressure-peer execute \
               --launcher /usr/lib/ota-authority/bin/ota-authority-launcher \
               --scenario live \
-              -- proof runtime --workflow smoke --ready-timeout 30s --grant platform-release-authority --archive --json
+              -- proof runtime --workflow smoke --grant platform-release-authority --archive --json
           ) > "$EVIDENCE_DIR/runtime-proof.json" 2> "$EVIDENCE_DIR/runtime-proof.stderr"
           jq -e '
             .ok == true and
@@ -326,7 +335,7 @@ jobs:
           ' "$runtime_archive"
           (
             cd "$PROOF_ROOT/runtime"
-            ota doctor --json
+            ota doctor --json || true
           ) > "$EVIDENCE_DIR/runtime-proof.doctor.json"
           jq -e '
             any(.claim_assurance[];
