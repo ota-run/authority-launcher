@@ -52,7 +52,7 @@ jobs:
 
       - name: Verify exact Ota source identity
         env:
-          EXPECTED_OTA_REVISION: 2d22d9804c30ef66376a5349e5ae3290b8664006
+          EXPECTED_OTA_REVISION: bd80b29d971ccd5ac8609d9fc767a491ff382ef8
           OBSERVED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
         run: test "$OBSERVED_OTA_REVISION" = "$EXPECTED_OTA_REVISION"
 
@@ -74,11 +74,31 @@ jobs:
 
       - name: Install protected pressure binaries and authority binding
         run: |
-          sudo install -d -o root -g root -m 0755 /usr/lib/ota-authority/bin
+          sudo install -d -o root -g root -m 0755 /usr/lib/ota-authority/bin /usr/lib/ota-authority/pressure-bin
           sudo install -d -o root -g root -m 0755 /etc/ota /var/lib/ota
           sudo install -o root -g root -m 0755 "$(command -v ota)" /usr/lib/ota-authority/bin/ota-pressure-core
           sudo install -o root -g root -m 0755 target/debug/ota-authority-launcher /usr/lib/ota-authority/bin/ota-authority-launcher
           sudo install -o root -g root -m 0755 target/debug/ota-authority-pressure-peer /usr/lib/ota-authority/bin/ota-authority-pressure-peer
+          pressure_docker=$(mktemp)
+          cat > "$pressure_docker" <<'SH'
+          #!/bin/sh
+          set -eu
+          for fd in /proc/$$/fd/*; do
+            target=$(readlink "$fd" 2>/dev/null || true)
+            case "$target" in
+              socket:*) echo "broker descriptor leaked into lifecycle manager" >&2; exit 97 ;;
+            esac
+          done
+          state_file="${HOME}/.ota-authority-pressure-compose-running"
+          case " $* " in
+            *" up -d "*) : > "$state_file" ;;
+            *" stop "*) rm -f "$state_file" ;;
+            *" ps "*) test ! -f "$state_file" || printf '%s\n' pressure-database ;;
+            *) echo "unsupported pressure manager invocation: $*" >&2; exit 64 ;;
+          esac
+          SH
+          sudo install -o root -g root -m 0755 "$pressure_docker" /usr/lib/ota-authority/pressure-bin/docker
+          rm -f "$pressure_docker"
           sudo /usr/lib/ota-authority/bin/ota-authority-pressure-peer provision \
             --ota-binary /usr/lib/ota-authority/bin/ota-pressure-core \
             --run-uid "$(id -u)" \
@@ -219,12 +239,241 @@ jobs:
 
           ota --version --json > "$EVIDENCE_DIR/ota-version.json"
           jq -e \
-            '.source_build == true and .dirty == false and .commit == "2d22d9804"' \
+            '.source_build == true and .dirty == false and .commit == "bd80b29d9"' \
             "$EVIDENCE_DIR/ota-version.json"
+
+      - name: Exercise proof-wide broker authority
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/authority-pressure-evidence
+          PROOF_ROOT: ${{ runner.temp }}/authority-proof-repos
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR" "$PROOF_ROOT/runtime" "$PROOF_ROOT/lifecycle"
+
+          cat > "$PROOF_ROOT/runtime/ota.yaml" <<'YAML'
+          version: 1
+          project:
+            name: authority-runtime-proof
+          governance:
+            crossing_authority:
+              authority_id: platform-release-authority
+          surfaces:
+            app:
+              kind: http
+              port: 38481
+              readiness:
+                kind: http
+                path: /
+                success:
+                  status: [200]
+          tasks:
+            app:
+              launch:
+                kind: command
+                exe: ./runtime-task.sh
+              runtime:
+                kind: service
+                listeners:
+                  app:
+                    protocol: http
+                    bind:
+                      address: 127.0.0.1
+                      port:
+                        mode: fixed
+                        value: 38481
+                    project:
+                      host:
+                        address: 127.0.0.1
+                        port:
+                          mode: fixed
+                          value: 38481
+                        path: /
+                        primary: true
+                surfaces: [app]
+                readiness:
+                  kind: http
+                  listener: app
+                  path: /
+              safe_for_agent: false
+          workflows:
+            default: smoke
+            smoke:
+              run:
+                task: app
+              readiness:
+                surfaces: [app]
+              proof:
+                claim: bounded
+          YAML
+          cat > "$PROOF_ROOT/runtime/runtime-task.sh" <<'SH'
+          #!/bin/sh
+          set -eu
+          for fd in /proc/$$/fd/*; do
+            target=$(readlink "$fd" 2>/dev/null || true)
+            case "$target" in
+              socket:*) echo "broker descriptor leaked into runtime task" >&2; exit 97 ;;
+            esac
+          done
+          exec python3 -m http.server 38481 --bind 127.0.0.1
+          SH
+          chmod 0755 "$PROOF_ROOT/runtime/runtime-task.sh"
+          printf '.ota/\n' > "$PROOF_ROOT/runtime/.gitignore"
+          (
+            cd "$PROOF_ROOT/runtime"
+            git init -q
+            git config user.name ota-pressure
+            git config user.email os@ota.run
+            git add ota.yaml runtime-task.sh .gitignore
+            git commit -qm "test: freeze runtime proof source"
+          )
+
+          (
+            cd "$PROOF_ROOT/runtime"
+            sudo /usr/lib/ota-authority/bin/ota-authority-pressure-peer execute \
+              --launcher /usr/lib/ota-authority/bin/ota-authority-launcher \
+              --scenario live \
+              -- proof runtime --workflow smoke --grant platform-release-authority --archive --json
+          ) > "$EVIDENCE_DIR/runtime-proof.json" 2> "$EVIDENCE_DIR/runtime-proof.stderr"
+          jq -e '
+            .ok == true and
+            .proof_verdict == "passed_with_unproven_boundaries" and
+            .crossing_evidence.authority.authority_carrier == "authority_broker" and
+            .crossing_evidence.proof_execution_id == .execution_id and
+            .crossing_evidence.transaction_id == .crossing_evidence.authority.transaction.transaction_id and
+            .crossing_evidence.authority.transaction.state == "completed" and
+            (.archive.path | type == "string")
+          ' "$EVIDENCE_DIR/runtime-proof.json"
+          runtime_archive=$(jq -r '.archive.path' "$EVIDENCE_DIR/runtime-proof.json")
+          if [[ "$runtime_archive" != /* ]]; then
+            runtime_archive="$PROOF_ROOT/runtime/$runtime_archive"
+          fi
+          cp "$runtime_archive" "$EVIDENCE_DIR/runtime-proof.archive.json"
+          jq -e '
+            .version == 6 and
+            .proof.execution_id == .proof.crossing_evidence.proof_execution_id and
+            .proof.crossing_evidence.authority.transaction.state == "completed"
+          ' "$runtime_archive"
+          if (
+            cd "$PROOF_ROOT/runtime"
+            ota proof runtime --workflow smoke --grant platform-release-authority --json
+          ) > "$EVIDENCE_DIR/runtime-proof.missing-launcher.stdout" \
+            2> "$EVIDENCE_DIR/runtime-proof.missing-launcher.json"; then
+            echo "runtime proof unexpectedly executed without launcher authority" >&2
+            exit 1
+          fi
+          jq -e \
+            --arg expected_scope "$(jq -r '.proof.crossing_evidence.scope_identity' "$runtime_archive")" \
+            '.execution_started == false and
+             .code == "crossing_broker_admission_refused" and
+             .crossing_grant_admission.scope_identity == $expected_scope' \
+            "$EVIDENCE_DIR/runtime-proof.missing-launcher.json"
+          (
+            cd "$PROOF_ROOT/runtime"
+            ota doctor --json || true
+          ) > "$EVIDENCE_DIR/runtime-proof.doctor.json"
+          jq -e '
+            any(.claim_assurance[];
+              .family == "proof_breadth" and
+              .subject.name == "smoke" and
+              .assurance.status == "supported")
+          ' "$EVIDENCE_DIR/runtime-proof.doctor.json"
+
+          cat > "$PROOF_ROOT/lifecycle/ota.yaml" <<'YAML'
+          version: 1
+          project:
+            name: authority-lifecycle-proof
+          governance:
+            crossing_authority:
+              authority_id: platform-release-authority
+          services:
+            database:
+              manager:
+                kind: compose
+                name: authority-lifecycle-proof
+                file: compose.yaml
+                service: database
+              lifecycle:
+                teardown_assertion: manager_inactive
+          tasks:
+            prepare:
+              command:
+                exe: ./assert-no-session.sh
+                args: [sh, -c, "true"]
+              safe_for_agent: false
+            assert-database:
+              command:
+                exe: ./assert-no-session.sh
+                args: [sh, -c, "docker compose -p authority-lifecycle-proof -f compose.yaml ps --status running -q database | grep -q ."]
+              requires_services: [database]
+              safe_for_agent: false
+          workflows:
+            default: smoke
+            smoke:
+              run:
+                task: prepare
+              proof:
+                lifecycle:
+                  services: [database]
+                  assertion:
+                    task: assert-database
+          YAML
+          cat > "$PROOF_ROOT/lifecycle/compose.yaml" <<'YAML'
+          services:
+            database:
+              image: alpine:3.22
+              command: [sh, -c, "while :; do sleep 3600; done"]
+          YAML
+          cat > "$PROOF_ROOT/lifecycle/assert-no-session.sh" <<'SH'
+          #!/bin/sh
+          set -eu
+          for fd in /proc/$$/fd/*; do
+            target=$(readlink "$fd" 2>/dev/null || true)
+            case "$target" in
+              socket:*) echo "broker descriptor leaked into lifecycle task" >&2; exit 97 ;;
+            esac
+          done
+          exec "$@"
+          SH
+          chmod 0755 "$PROOF_ROOT/lifecycle/assert-no-session.sh"
+          printf '%s\n' \
+            'Pressure-only deterministic Compose control stub.' \
+            'Proves Ota lifecycle authority, assertion ordering, finalization, and cleanup.' \
+            'Does not prove Docker provider behavior or Docker socket isolation beyond inaccessibility.' \
+            > "$EVIDENCE_DIR/lifecycle-provider-boundary.txt"
+
+          (
+            cd "$PROOF_ROOT/lifecycle"
+            sudo /usr/lib/ota-authority/bin/ota-authority-pressure-peer execute \
+              --launcher /usr/lib/ota-authority/bin/ota-authority-launcher \
+              --scenario live \
+              -- proof lifecycle --workflow smoke --grant platform-release-authority --archive --json
+          ) > "$EVIDENCE_DIR/lifecycle-proof.json" 2> "$EVIDENCE_DIR/lifecycle-proof.stderr"
+          jq -e '
+            .ok == true and
+            .proof_verdict == "passed_with_unproven_boundaries" and
+            .crossing_evidence.authority.authority_carrier == "authority_broker" and
+            .crossing_evidence.proof_execution_id == .transaction_id and
+            .crossing_evidence.transaction_id == .crossing_evidence.authority.transaction.transaction_id and
+            .crossing_evidence.authority.transaction.state == "completed" and
+            .finalization.state == "completed" and
+            (.archive.path | type == "string")
+          ' "$EVIDENCE_DIR/lifecycle-proof.json"
+          lifecycle_archive=$(jq -r '.archive.path' "$EVIDENCE_DIR/lifecycle-proof.json")
+          if [[ "$lifecycle_archive" != /* ]]; then
+            lifecycle_archive="$PROOF_ROOT/lifecycle/$lifecycle_archive"
+          fi
+          cp "$lifecycle_archive" "$EVIDENCE_DIR/lifecycle-proof.archive.json"
+          jq -e '
+            .version == 3 and
+            .proof.transaction_id == .proof.crossing_evidence.proof_execution_id and
+            .proof.crossing_evidence.authority.transaction.state == "completed" and
+            .proof.finalization.state == "completed"
+          ' "$lifecycle_archive"
+          test ! -e "$HOME/.ota-authority-pressure-compose-running"
 
       - name: Upload bounded pressure evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: authority-launcher-pressure-${{ github.run_id }}
           path: ${{ runner.temp }}/authority-pressure-evidence

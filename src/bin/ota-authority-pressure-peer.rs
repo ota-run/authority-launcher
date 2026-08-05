@@ -211,7 +211,7 @@ fn provision(ota_binary: &Path, run_uid: u32, run_gid: u32, run_home: &Path) -> 
                 "HOME": run_home,
                 "LANG": "C.UTF-8",
                 "LOGNAME": "ota-runner",
-                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "PATH": "/usr/lib/ota-authority/pressure-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
                 "USER": "ota-runner"
             },
             "sessions": [{

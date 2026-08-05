@@ -160,10 +160,10 @@ ota-authority-launcher run \
   -- run publish
 ```
 
-Only `ota run` and `ota up` are accepted. The Ota binary path, execution principal, complete child
-environment, source session descriptor, and Ota-facing descriptor come from protected system
-configuration, never repository files or inherited environment variables. The complete Core broker
-binding format is defined in the
+Only `ota run`, `ota up`, `ota proof runtime`, and `ota proof lifecycle` are accepted. The Ota
+binary path, execution principal, complete child environment, source session descriptor, and
+Ota-facing descriptor come from protected system configuration, never repository files or
+inherited environment variables. The complete Core broker binding format is defined in the
 [Broker Crossing Authority reference](https://ota.run/docs/reference/broker-crossing-authority).
 
 ## Trust boundary
@@ -221,11 +221,13 @@ The complete first milestone implements the Unix launcher-session carrier define
 3. obtain one exact broker authorization and prepared lease;
 4. preserve credentials and the launcher descriptor outside task processes;
 5. transparently carry broker-backed atomic one-use consumption and typed refusal; and
-6. prove success, replay refusal, expiry, revocation, wrong scope, interruption, and archive
-   reconciliation on a hardened Linux runner.
+6. prove success, replay refusal, expiry, revocation, wrong scope, interruption, proof-wide
+   transaction finalization, and archive reconciliation on a hardened Linux runner.
 
-Runtime and lifecycle proof transactions remain separate completion work until one authority
-transaction can cover their complete invocation and cleanup sets.
+The proof-wide pressure lane keeps Docker control unavailable to the job principal. Its lifecycle
+case uses a deterministic pressure-only Compose control stub to exercise Ota-owned service
+selection, assertion ordering, terminal authority, and cleanup. That fixture does not claim Docker
+provider behavior; independent provider pressure remains a separate Core evidence boundary.
 
 ## Relationship to Ota
 
