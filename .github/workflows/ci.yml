@@ -57,7 +57,7 @@ jobs:
 
       - name: Verify exact Ota source identity
         env:
-          EXPECTED_OTA_REVISION: 2d22d9804c30ef66376a5349e5ae3290b8664006
+          EXPECTED_OTA_REVISION: 4dfd478bd48616f7c0efa51bbb17562c5d39762c
           OBSERVED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
         run: test "$OBSERVED_OTA_REVISION" = "$EXPECTED_OTA_REVISION"
 

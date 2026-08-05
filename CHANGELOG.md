@@ -40,6 +40,9 @@
 - Start one fixed Ota binary as a configured non-root principal with Linux `no_new_privs`,
   parent-death signaling, and bounded process/session cleanup.
 - Add a contract-owned Linux/macOS verification matrix pinned to an exact Ota Core revision.
+- Permit the exact `ota proof runtime` and `ota proof lifecycle` surfaces so one protected launcher
+  session can carry Core's proof-wide crossing transaction through terminal cleanup and archive
+  reconciliation.
 
 ### Boundaries
 

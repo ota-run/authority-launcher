@@ -49,7 +49,7 @@ enum Command {
         #[arg(long)]
         authority_id: String,
 
-        /// Arguments passed to the protected Ota binary. The first argument must be run or up.
+        /// Arguments passed to the protected Ota binary. Only governed execution surfaces are accepted.
         #[arg(last = true, required = true)]
         ota_args: Vec<String>,
     },
@@ -123,11 +123,17 @@ fn validate_authority_label(value: &str) -> Result<(), String> {
 }
 
 fn validate_ota_args(args: &[String]) -> Result<(), String> {
-    if matches!(args.first().map(String::as_str), Some("run" | "up")) {
+    let allowed = matches!(args.first().map(String::as_str), Some("run" | "up"))
+        || matches!(
+            args.get(0..2),
+            Some([proof, kind])
+                if proof == "proof" && matches!(kind.as_str(), "runtime" | "lifecycle")
+        );
+    if allowed {
         Ok(())
     } else {
         Err(String::from(
-            "the launcher currently permits only ota run or ota up",
+            "the launcher permits only ota run, ota up, ota proof runtime, or ota proof lifecycle",
         ))
     }
 }
@@ -146,10 +152,21 @@ mod tests {
     }
 
     #[test]
-    fn execution_surface_is_limited_to_run_and_up() {
+    fn execution_surface_is_limited_to_governed_commands() {
         assert!(validate_ota_args(&[String::from("run"), String::from("publish")]).is_ok());
         assert!(validate_ota_args(&[String::from("up")]).is_ok());
+        assert!(
+            validate_ota_args(&[
+                String::from("proof"),
+                String::from("runtime"),
+                String::from("--workflow"),
+                String::from("smoke"),
+            ])
+            .is_ok()
+        );
+        assert!(validate_ota_args(&[String::from("proof"), String::from("lifecycle")]).is_ok());
         assert!(validate_ota_args(&[String::from("proof")]).is_err());
+        assert!(validate_ota_args(&[String::from("proof"), String::from("replay")]).is_err());
         assert!(validate_ota_args(&[String::from("self-update")]).is_err());
         assert!(validate_ota_args(&[]).is_err());
     }
