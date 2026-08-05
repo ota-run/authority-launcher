@@ -52,7 +52,7 @@ jobs:
 
       - name: Verify exact Ota source identity
         env:
-          EXPECTED_OTA_REVISION: 7cea05854adf597cb9f38a2430648aec7d2ed6f5
+          EXPECTED_OTA_REVISION: 85b2135e2dd26b1fc37d424b8c462edb5cad8326
           OBSERVED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
         run: test "$OBSERVED_OTA_REVISION" = "$EXPECTED_OTA_REVISION"
 
@@ -219,7 +219,7 @@ jobs:
 
           ota --version --json > "$EVIDENCE_DIR/ota-version.json"
           jq -e \
-            '.source_build == true and .dirty == false and .commit == "7cea05854"' \
+            '.source_build == true and .dirty == false and .commit == "85b2135e2"' \
             "$EVIDENCE_DIR/ota-version.json"
 
       - name: Exercise proof-wide broker authority
