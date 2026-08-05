@@ -52,7 +52,7 @@ jobs:
 
       - name: Verify exact Ota source identity
         env:
-          EXPECTED_OTA_REVISION: 2ad72af480fed2973601f7b8253be10961fa5fc5
+          EXPECTED_OTA_REVISION: bd80b29d971ccd5ac8609d9fc767a491ff382ef8
           OBSERVED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
         run: test "$OBSERVED_OTA_REVISION" = "$EXPECTED_OTA_REVISION"
 
@@ -219,7 +219,7 @@ jobs:
 
           ota --version --json > "$EVIDENCE_DIR/ota-version.json"
           jq -e \
-            '.source_build == true and .dirty == false and .commit == "2ad72af48"' \
+            '.source_build == true and .dirty == false and .commit == "bd80b29d9"' \
             "$EVIDENCE_DIR/ota-version.json"
 
       - name: Exercise proof-wide broker authority
@@ -228,7 +228,7 @@ jobs:
           PROOF_ROOT: ${{ runner.temp }}/authority-proof-repos
         run: |
           set -euo pipefail
-          mkdir -p "$EVIDENCE_DIR" "$PROOF_ROOT/runtime" "$PROOF_ROOT/lifecycle"
+          mkdir -p "$EVIDENCE_DIR" "$PROOF_ROOT/runtime" "$PROOF_ROOT/lifecycle" "$PROOF_ROOT/lifecycle-bin"
 
           cat > "$PROOF_ROOT/runtime/ota.yaml" <<'YAML'
           version: 1
@@ -415,10 +415,34 @@ jobs:
           exec "$@"
           SH
           chmod 0755 "$PROOF_ROOT/lifecycle/assert-no-session.sh"
+          cat > "$PROOF_ROOT/lifecycle-bin/docker" <<'SH'
+          #!/bin/sh
+          set -eu
+          for fd in /proc/$$/fd/*; do
+            target=$(readlink "$fd" 2>/dev/null || true)
+            case "$target" in
+              socket:*) echo "broker descriptor leaked into lifecycle manager" >&2; exit 97 ;;
+            esac
+          done
+          state_file="$(dirname "$0")/.compose-running"
+          case " $* " in
+            *" up -d "*) : > "$state_file" ;;
+            *" stop "*) rm -f "$state_file" ;;
+            *" ps "*) test ! -f "$state_file" || printf '%s\n' pressure-database ;;
+            *) echo "unsupported pressure manager invocation: $*" >&2; exit 64 ;;
+          esac
+          SH
+          chmod 0755 "$PROOF_ROOT/lifecycle-bin/docker"
+          printf '%s\n' \
+            'Pressure-only deterministic Compose control stub.' \
+            'Proves Ota lifecycle authority, assertion ordering, finalization, and cleanup.' \
+            'Does not prove Docker provider behavior or Docker socket isolation beyond inaccessibility.' \
+            > "$EVIDENCE_DIR/lifecycle-provider-boundary.txt"
 
           (
             cd "$PROOF_ROOT/lifecycle"
-            sudo /usr/lib/ota-authority/bin/ota-authority-pressure-peer execute \
+            sudo env PATH="$PROOF_ROOT/lifecycle-bin:/usr/bin:/bin" \
+              /usr/lib/ota-authority/bin/ota-authority-pressure-peer execute \
               --launcher /usr/lib/ota-authority/bin/ota-authority-launcher \
               --scenario live \
               -- proof lifecycle --workflow smoke --grant platform-release-authority --archive --json
@@ -444,7 +468,7 @@ jobs:
             .proof.crossing_evidence.authority.transaction.state == "completed" and
             .proof.finalization.state == "completed"
           ' "$lifecycle_archive"
-          test -z "$(docker compose -p authority-lifecycle-proof -f "$PROOF_ROOT/lifecycle/compose.yaml" ps -q)"
+          test ! -e "$PROOF_ROOT/lifecycle-bin/.compose-running"
 
       - name: Upload bounded pressure evidence
         if: always()

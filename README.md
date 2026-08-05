@@ -224,6 +224,11 @@ The complete first milestone implements the Unix launcher-session carrier define
 6. prove success, replay refusal, expiry, revocation, wrong scope, interruption, proof-wide
    transaction finalization, and archive reconciliation on a hardened Linux runner.
 
+The proof-wide pressure lane keeps Docker control unavailable to the job principal. Its lifecycle
+case uses a deterministic pressure-only Compose control stub to exercise Ota-owned service
+selection, assertion ordering, terminal authority, and cleanup. That fixture does not claim Docker
+provider behavior; independent provider pressure remains a separate Core evidence boundary.
+
 ## Relationship to Ota
 
 - [Ota Core](https://github.com/ota-run/ota) owns the protocol, scope, admission, execution, and
