@@ -93,12 +93,21 @@ jobs:
           tasks:
             publish:
               command:
-                exe: sh
-                args:
-                  - -c
-                  - 'for fd in /proc/$$/fd/*; do target=$(readlink "$fd" 2>/dev/null || true); case "$target" in socket:*) echo "broker descriptor leaked into task" >&2; exit 97;; esac; done; touch broker-executed'
+                exe: ./pressure-task.sh
               safe_for_agent: false
           YAML
+            cat > "$repo/pressure-task.sh" <<'SH'
+          #!/bin/sh
+          set -eu
+          for fd in /proc/$$/fd/*; do
+            target=$(readlink "$fd" 2>/dev/null || true)
+            case "$target" in
+              socket:*) echo "broker descriptor leaked into task" >&2; exit 97 ;;
+            esac
+          done
+          touch broker-executed
+          SH
+            chmod 0755 "$repo/pressure-task.sh"
             printf '.ota/\n' > "$repo/.gitignore"
             (
               cd "$repo"
