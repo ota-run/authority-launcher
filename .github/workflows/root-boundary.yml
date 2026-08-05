@@ -333,6 +333,20 @@ jobs:
             .proof.execution_id == .proof.crossing_evidence.proof_execution_id and
             .proof.crossing_evidence.authority.transaction.state == "completed"
           ' "$runtime_archive"
+          if (
+            cd "$PROOF_ROOT/runtime"
+            ota proof runtime --workflow smoke --grant platform-release-authority --json
+          ) > "$EVIDENCE_DIR/runtime-proof.missing-launcher.stdout" \
+            2> "$EVIDENCE_DIR/runtime-proof.missing-launcher.json"; then
+            echo "runtime proof unexpectedly executed without launcher authority" >&2
+            exit 1
+          fi
+          jq -e \
+            --arg expected_scope "$(jq -r '.proof.crossing_evidence.scope_identity' "$runtime_archive")" \
+            '.execution_started == false and
+             .code == "crossing_broker_admission_refused" and
+             .crossing_grant_admission.scope_identity == $expected_scope' \
+            "$EVIDENCE_DIR/runtime-proof.missing-launcher.json"
           (
             cd "$PROOF_ROOT/runtime"
             ota doctor --json || true
