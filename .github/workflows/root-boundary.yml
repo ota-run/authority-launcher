@@ -74,11 +74,31 @@ jobs:
 
       - name: Install protected pressure binaries and authority binding
         run: |
-          sudo install -d -o root -g root -m 0755 /usr/lib/ota-authority/bin
+          sudo install -d -o root -g root -m 0755 /usr/lib/ota-authority/bin /usr/lib/ota-authority/pressure-bin
           sudo install -d -o root -g root -m 0755 /etc/ota /var/lib/ota
           sudo install -o root -g root -m 0755 "$(command -v ota)" /usr/lib/ota-authority/bin/ota-pressure-core
           sudo install -o root -g root -m 0755 target/debug/ota-authority-launcher /usr/lib/ota-authority/bin/ota-authority-launcher
           sudo install -o root -g root -m 0755 target/debug/ota-authority-pressure-peer /usr/lib/ota-authority/bin/ota-authority-pressure-peer
+          pressure_docker=$(mktemp)
+          cat > "$pressure_docker" <<'SH'
+          #!/bin/sh
+          set -eu
+          for fd in /proc/$$/fd/*; do
+            target=$(readlink "$fd" 2>/dev/null || true)
+            case "$target" in
+              socket:*) echo "broker descriptor leaked into lifecycle manager" >&2; exit 97 ;;
+            esac
+          done
+          state_file="${HOME}/.ota-authority-pressure-compose-running"
+          case " $* " in
+            *" up -d "*) : > "$state_file" ;;
+            *" stop "*) rm -f "$state_file" ;;
+            *" ps "*) test ! -f "$state_file" || printf '%s\n' pressure-database ;;
+            *) echo "unsupported pressure manager invocation: $*" >&2; exit 64 ;;
+          esac
+          SH
+          sudo install -o root -g root -m 0755 "$pressure_docker" /usr/lib/ota-authority/pressure-bin/docker
+          rm -f "$pressure_docker"
           sudo /usr/lib/ota-authority/bin/ota-authority-pressure-peer provision \
             --ota-binary /usr/lib/ota-authority/bin/ota-pressure-core \
             --run-uid "$(id -u)" \
@@ -228,7 +248,7 @@ jobs:
           PROOF_ROOT: ${{ runner.temp }}/authority-proof-repos
         run: |
           set -euo pipefail
-          mkdir -p "$EVIDENCE_DIR" "$PROOF_ROOT/runtime" "$PROOF_ROOT/lifecycle" "$PROOF_ROOT/lifecycle-bin"
+          mkdir -p "$EVIDENCE_DIR" "$PROOF_ROOT/runtime" "$PROOF_ROOT/lifecycle"
 
           cat > "$PROOF_ROOT/runtime/ota.yaml" <<'YAML'
           version: 1
@@ -415,24 +435,6 @@ jobs:
           exec "$@"
           SH
           chmod 0755 "$PROOF_ROOT/lifecycle/assert-no-session.sh"
-          cat > "$PROOF_ROOT/lifecycle-bin/docker" <<'SH'
-          #!/bin/sh
-          set -eu
-          for fd in /proc/$$/fd/*; do
-            target=$(readlink "$fd" 2>/dev/null || true)
-            case "$target" in
-              socket:*) echo "broker descriptor leaked into lifecycle manager" >&2; exit 97 ;;
-            esac
-          done
-          state_file="$(dirname "$0")/.compose-running"
-          case " $* " in
-            *" up -d "*) : > "$state_file" ;;
-            *" stop "*) rm -f "$state_file" ;;
-            *" ps "*) test ! -f "$state_file" || printf '%s\n' pressure-database ;;
-            *) echo "unsupported pressure manager invocation: $*" >&2; exit 64 ;;
-          esac
-          SH
-          chmod 0755 "$PROOF_ROOT/lifecycle-bin/docker"
           printf '%s\n' \
             'Pressure-only deterministic Compose control stub.' \
             'Proves Ota lifecycle authority, assertion ordering, finalization, and cleanup.' \
@@ -441,8 +443,7 @@ jobs:
 
           (
             cd "$PROOF_ROOT/lifecycle"
-            sudo env PATH="$PROOF_ROOT/lifecycle-bin:/usr/bin:/bin" \
-              /usr/lib/ota-authority/bin/ota-authority-pressure-peer execute \
+            sudo /usr/lib/ota-authority/bin/ota-authority-pressure-peer execute \
               --launcher /usr/lib/ota-authority/bin/ota-authority-launcher \
               --scenario live \
               -- proof lifecycle --workflow smoke --grant platform-release-authority --archive --json
@@ -468,7 +469,7 @@ jobs:
             .proof.crossing_evidence.authority.transaction.state == "completed" and
             .proof.finalization.state == "completed"
           ' "$lifecycle_archive"
-          test ! -e "$PROOF_ROOT/lifecycle-bin/.compose-running"
+          test ! -e "$HOME/.ota-authority-pressure-compose-running"
 
       - name: Upload bounded pressure evidence
         if: always()
