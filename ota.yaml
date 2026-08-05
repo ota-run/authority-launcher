@@ -99,4 +99,4 @@ agent:
     ota:
       source:
         kind: git_rev
-        rev: 85b2135e2dd26b1fc37d424b8c462edb5cad8326
+        rev: d207a193a088bf54c79b1af5894f169d41f0e477
