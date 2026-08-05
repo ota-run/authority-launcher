@@ -204,6 +204,7 @@ fn provision(ota_binary: &Path, run_uid: u32, run_gid: u32, run_home: &Path) -> 
     write_protected_json(
         Path::new("/etc/ota/crossing-brokers.json"),
         &json!({ "schema_version": 1, "bindings": [binding] }),
+        0o644,
     )?;
     write_protected_json(
         Path::new("/etc/ota/authority-launcher.json"),
@@ -224,18 +225,19 @@ fn provision(ota_binary: &Path, run_uid: u32, run_gid: u32, run_home: &Path) -> 
                 "expected_peer": { "uid": 0, "gid": 0 }
             }]
         }),
+        0o600,
     )?;
     Ok(0)
 }
 
-fn write_protected_json(path: &Path, value: &Value) -> Result<(), String> {
+fn write_protected_json(path: &Path, value: &Value, mode: u32) -> Result<(), String> {
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| format!("failed to serialize protected config: {error}"))?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .mode(mode)
         .open(&temporary)
         .map_err(|error| format!("failed to create protected config: {error}"))?;
     file.write_all(&bytes)
@@ -243,7 +245,7 @@ fn write_protected_json(path: &Path, value: &Value) -> Result<(), String> {
         .map_err(|error| format!("failed to persist protected config: {error}"))?;
     fs::rename(&temporary, path)
         .map_err(|error| format!("failed to publish protected config: {error}"))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
         .map_err(|error| format!("failed to protect config permissions: {error}"))?;
     Ok(())
 }

@@ -67,7 +67,7 @@ jobs:
             --run-uid "$(id -u)" \
             --run-gid "$(id -g)" \
             --run-home "$HOME"
-          test "$(stat -c '%U:%G:%a' /etc/ota/crossing-brokers.json)" = "root:root:600"
+          test "$(stat -c '%U:%G:%a' /etc/ota/crossing-brokers.json)" = "root:root:644"
           test "$(stat -c '%U:%G:%a' /etc/ota/authority-launcher.json)" = "root:root:600"
           namei -l /etc/ota/authority-launcher.json /etc/ota/crossing-brokers.json /usr/lib/ota-authority/bin/ota-pressure-core
 
