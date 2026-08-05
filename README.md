@@ -47,6 +47,12 @@ session remains responsible for authenticated transport and protocol responses. 
 component and hosted adversarial pressure exist, this repository is foundation code rather than a
 complete authority system.
 
+The feature-gated `ota-authority-pressure-peer` binary is an exception for conformance testing
+only. It uses fixed public test keys and deterministic scenarios to exercise the complete protocol
+through a real launcher/Core process chain. Its replay scenario proves Core's signed
+already-consumed refusal; the separate reference-store regression proves atomic one-use state. It
+is not installed by default and must never be used as an operator broker or authority issuer.
+
 ## Why it exists
 
 Some repository operations need more than ordinary task admission. Production deployment,

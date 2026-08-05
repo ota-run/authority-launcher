@@ -13,15 +13,34 @@ repository = "https://github.com/ota-run/authority-launcher"
 rust-version = "1.95"
 
 [dependencies]
+base64 = { version = "0.22.1", optional = true }
 clap = { version = "4.5.39", features = ["derive"] }
+ed25519-dalek = { version = "3.0.0", optional = true }
 libc = "0.2.177"
+ota-authority-protocol = { git = "https://github.com/ota-run/authority-protocol", rev = "bfa11a1703e7067d72656aa1c6cb9e931e35497a", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
+serde_jcs = { version = "0.2.0", optional = true }
 serde_json = "1.0.145"
 thiserror = "2.0.12"
+time = { version = "0.3.48", features = ["formatting"], optional = true }
 
 [dev-dependencies]
 ota-authority-protocol = { git = "https://github.com/ota-run/authority-protocol", rev = "bfa11a1703e7067d72656aa1c6cb9e931e35497a" }
 tempfile = "3.23.0"
+
+[features]
+pressure-peer = [
+  "dep:base64",
+  "dep:ed25519-dalek",
+  "dep:ota-authority-protocol",
+  "dep:serde_jcs",
+  "dep:time",
+]
+
+[[bin]]
+name = "ota-authority-pressure-peer"
+path = "src/bin/ota-authority-pressure-peer.rs"
+required-features = ["pressure-peer"]
 
 [profile.release]
 lto = "thin"
