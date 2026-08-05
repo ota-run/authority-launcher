@@ -1,0 +1,83 @@
+# Copyright (C) 2026 — 2026, Ota. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0. See LICENSE for the full license text.
+
+version: 1
+project:
+  name: ota-authority-launcher
+  description: Trusted Unix launcher boundary for Ota crossing authority
+  type: application
+metadata:
+  team: Engineering
+  owner: ota
+  repo_class: oss
+execution:
+  preferred: native
+  supported:
+    - native
+toolchains:
+  rust:
+    version: "1.95.0"
+    components:
+      - clippy
+      - rustfmt
+tasks:
+  fmt:
+    description: Check Rust formatting
+    category: test
+    command:
+      exe: cargo
+      args: [fmt, --check]
+    requirements:
+      toolchains: [rust]
+    safe_for_agent: true
+  check:
+    description: Type-check the launcher
+    category: test
+    command:
+      exe: cargo
+      args: [check, --all-targets]
+    requirements:
+      toolchains: [rust]
+    safe_for_agent: true
+  clippy:
+    description: Run strict Rust linting
+    category: test
+    command:
+      exe: cargo
+      args: [clippy, --all-targets, --, -D, warnings]
+    requirements:
+      toolchains: [rust]
+    safe_for_agent: true
+  test:
+    description: Run the launcher test suite
+    category: test
+    command:
+      exe: cargo
+      args: [test, --all-targets]
+    requirements:
+      toolchains: [rust]
+    safe_for_agent: true
+  verify:
+    description: Run the complete local verification suite
+    category: test
+    aggregate:
+      tasks: [fmt, check, clippy, test]
+    safe_for_agent: true
+workflows:
+  default: verify
+  verify:
+    intent: verification
+    run:
+      task: verify
+agent:
+  entrypoint: verify
+  default_task: verify
+  safe_tasks: [fmt, check, clippy, test, verify]
+  verify_after_changes: [verify]
+  writable_paths: [src, README.md, SECURITY.md, CHANGELOG.md, Cargo.toml, rust-toolchain.toml]
+  protected_paths: [Cargo.lock, ota.yaml, LICENSE]
+  bootstrap:
+    ota:
+      source:
+        kind: git_rev
+        rev: 0011e64ab545ef3eb34602ce5469a2f779c870ea

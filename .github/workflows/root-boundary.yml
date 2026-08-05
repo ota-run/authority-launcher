@@ -1,0 +1,52 @@
+# Copyright (C) 2026 — 2026, Ota. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0. See LICENSE for the full license text.
+# You may not use this file except in compliance with that License.
+
+name: Root boundary proof
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  root-boundary:
+    name: Prove root-to-job-principal boundary
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: 1.95.0
+          components: clippy,rustfmt
+
+      - name: Install contract-selected Ota
+        id: ota
+        uses: ota-run/setup@493cba84bf7f7c11c9e8e996d832d93a89c62184
+        with:
+          source: contract
+          contract-path: ota.yaml
+
+      - name: Verify exact Ota source identity
+        env:
+          EXPECTED_OTA_REVISION: 0011e64ab545ef3eb34602ce5469a2f779c870ea
+          OBSERVED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
+        run: test "$OBSERVED_OTA_REVISION" = "$EXPECTED_OTA_REVISION"
+
+      - name: Prove root boundary
+        env:
+          ROOT_TEST_TARGET: ${{ runner.temp }}/authority-launcher-root-target
+        run: |
+          CARGO_BIN_DIR="$(dirname "$(command -v cargo)")"
+          OBSERVED_RUSTUP_HOME="$(rustup show home)"
+          sudo env \
+            PATH="$CARGO_BIN_DIR:/usr/bin:/bin" \
+            RUSTUP_HOME="$OBSERVED_RUSTUP_HOME" \
+            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            CARGO_TARGET_DIR="$ROOT_TEST_TARGET" \
+            cargo test unix::tests::root_launch_drops_uid_gid_and_supplementary_groups -- --exact

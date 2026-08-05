@@ -1,0 +1,28 @@
+# Copyright (C) 2026 — 2026, Ota. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0. See LICENSE for the full license text.
+# You may not use this file except in compliance with that License.
+
+[package]
+name = "ota-authority-launcher"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Trusted launcher for Ota crossing authority"
+repository = "https://github.com/ota-run/authority-launcher"
+rust-version = "1.95"
+
+[dependencies]
+clap = { version = "4.5.39", features = ["derive"] }
+libc = "0.2.177"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+thiserror = "2.0.12"
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
