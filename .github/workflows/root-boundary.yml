@@ -171,12 +171,12 @@ jobs:
                 expired)
                   test ! -e "$repo/.ota"
                   grep -q 'crossing_broker_admission_refused' "$output"
-                  grep -q 'broker message is outside its validity window' "$output"
+                  grep -q 'pressure-peer-scenario: expired-decision' "$output"
                   ;;
                 wrong-scope)
                   test ! -e "$repo/.ota"
                   grep -q 'crossing_broker_admission_refused' "$output"
-                  grep -q 'broker authorization decision does not bind the exact request' "$output"
+                  grep -q 'pressure-peer-scenario: wrong-scope-decision' "$output"
                   ;;
                 revoked)
                   test -d "$repo/.ota/state/crossings"
@@ -185,7 +185,7 @@ jobs:
                     ! -path '.ota/state/crossings' \
                     ! -path '.ota/state/crossings/*' -print -quit)"
                   grep -q 'crossing_broker_consumption_refused' "$output"
-                  grep -q 'broker lease was revoked before consumption' "$output"
+                  grep -q 'pressure-peer-scenario: revoked-consume' "$output"
                   ;;
                 replay)
                   test -d "$repo/.ota/state/crossings"
@@ -194,7 +194,7 @@ jobs:
                     ! -path '.ota/state/crossings' \
                     ! -path '.ota/state/crossings/*' -print -quit)"
                   grep -q 'crossing_broker_consumption_refused' "$output"
-                  grep -q 'broker lease was already consumed' "$output"
+                  grep -q 'pressure-peer-scenario: already-consumed' "$output"
                   ;;
               esac
             fi

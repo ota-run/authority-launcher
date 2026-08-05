@@ -345,6 +345,14 @@ fn serve_session(stream: &mut UnixStream, scenario: Scenario) -> Result<(), Stri
             .map_err(|error| format!("failed to identify authorization decision: {error}"))?;
     write_json_frame(stream, &decision)?;
     if matches!(scenario, Scenario::Expired | Scenario::WrongScope) {
+        eprintln!(
+            "pressure-peer-scenario: {}",
+            match scenario {
+                Scenario::Expired => "expired-decision",
+                Scenario::WrongScope => "wrong-scope-decision",
+                _ => unreachable!("scenario returned earlier"),
+            }
+        );
         return Ok(());
     }
 
@@ -403,7 +411,17 @@ fn serve_session(stream: &mut UnixStream, scenario: Scenario) -> Result<(), Stri
             consumed_at: formatted(OffsetDateTime::now_utc())?,
         },
     )?;
-    write_json_frame(stream, &response)
+    write_json_frame(stream, &response)?;
+    eprintln!(
+        "pressure-peer-scenario: {}",
+        match scenario {
+            Scenario::Live => "consumed",
+            Scenario::Revoked => "revoked-consume",
+            Scenario::Replay => "already-consumed",
+            Scenario::Expired | Scenario::WrongScope => unreachable!("scenario returned earlier"),
+        }
+    );
+    Ok(())
 }
 
 fn sign_attestation(
