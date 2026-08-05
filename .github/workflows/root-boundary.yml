@@ -35,7 +35,7 @@ jobs:
 
       - name: Verify exact Ota source identity
         env:
-          EXPECTED_OTA_REVISION: c3c871eb2387d681ec0c46a114ad4db95544e1f1
+          EXPECTED_OTA_REVISION: 2d22d9804c30ef66376a5349e5ae3290b8664006
           OBSERVED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
         run: test "$OBSERVED_OTA_REVISION" = "$EXPECTED_OTA_REVISION"
 
@@ -202,7 +202,7 @@ jobs:
 
           ota --version --json > "$EVIDENCE_DIR/ota-version.json"
           jq -e \
-            '.source_build == true and .dirty == false and .commit == "c3c871eb2"' \
+            '.source_build == true and .dirty == false and .commit == "2d22d9804"' \
             "$EVIDENCE_DIR/ota-version.json"
 
       - name: Upload bounded pressure evidence
