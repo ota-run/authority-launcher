@@ -20,6 +20,7 @@ serde_json = "1.0.145"
 thiserror = "2.0.12"
 
 [dev-dependencies]
+ota-authority-protocol = { git = "https://github.com/ota-run/authority-protocol", rev = "bfa11a1703e7067d72656aa1c6cb9e931e35497a" }
 tempfile = "3.23.0"
 
 [profile.release]

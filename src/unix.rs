@@ -563,13 +563,6 @@ mod tests {
 
     #[test]
     fn bridge_preserves_core_protocol_frames_byte_for_byte() {
-        fn frame(payload: &[u8]) -> Vec<u8> {
-            let mut framed = Vec::with_capacity(4 + payload.len());
-            framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-            framed.extend_from_slice(payload);
-            framed
-        }
-
         let request_payloads: [&[u8]; 3] = [
             br#"{"message_kind":"challenge_request"}"#,
             br#"{"message_kind":"authorization_request"}"#,
@@ -583,11 +576,15 @@ mod tests {
         ];
         let requests = request_payloads
             .iter()
-            .flat_map(|payload| frame(payload))
+            .flat_map(|payload| {
+                ota_authority_protocol::encode_frame(payload).expect("protocol request frame")
+            })
             .collect::<Vec<_>>();
         let responses = response_payloads
             .iter()
-            .flat_map(|payload| frame(payload))
+            .flat_map(|payload| {
+                ota_authority_protocol::encode_frame(payload).expect("protocol response frame")
+            })
             .collect::<Vec<_>>();
 
         let (mut ota_client, ota_launcher) = UnixStream::pair().expect("ota pair");

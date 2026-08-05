@@ -221,6 +221,8 @@ transaction can cover their complete invocation and cleanup sets.
 
 - [Ota Core](https://github.com/ota-run/ota) owns the protocol, scope, admission, execution, and
   evidence model.
+- [Ota Authority Protocol](https://github.com/ota-run/authority-protocol) publishes the shared
+  wire types, fixed domains, framing, identities, and conformance vectors.
 - This repository implements the privileged launcher side of that protocol.
 - The public operator reference is
   [Broker Crossing Authority (Preview)](https://ota.run/docs/reference/broker-crossing-authority).
