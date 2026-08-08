@@ -48,14 +48,18 @@ The first implementation is a Unix session-isolating exec wrapper. It:
 This slice does **not** create launcher attestations, connect to a remote broker, hold signing keys,
 or make authorization decisions. The administrator-controlled process that supplies the connected
 session remains responsible for authenticated transport and protocol responses. Until that
-component and hosted adversarial pressure exist, this repository is foundation code rather than a
-complete authority system.
+component is deployed with independently protected credentials and attestation, this launcher is
+one authority-system building block rather than a complete authority system.
 
 The feature-gated `ota-authority-pressure-peer` binary is an exception for conformance testing
 only. It uses fixed public test keys and deterministic scenarios to exercise the complete protocol
-through a real launcher/Core process chain. Its replay scenario proves Core's signed
-already-consumed refusal; the separate reference-store regression proves atomic one-use state. It
-is not installed by default and must never be used as an operator broker or authority issuer.
+through a real launcher/Core process chain. Its scenarios prove live consumption plus expired,
+revoked, wrong-scope, already-consumed, unavailable, timed-out, cancelled, and ambiguous
+pre-execution refusal. A paired recovery scenario withholds an already-consumed response, then
+proves that a fresh launcher session re-queries the exact durable intent, closes the abandoned
+transaction without execution, and requires a newly consumed lease before work starts. The
+separate reference-store regression proves atomic one-use state. The pressure peer is not installed
+by default and must never be used as an operator broker or authority issuer.
 
 ## Why it exists
 
@@ -221,8 +225,9 @@ The complete first milestone implements the Unix launcher-session carrier define
 3. obtain one exact broker authorization and prepared lease;
 4. preserve credentials and the launcher descriptor outside task processes;
 5. transparently carry broker-backed atomic one-use consumption and typed refusal; and
-6. prove success, replay refusal, expiry, revocation, wrong scope, interruption, proof-wide
-   transaction finalization, and archive reconciliation on a hardened Linux runner.
+6. prove success, replay refusal, expiry, revocation, wrong scope, broker unavailability, bounded
+   approval timeout/cancellation/ambiguity, proof-wide transaction finalization, and archive
+   reconciliation on a hardened Linux runner.
 
 The proof-wide pressure lane keeps Docker control unavailable to the job principal. Its lifecycle
 case uses a deterministic pressure-only Compose control stub to exercise Ota-owned service

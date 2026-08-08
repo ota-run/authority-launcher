@@ -580,16 +580,18 @@ mod tests {
 
     #[test]
     fn bridge_preserves_core_protocol_frames_byte_for_byte() {
-        let request_payloads: [&[u8]; 3] = [
+        let request_payloads: [&[u8]; 4] = [
             br#"{"message_kind":"challenge_request"}"#,
             br#"{"message_kind":"authorization_request"}"#,
             br#"{"message_kind":"lease_consume"}"#,
+            br#"{"message_kind":"lease_consumption_query"}"#,
         ];
-        let response_payloads: [&[u8]; 4] = [
+        let response_payloads: [&[u8]; 5] = [
             br#"{"message_kind":"attestation_response"}"#,
             br#"{"message_kind":"authorization_decision"}"#,
             br#"{"message_kind":"lease_issuance"}"#,
             br#"{"message_kind":"lease_consume_response"}"#,
+            br#"{"message_kind":"lease_consumption_status"}"#,
         ];
         let requests = request_payloads
             .iter()

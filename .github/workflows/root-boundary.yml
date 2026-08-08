@@ -52,7 +52,7 @@ jobs:
 
       - name: Verify exact Ota source identity
         env:
-          EXPECTED_OTA_REVISION: bd80b29d971ccd5ac8609d9fc767a491ff382ef8
+          EXPECTED_OTA_REVISION: 9244eb2bc6a44151c4172c0634ac44bdb216a65a
           OBSERVED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
         run: test "$OBSERVED_OTA_REVISION" = "$EXPECTED_OTA_REVISION"
 
@@ -142,7 +142,7 @@ jobs:
               socket:*) echo "broker descriptor leaked into task" >&2; exit 97 ;;
             esac
           done
-          touch broker-executed
+          printf x >> broker-executed
           SH
             chmod 0755 "$repo/pressure-task.sh"
             printf '.ota/\n' > "$repo/.gitignore"
@@ -153,7 +153,7 @@ jobs:
             ) > "$EVIDENCE_DIR/$scenario.before"
           }
 
-          for scenario in live expired revoked wrong-scope replay; do
+          for scenario in live expired revoked wrong-scope replay unavailable pending-timeout pending-cancelled pending-late-approval insufficient-pre-wait-freshness pending-ambiguous; do
             make_repo "$scenario"
             repo="$PRESSURE_ROOT/$scenario"
             output="$EVIDENCE_DIR/$scenario.output"
@@ -215,6 +215,43 @@ jobs:
                   grep -q 'crossing_broker_admission_refused' "$output"
                   grep -q 'pressure-peer-scenario: wrong-scope-decision' "$output"
                   ;;
+                unavailable)
+                  test ! -e "$repo/.ota"
+                  grep -q 'crossing_broker_admission_refused' "$output"
+                  grep -q 'pressure-peer-scenario: unavailable' "$output"
+                  ;;
+                pending-timeout)
+                  test ! -e "$repo/.ota"
+                  grep -q 'crossing_broker_admission_refused' "$output"
+                  grep -q 'pressure-peer-scenario: pending-timeout' "$output"
+                  ;;
+                pending-cancelled)
+                  test ! -e "$repo/.ota"
+                  grep -q 'crossing_broker_admission_refused' "$output"
+                  grep -q 'pressure-peer-scenario: pending-cancelled' "$output"
+                  ;;
+                pending-late-approval)
+                  test ! -e "$repo/.ota"
+                  grep -q 'crossing_broker_admission_refused' "$output"
+                  grep -q 'pressure-peer-scenario: late-approval-after-terminal-cancellation session-closed=true delivery-refused=true' "$output"
+                  test "$(stat -c '%U:%G:%a' /var/lib/ota/pressure-late-approval.json)" = "root:root:600"
+                  sudo cp /var/lib/ota/pressure-late-approval.json \
+                    "$EVIDENCE_DIR/pending-late-approval.signed-decision.json"
+                  sudo chown "$(id -u):$(id -g)" \
+                    "$EVIDENCE_DIR/pending-late-approval.signed-decision.json"
+                  jq -e '.payload.decision == "allowed" and .payload.approval_reference == "pressure:late-approval"' \
+                    "$EVIDENCE_DIR/pending-late-approval.signed-decision.json"
+                  ;;
+                insufficient-pre-wait-freshness)
+                  test ! -e "$repo/.ota"
+                  grep -q 'crossing_broker_admission_refused' "$output"
+                  grep -q 'pressure-peer-scenario: insufficient-pre-wait-freshness required-seconds=32 attestation-seconds=31 authorization-request=false' "$output"
+                  ;;
+                pending-ambiguous)
+                  test ! -e "$repo/.ota"
+                  grep -q 'crossing_broker_admission_refused' "$output"
+                  grep -q 'pressure-peer-scenario: pending-ambiguous' "$output"
+                  ;;
                 revoked)
                   test -d "$repo/.ota/state/crossings"
                   test -z "$(cd "$repo" && find .ota -mindepth 1 \
@@ -237,9 +274,161 @@ jobs:
             fi
           done
 
+          make_repo consume-recovery
+          recovery_repo="$PRESSURE_ROOT/consume-recovery"
+          recovery_first="$EVIDENCE_DIR/consume-recovery-first.output"
+          if (
+            cd "$recovery_repo"
+            sudo /usr/lib/ota-authority/bin/ota-authority-pressure-peer execute \
+              --launcher /usr/lib/ota-authority/bin/ota-authority-launcher \
+              --scenario consume-response-lost \
+              -- run publish --grant platform-release-authority --reason pressure
+          ) >"$recovery_first" 2>&1; then
+            echo "lost consume response unexpectedly executed" >&2
+            exit 1
+          fi
+          test ! -e "$recovery_repo/broker-executed"
+          test "$(stat -c '%U:%G:%a' /var/lib/ota/pressure-consumption-recovery.json)" = "root:root:600"
+          grep -q 'pressure-peer-scenario: consume-response-lost' "$recovery_first"
+          grep -q 'crossing_broker_consumption_refused' "$recovery_first"
+          (
+            cd "$recovery_repo"
+            find . -path './.ota' -prune -o -printf '%y %P %l\n' | sort
+            find . -path './.ota' -prune -o -type f -print0 | sort -z | xargs -0 sha256sum
+          ) > "$EVIDENCE_DIR/consume-recovery.after-first"
+          cmp "$EVIDENCE_DIR/consume-recovery.before" "$EVIDENCE_DIR/consume-recovery.after-first"
+
+          recovery_second="$EVIDENCE_DIR/consume-recovery-second.output"
+          (
+            cd "$recovery_repo"
+            sudo /usr/lib/ota-authority/bin/ota-authority-pressure-peer execute \
+              --launcher /usr/lib/ota-authority/bin/ota-authority-launcher \
+              --scenario recovery-consumed \
+              -- run publish --grant platform-release-authority --reason pressure
+          ) >"$recovery_second" 2>&1
+          test -f "$recovery_repo/broker-executed"
+          test "$(wc -c < "$recovery_repo/broker-executed")" -eq 1
+          grep -q 'pressure-peer-scenario: recovered-consumed-status' "$recovery_second"
+          grep -q 'pressure-peer-scenario: recovery-consumed-then-fresh-consumed' "$recovery_second"
+          jq -s -e '
+            map(select(
+              .state == "incomplete" and
+              .receipt_status == "broker_consumption_recovered_without_execution" and
+              .broker_consumption.consume_response.payload.state == "consumed" and
+              .broker_consumption_recovery.status.payload.status.state == "consumed"
+            )) | length == 1
+          ' "$recovery_repo"/.ota/state/crossings/*/*.json
+          (
+            cd "$recovery_repo"
+            ota receipt --history --json
+          ) > "$EVIDENCE_DIR/consume-recovery.receipt-history.json"
+          jq -e '.summary.archive_count == 1 and .summary.invalid_archive_count == 0' \
+            "$EVIDENCE_DIR/consume-recovery.receipt-history.json"
+
+          catch_all_repo="$PRESSURE_ROOT/catch-all"
+          mkdir -p "$catch_all_repo"
+          cat > "$catch_all_repo/ota.yaml" <<'YAML'
+          version: 1
+          project:
+            name: authority-catch-all-pressure
+          governance:
+            crossing_authority:
+              authority_id: platform-release-authority
+          tasks:
+            prepare-release:
+              command:
+                exe: ./pressure-task.sh
+                args: [prepare]
+              effects:
+                writes: [broker-executed]
+              safe_for_agent: false
+            publish:
+              command:
+                exe: ./pressure-task.sh
+                args: [publish]
+              depends_on: [prepare-release]
+              after_success: [audit-release]
+              effects:
+                writes: [broker-executed]
+                network: true
+                network_kind: broad
+              safe_for_agent: false
+            audit-release:
+              command:
+                exe: ./pressure-task.sh
+                args: [audit]
+              effects:
+                writes: [broker-executed]
+              safe_for_agent: false
+          YAML
+          cat > "$catch_all_repo/pressure-task.sh" <<'SH'
+          #!/bin/sh
+          set -eu
+          for fd in /proc/$$/fd/*; do
+            target=$(readlink "$fd" 2>/dev/null || true)
+            case "$target" in
+              socket:*) echo "broker descriptor leaked into catch-all task" >&2; exit 97 ;;
+            esac
+          done
+          printf '%s\n' "$1" >> broker-executed
+          SH
+          chmod 0755 "$catch_all_repo/pressure-task.sh"
+          printf '.ota/\n' > "$catch_all_repo/.gitignore"
+
+          catch_all_first="$EVIDENCE_DIR/catch-all-first.output"
+          (
+            cd "$catch_all_repo"
+            sudo /usr/lib/ota-authority/bin/ota-authority-pressure-peer execute \
+              --launcher /usr/lib/ota-authority/bin/ota-authority-launcher \
+              --scenario catch-all-first \
+              -- run publish --grant platform-release-authority --reason pressure
+          ) >"$catch_all_first" 2>&1
+          catch_all_second="$EVIDENCE_DIR/catch-all-second.output"
+          (
+            cd "$catch_all_repo"
+            sudo /usr/lib/ota-authority/bin/ota-authority-pressure-peer execute \
+              --launcher /usr/lib/ota-authority/bin/ota-authority-launcher \
+              --scenario catch-all-second \
+              -- run publish --grant platform-release-authority --reason pressure
+          ) >"$catch_all_second" 2>&1
+          grep -q 'pressure-peer-scenario: catch-all-first-consumed' "$catch_all_first"
+          grep -q 'pressure-peer-scenario: catch-all-second-distinct-work-unit-consumed' "$catch_all_second"
+          test "$(stat -c '%U:%G:%a' /var/lib/ota/pressure-catch-all-invocation.json)" = "root:root:600"
+          test "$(wc -l < "$catch_all_repo/broker-executed")" -eq 6
+          test "$(grep -c '^prepare$' "$catch_all_repo/broker-executed")" -eq 2
+          test "$(grep -c '^publish$' "$catch_all_repo/broker-executed")" -eq 2
+          test "$(grep -c '^audit$' "$catch_all_repo/broker-executed")" -eq 2
+          (
+            cd "$catch_all_repo"
+            ota receipt --history --json
+          ) > "$EVIDENCE_DIR/catch-all.receipt-history.json"
+          jq -e '.summary.archive_count == 2 and .summary.invalid_archive_count == 0' \
+            "$EVIDENCE_DIR/catch-all.receipt-history.json"
+          : > "$EVIDENCE_DIR/catch-all.work-units"
+          archive_index=0
+          while IFS= read -r archive_path; do
+            if [[ "$archive_path" != /* ]]; then
+              archive_path="$catch_all_repo/$archive_path"
+            fi
+            jq -e '
+              .receipt.crossing.authority.authority_carrier == "authority_broker" and
+              .receipt.crossing.authority.transaction.state == "completed" and
+              .receipt.crossing.authority.archive_evidence.admission.semantic_scope.breadth.closure_node_count == 3 and
+              .receipt.crossing.authority.archive_evidence.admission.semantic_scope.breadth.closure_edge_count >= 2 and
+              (.receipt.crossing.authority.archive_evidence.admission.semantic_scope.breadth.effect_categories | index("repo_write") != null) and
+              (.receipt.crossing.authority.archive_evidence.admission.semantic_scope.breadth.effect_categories | index("network") != null)
+            ' "$archive_path"
+            jq -r '.receipt.crossing.authority.broker.work_unit_identity' "$archive_path" \
+              >> "$EVIDENCE_DIR/catch-all.work-units"
+            cp "$archive_path" "$EVIDENCE_DIR/catch-all.receipt-archive-$archive_index.json"
+            archive_index=$((archive_index + 1))
+          done < <(jq -r '.archives[].archive_path' "$EVIDENCE_DIR/catch-all.receipt-history.json")
+          test "$archive_index" -eq 2
+          test "$(sort -u "$EVIDENCE_DIR/catch-all.work-units" | wc -l)" -eq 2
+
           ota --version --json > "$EVIDENCE_DIR/ota-version.json"
           jq -e \
-            '.source_build == true and .dirty == false and .commit == "bd80b29d9"' \
+            '.source_build == true and .dirty == false and .commit == "9244eb2bc"' \
             "$EVIDENCE_DIR/ota-version.json"
 
       - name: Exercise proof-wide broker authority

@@ -27,13 +27,14 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -43,13 +44,14 @@ use ota_authority_protocol::{
     ATTESTATION_RESPONSE_DOMAIN_V1, AUTHORIZATION_DECISION_DOMAIN_V1,
     AUTHORIZATION_REQUEST_DOMAIN_V1, AuthorizationDecision, AuthorizationDecisionPayload,
     AuthorizationRequest, BROKER_BINDING_IDENTITY_DOMAIN_V1, BrokerChallenge, CHALLENGE_REQUEST,
-    LEASE_CONSUME_DOMAIN_V1, LEASE_CONSUME_RESPONSE_DOMAIN_V1, LEASE_ISSUANCE_DOMAIN_V1,
-    LauncherAttestationPayload, LeaseConsumeRequest, LeaseConsumeResponsePayload,
-    LeaseConsumeState, PreparedLeasePayload, SignedBrokerMessage, SignedLauncherAttestation,
-    message_identity,
+    LEASE_CONSUME_DOMAIN_V1, LEASE_CONSUME_RESPONSE_DOMAIN_V1, LEASE_CONSUMPTION_QUERY_DOMAIN_V1,
+    LEASE_CONSUMPTION_STATUS_DOMAIN_V1, LEASE_ISSUANCE_DOMAIN_V1, LauncherAttestationPayload,
+    LeaseConsumeRequest, LeaseConsumeResponsePayload, LeaseConsumeState, LeaseConsumptionQuery,
+    LeaseConsumptionStatus, LeaseConsumptionStatusPayload, PreparedLeasePayload,
+    SignedBrokerMessage, SignedLauncherAttestation, message_identity,
 };
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -59,6 +61,24 @@ const BROKER_DESCRIPTOR: RawFd = 4;
 const OTA_DESCRIPTOR: RawFd = 3;
 const SIGNING_SEED: [u8; 32] = [9_u8; 32];
 const KEY_ID: &str = "broker-2026-01";
+const RECOVERY_STATE_PATH: &str = "/var/lib/ota/pressure-consumption-recovery.json";
+const CATCH_ALL_STATE_PATH: &str = "/var/lib/ota/pressure-catch-all-invocation.json";
+const LATE_APPROVAL_STATE_PATH: &str = "/var/lib/ota/pressure-late-approval.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredConsumptionRecovery {
+    consume_request_identity: String,
+    consume_request: LeaseConsumeRequest,
+    consume_response: SignedBrokerMessage<LeaseConsumeResponsePayload>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredCatchAllInvocation {
+    semantic_scope_identity: String,
+    work_unit_identity: String,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "ota-authority-pressure-peer", version, about)]
@@ -98,6 +118,16 @@ enum Scenario {
     Revoked,
     WrongScope,
     Replay,
+    Unavailable,
+    PendingTimeout,
+    PendingCancelled,
+    PendingLateApproval,
+    InsufficientPreWaitFreshness,
+    PendingAmbiguous,
+    ConsumeResponseLost,
+    RecoveryConsumed,
+    CatchAllFirst,
+    CatchAllSecond,
 }
 
 fn main() -> ExitCode {
@@ -133,6 +163,23 @@ fn provision(ota_binary: &Path, run_uid: u32, run_gid: u32, run_home: &Path) -> 
             .map_err(|error| format!("failed to create protected store: {error}"))?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))
             .map_err(|error| format!("failed to protect authority store: {error}"))?;
+    }
+    if let Err(error) = fs::remove_file(RECOVERY_STATE_PATH)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(format!("failed to clear pressure recovery state: {error}"));
+    }
+    if let Err(error) = fs::remove_file(CATCH_ALL_STATE_PATH)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(format!("failed to clear catch-all pressure state: {error}"));
+    }
+    if let Err(error) = fs::remove_file(LATE_APPROVAL_STATE_PATH)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(format!(
+            "failed to clear late-approval pressure state: {error}"
+        ));
     }
     let signing_key = SigningKey::from_bytes(&SIGNING_SEED);
     let public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes());
@@ -187,9 +234,11 @@ fn provision(ota_binary: &Path, run_uid: u32, run_gid: u32, run_home: &Path) -> 
             "authorization_decision": AUTHORIZATION_DECISION_DOMAIN_V1,
             "lease_issuance": LEASE_ISSUANCE_DOMAIN_V1,
             "lease_consume": LEASE_CONSUME_DOMAIN_V1,
-            "lease_consume_response": LEASE_CONSUME_RESPONSE_DOMAIN_V1
+            "lease_consume_response": LEASE_CONSUME_RESPONSE_DOMAIN_V1,
+            "lease_consumption_query": LEASE_CONSUMPTION_QUERY_DOMAIN_V1,
+            "lease_consumption_status": LEASE_CONSUMPTION_STATUS_DOMAIN_V1
         },
-        "maximum_approval_wait_seconds": 120,
+        "maximum_approval_wait_seconds": 2,
         "minimum_post_approval_freshness_seconds": 30,
         "maximum_lease_seconds": 300
     });
@@ -281,7 +330,7 @@ fn execute(launcher: &Path, scenario: Scenario, ota_args: &[String]) -> Result<u
         .spawn()
         .map_err(|error| format!("failed to start protected launcher: {error}"))?;
     drop(launcher_session);
-    if let Err(error) = serve_session(&mut broker, scenario) {
+    if let Err(error) = serve_session(&mut broker, scenario, child.id()) {
         let _ = child.kill();
         let _ = child.wait();
         return Err(error);
@@ -292,20 +341,74 @@ fn execute(launcher: &Path, scenario: Scenario, ota_args: &[String]) -> Result<u
     Ok(status.code().unwrap_or(1).clamp(0, u8::MAX as i32) as u8)
 }
 
-fn serve_session(stream: &mut UnixStream, scenario: Scenario) -> Result<(), String> {
+fn serve_session(
+    stream: &mut UnixStream,
+    scenario: Scenario,
+    child_pid: u32,
+) -> Result<(), String> {
+    if matches!(scenario, Scenario::Unavailable) {
+        stream
+            .shutdown(Shutdown::Both)
+            .map_err(|error| format!("failed to close unavailable pressure session: {error}"))?;
+        eprintln!("pressure-peer-scenario: unavailable");
+        return Ok(());
+    }
     let signing_key = SigningKey::from_bytes(&SIGNING_SEED);
     let now = OffsetDateTime::now_utc();
     let challenge: BrokerChallenge = read_json_frame(stream)?;
     if challenge.message_kind != CHALLENGE_REQUEST {
         return Err(String::from("Core did not begin with a challenge request"));
     }
-    let attestation = sign_attestation(&signing_key, &challenge, now)?;
+    let attestation_lifetime_seconds = if matches!(scenario, Scenario::InsufficientPreWaitFreshness)
+    {
+        31
+    } else {
+        180
+    };
+    let attestation =
+        sign_attestation(&signing_key, &challenge, now, attestation_lifetime_seconds)?;
     write_json_frame(stream, &attestation)?;
 
-    let request: AuthorizationRequest = read_json_frame(stream)?;
+    let next = read_json_frame::<Value>(stream);
+    if matches!(scenario, Scenario::InsufficientPreWaitFreshness) {
+        return match next {
+            Ok(_) => Err(String::from(
+                "Core requested authorization with attestation that cannot cover the bounded wait",
+            )),
+            Err(error)
+                if error.contains("failed to fill whole buffer")
+                    || error.contains("Connection reset by peer") =>
+            {
+                eprintln!(
+                    "pressure-peer-scenario: insufficient-pre-wait-freshness required-seconds=32 attestation-seconds=31 authorization-request=false"
+                );
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "Core did not close the insufficient-freshness session cleanly: {error}"
+            )),
+        };
+    }
+    let next = next?;
+    let request: AuthorizationRequest =
+        if next.get("message_kind").and_then(Value::as_str) == Some("lease_consumption_query") {
+            if !matches!(scenario, Scenario::RecoveryConsumed) {
+                return Err(String::from(
+                    "Core sent a recovery query outside the recovery pressure scenario",
+                ));
+            }
+            let query: LeaseConsumptionQuery = serde_json::from_value(next)
+                .map_err(|error| format!("Core sent a malformed recovery query: {error}"))?;
+            serve_consumption_recovery(stream, &signing_key, &query)?;
+            read_json_frame(stream)?
+        } else {
+            serde_json::from_value(next)
+                .map_err(|error| format!("Core sent a malformed authorization request: {error}"))?
+        };
     let request_identity =
         message_identity(AUTHORIZATION_REQUEST_DOMAIN_V1.as_bytes(), &request)
             .map_err(|error| format!("failed to identify authorization request: {error}"))?;
+    verify_catch_all_invocation(scenario, &request)?;
     let decision_time = if matches!(scenario, Scenario::Expired) {
         now - time::Duration::seconds(120)
     } else {
@@ -330,6 +433,16 @@ fn serve_session(stream: &mut UnixStream, scenario: Scenario) -> Result<(), Stri
     if matches!(scenario, Scenario::WrongScope) {
         decision_payload.semantic_scope_identity = format!("sha256:{}", "f".repeat(64));
     }
+    if matches!(
+        scenario,
+        Scenario::PendingTimeout
+            | Scenario::PendingCancelled
+            | Scenario::PendingLateApproval
+            | Scenario::PendingAmbiguous
+    ) {
+        decision_payload.decision = AuthorizationDecision::Pending;
+        decision_payload.approval_reference = None;
+    }
     let decision = sign_message(
         &signing_key,
         AUTHORIZATION_DECISION_DOMAIN_V1,
@@ -339,6 +452,80 @@ fn serve_session(stream: &mut UnixStream, scenario: Scenario) -> Result<(), Stri
         message_identity(AUTHORIZATION_DECISION_DOMAIN_V1.as_bytes(), &decision)
             .map_err(|error| format!("failed to identify authorization decision: {error}"))?;
     write_json_frame(stream, &decision)?;
+    if matches!(
+        scenario,
+        Scenario::PendingTimeout
+            | Scenario::PendingCancelled
+            | Scenario::PendingLateApproval
+            | Scenario::PendingAmbiguous
+    ) {
+        match scenario {
+            Scenario::PendingTimeout => {
+                std::thread::sleep(Duration::from_secs(3));
+                eprintln!("pressure-peer-scenario: pending-timeout");
+            }
+            Scenario::PendingCancelled => {
+                // SAFETY: the PID belongs to the launcher process started by this pressure peer.
+                if unsafe { libc::kill(child_pid as i32, libc::SIGINT) } != 0 {
+                    return Err(format!(
+                        "failed to interrupt pending pressure invocation: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                eprintln!("pressure-peer-scenario: pending-cancelled");
+            }
+            Scenario::PendingLateApproval => {
+                // SAFETY: the PID belongs to the launcher process started by this pressure peer.
+                if unsafe { libc::kill(child_pid as i32, libc::SIGINT) } != 0 {
+                    return Err(format!(
+                        "failed to interrupt late-approval pressure invocation: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                wait_for_linux_process_terminal(child_pid, Duration::from_secs(2))?;
+                let late_time = OffsetDateTime::now_utc();
+                let mut late_payload = decision.payload.clone();
+                late_payload.decision = AuthorizationDecision::Allowed;
+                late_payload.approval_reference = Some(String::from("pressure:late-approval"));
+                late_payload.broker_revision += 1;
+                late_payload.issued_at = formatted(late_time)?;
+                late_payload.expires_at = formatted(late_time + time::Duration::seconds(60))?;
+                let late_decision =
+                    sign_message(&signing_key, AUTHORIZATION_DECISION_DOMAIN_V1, late_payload)?;
+                write_protected_json(
+                    Path::new(LATE_APPROVAL_STATE_PATH),
+                    &serde_json::to_value(&late_decision).map_err(|error| {
+                        format!("failed to encode late-approval pressure state: {error}")
+                    })?,
+                    0o600,
+                )?;
+                let delivery_error = match write_json_frame(stream, &late_decision) {
+                    Ok(()) => {
+                        return Err(String::from(
+                            "terminal cancelled launcher session accepted a late decision",
+                        ));
+                    }
+                    Err(error) => error,
+                };
+                eprintln!(
+                    "pressure-peer-scenario: late-approval-after-terminal-cancellation session-closed=true delivery-refused=true ({delivery_error})"
+                );
+            }
+            Scenario::PendingAmbiguous => {
+                let mut conflicting_payload = decision.payload.clone();
+                conflicting_payload.broker_revision = 2;
+                let conflicting = sign_message(
+                    &signing_key,
+                    AUTHORIZATION_DECISION_DOMAIN_V1,
+                    conflicting_payload,
+                )?;
+                write_json_frame(stream, &conflicting)?;
+                eprintln!("pressure-peer-scenario: pending-ambiguous");
+            }
+            _ => unreachable!("pending scenario matched above"),
+        }
+        return Ok(());
+    }
     if matches!(scenario, Scenario::Expired | Scenario::WrongScope) {
         eprintln!(
             "pressure-peer-scenario: {}",
@@ -384,17 +571,27 @@ fn serve_session(stream: &mut UnixStream, scenario: Scenario) -> Result<(), Stri
     let consume_identity = message_identity(LEASE_CONSUME_DOMAIN_V1.as_bytes(), &consume)
         .map_err(|error| format!("failed to identify consume request: {error}"))?;
     let state = match scenario {
-        Scenario::Live => LeaseConsumeState::Consumed,
+        Scenario::Live | Scenario::CatchAllFirst | Scenario::CatchAllSecond => {
+            LeaseConsumeState::Consumed
+        }
         Scenario::Revoked => LeaseConsumeState::Revoked,
         Scenario::Replay => LeaseConsumeState::AlreadyConsumed,
-        Scenario::Expired | Scenario::WrongScope => unreachable!("scenario returned earlier"),
+        Scenario::ConsumeResponseLost | Scenario::RecoveryConsumed => LeaseConsumeState::Consumed,
+        Scenario::Expired
+        | Scenario::WrongScope
+        | Scenario::Unavailable
+        | Scenario::PendingTimeout
+        | Scenario::PendingCancelled
+        | Scenario::PendingLateApproval
+        | Scenario::InsufficientPreWaitFreshness
+        | Scenario::PendingAmbiguous => unreachable!("scenario returned earlier"),
     };
     let response = sign_message(
         &signing_key,
         LEASE_CONSUME_RESPONSE_DOMAIN_V1,
         LeaseConsumeResponsePayload {
             message_kind: String::from("lease_consume_response"),
-            consume_request_identity: consume_identity,
+            consume_request_identity: consume_identity.clone(),
             binding_identity: consume.binding_identity.clone(),
             lease_identity: consume.lease_identity.clone(),
             challenge_nonce_commitment: consume.challenge_nonce_commitment.clone(),
@@ -406,23 +603,174 @@ fn serve_session(stream: &mut UnixStream, scenario: Scenario) -> Result<(), Stri
             consumed_at: formatted(OffsetDateTime::now_utc())?,
         },
     )?;
+    if matches!(scenario, Scenario::ConsumeResponseLost) {
+        write_protected_json(
+            Path::new(RECOVERY_STATE_PATH),
+            &serde_json::to_value(StoredConsumptionRecovery {
+                consume_request_identity: consume_identity,
+                consume_request: consume,
+                consume_response: response,
+            })
+            .map_err(|error| format!("failed to encode pressure recovery state: {error}"))?,
+            0o600,
+        )?;
+        stream
+            .shutdown(Shutdown::Both)
+            .map_err(|error| format!("failed to end uncertain consume session: {error}"))?;
+        eprintln!("pressure-peer-scenario: consume-response-lost");
+        return Ok(());
+    }
     write_json_frame(stream, &response)?;
     eprintln!(
         "pressure-peer-scenario: {}",
         match scenario {
             Scenario::Live => "consumed",
+            Scenario::CatchAllFirst => "catch-all-first-consumed",
+            Scenario::CatchAllSecond => "catch-all-second-distinct-work-unit-consumed",
             Scenario::Revoked => "revoked-consume",
             Scenario::Replay => "already-consumed",
-            Scenario::Expired | Scenario::WrongScope => unreachable!("scenario returned earlier"),
+            Scenario::RecoveryConsumed => "recovery-consumed-then-fresh-consumed",
+            Scenario::ConsumeResponseLost => unreachable!("scenario returned before response"),
+            Scenario::Expired
+            | Scenario::WrongScope
+            | Scenario::Unavailable
+            | Scenario::PendingTimeout
+            | Scenario::PendingCancelled
+            | Scenario::PendingLateApproval
+            | Scenario::InsufficientPreWaitFreshness
+            | Scenario::PendingAmbiguous => unreachable!("scenario returned earlier"),
         }
     );
     Ok(())
+}
+
+fn serve_consumption_recovery(
+    stream: &mut UnixStream,
+    signing_key: &SigningKey,
+    query: &LeaseConsumptionQuery,
+) -> Result<(), String> {
+    let bytes = fs::read(RECOVERY_STATE_PATH)
+        .map_err(|error| format!("failed to read pressure recovery state: {error}"))?;
+    let stored: StoredConsumptionRecovery = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("failed to parse pressure recovery state: {error}"))?;
+    if query.message_kind != "lease_consumption_query"
+        || query.lease_identity != stored.consume_request.lease_identity
+        || query.consume_request_identity != stored.consume_request_identity
+        || query.original_work_unit_identity != stored.consume_request.work_unit_identity
+        || query.crossing_transaction_id != stored.consume_request.crossing_transaction_id
+        || query.crossing_transaction_identity
+            != stored.consume_request.crossing_transaction_identity
+    {
+        return Err(String::from(
+            "Core recovery query does not bind the stored uncertain consume intent",
+        ));
+    }
+    let query_identity = message_identity(LEASE_CONSUMPTION_QUERY_DOMAIN_V1.as_bytes(), query)
+        .map_err(|error| format!("failed to identify recovery query: {error}"))?;
+    let status = sign_message(
+        signing_key,
+        LEASE_CONSUMPTION_STATUS_DOMAIN_V1,
+        LeaseConsumptionStatusPayload {
+            message_kind: String::from("lease_consumption_status"),
+            query_identity,
+            binding_identity: query.binding_identity.clone(),
+            attestation_identity: query.attestation_identity.clone(),
+            recovery_challenge_nonce_commitment: query.recovery_challenge_nonce_commitment.clone(),
+            recovery_work_unit_identity: query.recovery_work_unit_identity.clone(),
+            lease_identity: query.lease_identity.clone(),
+            consume_request_identity: query.consume_request_identity.clone(),
+            original_work_unit_identity: query.original_work_unit_identity.clone(),
+            crossing_transaction_id: query.crossing_transaction_id.clone(),
+            crossing_transaction_identity: query.crossing_transaction_identity.clone(),
+            broker_revision: stored.consume_response.payload.broker_revision,
+            observed_at: formatted(OffsetDateTime::now_utc())?,
+            status: LeaseConsumptionStatus::Consumed {
+                consume_response: Box::new(stored.consume_response),
+            },
+        },
+    )?;
+    write_json_frame(stream, &status)?;
+    eprintln!("pressure-peer-scenario: recovered-consumed-status");
+    Ok(())
+}
+
+fn verify_catch_all_invocation(
+    scenario: Scenario,
+    request: &AuthorizationRequest,
+) -> Result<(), String> {
+    match scenario {
+        Scenario::CatchAllFirst => write_protected_json(
+            Path::new(CATCH_ALL_STATE_PATH),
+            &serde_json::to_value(StoredCatchAllInvocation {
+                semantic_scope_identity: request.semantic_scope_identity.clone(),
+                work_unit_identity: request.work_unit_identity.clone(),
+            })
+            .map_err(|error| format!("failed to encode catch-all pressure state: {error}"))?,
+            0o600,
+        ),
+        Scenario::CatchAllSecond => {
+            let bytes = fs::read(CATCH_ALL_STATE_PATH)
+                .map_err(|error| format!("failed to read catch-all pressure state: {error}"))?;
+            let first: StoredCatchAllInvocation = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("failed to parse catch-all pressure state: {error}"))?;
+            if request.semantic_scope_identity != first.semantic_scope_identity {
+                return Err(String::from(
+                    "catch-all invocation changed semantic scope between executions",
+                ));
+            }
+            if request.work_unit_identity == first.work_unit_identity {
+                return Err(String::from(
+                    "catch-all invocation reused the first work-unit identity",
+                ));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn wait_for_linux_process_terminal(child_pid: u32, timeout: Duration) -> Result<(), String> {
+    if !Path::new("/proc/self/stat").is_file() {
+        return Err(String::from(
+            "terminal cancellation pressure requires Linux process state",
+        ));
+    }
+    let status_path = PathBuf::from(format!("/proc/{child_pid}/stat"));
+    let deadline = Instant::now() + timeout;
+    loop {
+        match fs::read_to_string(&status_path) {
+            Ok(status) => {
+                let state = status
+                    .rsplit_once(") ")
+                    .and_then(|(_, fields)| fields.chars().next())
+                    .ok_or_else(|| {
+                        String::from("failed to parse cancelled launcher process state")
+                    })?;
+                if state == 'Z' {
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect cancelled launcher process state: {error}"
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(String::from(
+                "cancelled launcher did not reach a terminal process state",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn sign_attestation(
     signing_key: &SigningKey,
     challenge: &BrokerChallenge,
     now: OffsetDateTime,
+    lifetime_seconds: i64,
 ) -> Result<SignedLauncherAttestation, String> {
     let payload = LauncherAttestationPayload {
         message_kind: String::from("attestation_response"),
@@ -438,7 +786,7 @@ fn sign_attestation(
         issuer: String::from("runner-launcher"),
         audience: String::from("ota-crossing-broker"),
         issued_at: formatted(now)?,
-        expires_at: formatted(now + time::Duration::seconds(180))?,
+        expires_at: formatted(now + time::Duration::seconds(lifetime_seconds))?,
     };
     let canonical = serde_jcs::to_vec(&payload)
         .map_err(|error| format!("failed to canonicalize attestation: {error}"))?;
