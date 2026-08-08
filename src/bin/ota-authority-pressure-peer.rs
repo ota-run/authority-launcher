@@ -27,6 +27,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
@@ -98,6 +99,10 @@ enum Scenario {
     Revoked,
     WrongScope,
     Replay,
+    Unavailable,
+    PendingTimeout,
+    PendingCancelled,
+    PendingAmbiguous,
 }
 
 fn main() -> ExitCode {
@@ -189,7 +194,7 @@ fn provision(ota_binary: &Path, run_uid: u32, run_gid: u32, run_home: &Path) -> 
             "lease_consume": LEASE_CONSUME_DOMAIN_V1,
             "lease_consume_response": LEASE_CONSUME_RESPONSE_DOMAIN_V1
         },
-        "maximum_approval_wait_seconds": 120,
+        "maximum_approval_wait_seconds": 2,
         "minimum_post_approval_freshness_seconds": 30,
         "maximum_lease_seconds": 300
     });
@@ -281,7 +286,7 @@ fn execute(launcher: &Path, scenario: Scenario, ota_args: &[String]) -> Result<u
         .spawn()
         .map_err(|error| format!("failed to start protected launcher: {error}"))?;
     drop(launcher_session);
-    if let Err(error) = serve_session(&mut broker, scenario) {
+    if let Err(error) = serve_session(&mut broker, scenario, child.id()) {
         let _ = child.kill();
         let _ = child.wait();
         return Err(error);
@@ -292,7 +297,18 @@ fn execute(launcher: &Path, scenario: Scenario, ota_args: &[String]) -> Result<u
     Ok(status.code().unwrap_or(1).clamp(0, u8::MAX as i32) as u8)
 }
 
-fn serve_session(stream: &mut UnixStream, scenario: Scenario) -> Result<(), String> {
+fn serve_session(
+    stream: &mut UnixStream,
+    scenario: Scenario,
+    child_pid: u32,
+) -> Result<(), String> {
+    if matches!(scenario, Scenario::Unavailable) {
+        stream
+            .shutdown(Shutdown::Both)
+            .map_err(|error| format!("failed to close unavailable pressure session: {error}"))?;
+        eprintln!("pressure-peer-scenario: unavailable");
+        return Ok(());
+    }
     let signing_key = SigningKey::from_bytes(&SIGNING_SEED);
     let now = OffsetDateTime::now_utc();
     let challenge: BrokerChallenge = read_json_frame(stream)?;
@@ -330,6 +346,13 @@ fn serve_session(stream: &mut UnixStream, scenario: Scenario) -> Result<(), Stri
     if matches!(scenario, Scenario::WrongScope) {
         decision_payload.semantic_scope_identity = format!("sha256:{}", "f".repeat(64));
     }
+    if matches!(
+        scenario,
+        Scenario::PendingTimeout | Scenario::PendingCancelled | Scenario::PendingAmbiguous
+    ) {
+        decision_payload.decision = AuthorizationDecision::Pending;
+        decision_payload.approval_reference = None;
+    }
     let decision = sign_message(
         &signing_key,
         AUTHORIZATION_DECISION_DOMAIN_V1,
@@ -339,6 +362,40 @@ fn serve_session(stream: &mut UnixStream, scenario: Scenario) -> Result<(), Stri
         message_identity(AUTHORIZATION_DECISION_DOMAIN_V1.as_bytes(), &decision)
             .map_err(|error| format!("failed to identify authorization decision: {error}"))?;
     write_json_frame(stream, &decision)?;
+    if matches!(
+        scenario,
+        Scenario::PendingTimeout | Scenario::PendingCancelled | Scenario::PendingAmbiguous
+    ) {
+        match scenario {
+            Scenario::PendingTimeout => {
+                std::thread::sleep(Duration::from_secs(3));
+                eprintln!("pressure-peer-scenario: pending-timeout");
+            }
+            Scenario::PendingCancelled => {
+                // SAFETY: the PID belongs to the launcher process started by this pressure peer.
+                if unsafe { libc::kill(child_pid as i32, libc::SIGINT) } != 0 {
+                    return Err(format!(
+                        "failed to interrupt pending pressure invocation: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                eprintln!("pressure-peer-scenario: pending-cancelled");
+            }
+            Scenario::PendingAmbiguous => {
+                let mut conflicting_payload = decision.payload.clone();
+                conflicting_payload.broker_revision = 2;
+                let conflicting = sign_message(
+                    &signing_key,
+                    AUTHORIZATION_DECISION_DOMAIN_V1,
+                    conflicting_payload,
+                )?;
+                write_json_frame(stream, &conflicting)?;
+                eprintln!("pressure-peer-scenario: pending-ambiguous");
+            }
+            _ => unreachable!("pending scenario matched above"),
+        }
+        return Ok(());
+    }
     if matches!(scenario, Scenario::Expired | Scenario::WrongScope) {
         eprintln!(
             "pressure-peer-scenario: {}",
@@ -387,7 +444,12 @@ fn serve_session(stream: &mut UnixStream, scenario: Scenario) -> Result<(), Stri
         Scenario::Live => LeaseConsumeState::Consumed,
         Scenario::Revoked => LeaseConsumeState::Revoked,
         Scenario::Replay => LeaseConsumeState::AlreadyConsumed,
-        Scenario::Expired | Scenario::WrongScope => unreachable!("scenario returned earlier"),
+        Scenario::Expired
+        | Scenario::WrongScope
+        | Scenario::Unavailable
+        | Scenario::PendingTimeout
+        | Scenario::PendingCancelled
+        | Scenario::PendingAmbiguous => unreachable!("scenario returned earlier"),
     };
     let response = sign_message(
         &signing_key,
@@ -413,7 +475,12 @@ fn serve_session(stream: &mut UnixStream, scenario: Scenario) -> Result<(), Stri
             Scenario::Live => "consumed",
             Scenario::Revoked => "revoked-consume",
             Scenario::Replay => "already-consumed",
-            Scenario::Expired | Scenario::WrongScope => unreachable!("scenario returned earlier"),
+            Scenario::Expired
+            | Scenario::WrongScope
+            | Scenario::Unavailable
+            | Scenario::PendingTimeout
+            | Scenario::PendingCancelled
+            | Scenario::PendingAmbiguous => unreachable!("scenario returned earlier"),
         }
     );
     Ok(())

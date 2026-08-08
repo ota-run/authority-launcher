@@ -52,7 +52,7 @@ jobs:
 
       - name: Verify exact Ota source identity
         env:
-          EXPECTED_OTA_REVISION: bd80b29d971ccd5ac8609d9fc767a491ff382ef8
+          EXPECTED_OTA_REVISION: 257be61dd91799237357390b145be950f2fc6b3f
           OBSERVED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
         run: test "$OBSERVED_OTA_REVISION" = "$EXPECTED_OTA_REVISION"
 
@@ -153,7 +153,7 @@ jobs:
             ) > "$EVIDENCE_DIR/$scenario.before"
           }
 
-          for scenario in live expired revoked wrong-scope replay; do
+          for scenario in live expired revoked wrong-scope replay unavailable pending-timeout pending-cancelled pending-ambiguous; do
             make_repo "$scenario"
             repo="$PRESSURE_ROOT/$scenario"
             output="$EVIDENCE_DIR/$scenario.output"
@@ -215,6 +215,26 @@ jobs:
                   grep -q 'crossing_broker_admission_refused' "$output"
                   grep -q 'pressure-peer-scenario: wrong-scope-decision' "$output"
                   ;;
+                unavailable)
+                  test ! -e "$repo/.ota"
+                  grep -q 'crossing_broker_admission_refused' "$output"
+                  grep -q 'pressure-peer-scenario: unavailable' "$output"
+                  ;;
+                pending-timeout)
+                  test ! -e "$repo/.ota"
+                  grep -q 'crossing_broker_admission_refused' "$output"
+                  grep -q 'pressure-peer-scenario: pending-timeout' "$output"
+                  ;;
+                pending-cancelled)
+                  test ! -e "$repo/.ota"
+                  grep -q 'crossing_broker_admission_refused' "$output"
+                  grep -q 'pressure-peer-scenario: pending-cancelled' "$output"
+                  ;;
+                pending-ambiguous)
+                  test ! -e "$repo/.ota"
+                  grep -q 'crossing_broker_admission_refused' "$output"
+                  grep -q 'pressure-peer-scenario: pending-ambiguous' "$output"
+                  ;;
                 revoked)
                   test -d "$repo/.ota/state/crossings"
                   test -z "$(cd "$repo" && find .ota -mindepth 1 \
@@ -239,7 +259,7 @@ jobs:
 
           ota --version --json > "$EVIDENCE_DIR/ota-version.json"
           jq -e \
-            '.source_build == true and .dirty == false and .commit == "bd80b29d9"' \
+            '.source_build == true and .dirty == false and .commit == "257be61dd"' \
             "$EVIDENCE_DIR/ota-version.json"
 
       - name: Exercise proof-wide broker authority
