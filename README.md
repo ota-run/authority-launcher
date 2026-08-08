@@ -55,8 +55,11 @@ The feature-gated `ota-authority-pressure-peer` binary is an exception for confo
 only. It uses fixed public test keys and deterministic scenarios to exercise the complete protocol
 through a real launcher/Core process chain. Its scenarios prove live consumption plus expired,
 revoked, wrong-scope, already-consumed, unavailable, timed-out, cancelled, and ambiguous
-pre-execution refusal; the separate reference-store regression proves atomic one-use state. It
-is not installed by default and must never be used as an operator broker or authority issuer.
+pre-execution refusal. A paired recovery scenario withholds an already-consumed response, then
+proves that a fresh launcher session re-queries the exact durable intent, closes the abandoned
+transaction without execution, and requires a newly consumed lease before work starts. The
+separate reference-store regression proves atomic one-use state. The pressure peer is not installed
+by default and must never be used as an operator broker or authority issuer.
 
 ## Why it exists
 

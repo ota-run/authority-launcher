@@ -44,13 +44,14 @@ use ota_authority_protocol::{
     ATTESTATION_RESPONSE_DOMAIN_V1, AUTHORIZATION_DECISION_DOMAIN_V1,
     AUTHORIZATION_REQUEST_DOMAIN_V1, AuthorizationDecision, AuthorizationDecisionPayload,
     AuthorizationRequest, BROKER_BINDING_IDENTITY_DOMAIN_V1, BrokerChallenge, CHALLENGE_REQUEST,
-    LEASE_CONSUME_DOMAIN_V1, LEASE_CONSUME_RESPONSE_DOMAIN_V1, LEASE_ISSUANCE_DOMAIN_V1,
-    LauncherAttestationPayload, LeaseConsumeRequest, LeaseConsumeResponsePayload,
-    LeaseConsumeState, PreparedLeasePayload, SignedBrokerMessage, SignedLauncherAttestation,
-    message_identity,
+    LEASE_CONSUME_DOMAIN_V1, LEASE_CONSUME_RESPONSE_DOMAIN_V1, LEASE_CONSUMPTION_QUERY_DOMAIN_V1,
+    LEASE_CONSUMPTION_STATUS_DOMAIN_V1, LEASE_ISSUANCE_DOMAIN_V1, LauncherAttestationPayload,
+    LeaseConsumeRequest, LeaseConsumeResponsePayload, LeaseConsumeState, LeaseConsumptionQuery,
+    LeaseConsumptionStatus, LeaseConsumptionStatusPayload, PreparedLeasePayload,
+    SignedBrokerMessage, SignedLauncherAttestation, message_identity,
 };
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -60,6 +61,15 @@ const BROKER_DESCRIPTOR: RawFd = 4;
 const OTA_DESCRIPTOR: RawFd = 3;
 const SIGNING_SEED: [u8; 32] = [9_u8; 32];
 const KEY_ID: &str = "broker-2026-01";
+const RECOVERY_STATE_PATH: &str = "/var/lib/ota/pressure-consumption-recovery.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredConsumptionRecovery {
+    consume_request_identity: String,
+    consume_request: LeaseConsumeRequest,
+    consume_response: SignedBrokerMessage<LeaseConsumeResponsePayload>,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "ota-authority-pressure-peer", version, about)]
@@ -103,6 +113,8 @@ enum Scenario {
     PendingTimeout,
     PendingCancelled,
     PendingAmbiguous,
+    ConsumeResponseLost,
+    RecoveryConsumed,
 }
 
 fn main() -> ExitCode {
@@ -138,6 +150,11 @@ fn provision(ota_binary: &Path, run_uid: u32, run_gid: u32, run_home: &Path) -> 
             .map_err(|error| format!("failed to create protected store: {error}"))?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))
             .map_err(|error| format!("failed to protect authority store: {error}"))?;
+    }
+    if let Err(error) = fs::remove_file(RECOVERY_STATE_PATH)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(format!("failed to clear pressure recovery state: {error}"));
     }
     let signing_key = SigningKey::from_bytes(&SIGNING_SEED);
     let public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes());
@@ -192,7 +209,9 @@ fn provision(ota_binary: &Path, run_uid: u32, run_gid: u32, run_home: &Path) -> 
             "authorization_decision": AUTHORIZATION_DECISION_DOMAIN_V1,
             "lease_issuance": LEASE_ISSUANCE_DOMAIN_V1,
             "lease_consume": LEASE_CONSUME_DOMAIN_V1,
-            "lease_consume_response": LEASE_CONSUME_RESPONSE_DOMAIN_V1
+            "lease_consume_response": LEASE_CONSUME_RESPONSE_DOMAIN_V1,
+            "lease_consumption_query": LEASE_CONSUMPTION_QUERY_DOMAIN_V1,
+            "lease_consumption_status": LEASE_CONSUMPTION_STATUS_DOMAIN_V1
         },
         "maximum_approval_wait_seconds": 2,
         "minimum_post_approval_freshness_seconds": 30,
@@ -318,7 +337,22 @@ fn serve_session(
     let attestation = sign_attestation(&signing_key, &challenge, now)?;
     write_json_frame(stream, &attestation)?;
 
-    let request: AuthorizationRequest = read_json_frame(stream)?;
+    let next: Value = read_json_frame(stream)?;
+    let request: AuthorizationRequest =
+        if next.get("message_kind").and_then(Value::as_str) == Some("lease_consumption_query") {
+            if !matches!(scenario, Scenario::RecoveryConsumed) {
+                return Err(String::from(
+                    "Core sent a recovery query outside the recovery pressure scenario",
+                ));
+            }
+            let query: LeaseConsumptionQuery = serde_json::from_value(next)
+                .map_err(|error| format!("Core sent a malformed recovery query: {error}"))?;
+            serve_consumption_recovery(stream, &signing_key, &query)?;
+            read_json_frame(stream)?
+        } else {
+            serde_json::from_value(next)
+                .map_err(|error| format!("Core sent a malformed authorization request: {error}"))?
+        };
     let request_identity =
         message_identity(AUTHORIZATION_REQUEST_DOMAIN_V1.as_bytes(), &request)
             .map_err(|error| format!("failed to identify authorization request: {error}"))?;
@@ -444,6 +478,7 @@ fn serve_session(
         Scenario::Live => LeaseConsumeState::Consumed,
         Scenario::Revoked => LeaseConsumeState::Revoked,
         Scenario::Replay => LeaseConsumeState::AlreadyConsumed,
+        Scenario::ConsumeResponseLost | Scenario::RecoveryConsumed => LeaseConsumeState::Consumed,
         Scenario::Expired
         | Scenario::WrongScope
         | Scenario::Unavailable
@@ -456,7 +491,7 @@ fn serve_session(
         LEASE_CONSUME_RESPONSE_DOMAIN_V1,
         LeaseConsumeResponsePayload {
             message_kind: String::from("lease_consume_response"),
-            consume_request_identity: consume_identity,
+            consume_request_identity: consume_identity.clone(),
             binding_identity: consume.binding_identity.clone(),
             lease_identity: consume.lease_identity.clone(),
             challenge_nonce_commitment: consume.challenge_nonce_commitment.clone(),
@@ -468,6 +503,23 @@ fn serve_session(
             consumed_at: formatted(OffsetDateTime::now_utc())?,
         },
     )?;
+    if matches!(scenario, Scenario::ConsumeResponseLost) {
+        write_protected_json(
+            Path::new(RECOVERY_STATE_PATH),
+            &serde_json::to_value(StoredConsumptionRecovery {
+                consume_request_identity: consume_identity,
+                consume_request: consume,
+                consume_response: response,
+            })
+            .map_err(|error| format!("failed to encode pressure recovery state: {error}"))?,
+            0o600,
+        )?;
+        stream
+            .shutdown(Shutdown::Both)
+            .map_err(|error| format!("failed to end uncertain consume session: {error}"))?;
+        eprintln!("pressure-peer-scenario: consume-response-lost");
+        return Ok(());
+    }
     write_json_frame(stream, &response)?;
     eprintln!(
         "pressure-peer-scenario: {}",
@@ -475,6 +527,8 @@ fn serve_session(
             Scenario::Live => "consumed",
             Scenario::Revoked => "revoked-consume",
             Scenario::Replay => "already-consumed",
+            Scenario::RecoveryConsumed => "recovery-consumed-then-fresh-consumed",
+            Scenario::ConsumeResponseLost => unreachable!("scenario returned before response"),
             Scenario::Expired
             | Scenario::WrongScope
             | Scenario::Unavailable
@@ -483,6 +537,56 @@ fn serve_session(
             | Scenario::PendingAmbiguous => unreachable!("scenario returned earlier"),
         }
     );
+    Ok(())
+}
+
+fn serve_consumption_recovery(
+    stream: &mut UnixStream,
+    signing_key: &SigningKey,
+    query: &LeaseConsumptionQuery,
+) -> Result<(), String> {
+    let bytes = fs::read(RECOVERY_STATE_PATH)
+        .map_err(|error| format!("failed to read pressure recovery state: {error}"))?;
+    let stored: StoredConsumptionRecovery = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("failed to parse pressure recovery state: {error}"))?;
+    if query.message_kind != "lease_consumption_query"
+        || query.lease_identity != stored.consume_request.lease_identity
+        || query.consume_request_identity != stored.consume_request_identity
+        || query.original_work_unit_identity != stored.consume_request.work_unit_identity
+        || query.crossing_transaction_id != stored.consume_request.crossing_transaction_id
+        || query.crossing_transaction_identity
+            != stored.consume_request.crossing_transaction_identity
+    {
+        return Err(String::from(
+            "Core recovery query does not bind the stored uncertain consume intent",
+        ));
+    }
+    let query_identity = message_identity(LEASE_CONSUMPTION_QUERY_DOMAIN_V1.as_bytes(), query)
+        .map_err(|error| format!("failed to identify recovery query: {error}"))?;
+    let status = sign_message(
+        signing_key,
+        LEASE_CONSUMPTION_STATUS_DOMAIN_V1,
+        LeaseConsumptionStatusPayload {
+            message_kind: String::from("lease_consumption_status"),
+            query_identity,
+            binding_identity: query.binding_identity.clone(),
+            attestation_identity: query.attestation_identity.clone(),
+            recovery_challenge_nonce_commitment: query.recovery_challenge_nonce_commitment.clone(),
+            recovery_work_unit_identity: query.recovery_work_unit_identity.clone(),
+            lease_identity: query.lease_identity.clone(),
+            consume_request_identity: query.consume_request_identity.clone(),
+            original_work_unit_identity: query.original_work_unit_identity.clone(),
+            crossing_transaction_id: query.crossing_transaction_id.clone(),
+            crossing_transaction_identity: query.crossing_transaction_identity.clone(),
+            broker_revision: stored.consume_response.payload.broker_revision,
+            observed_at: formatted(OffsetDateTime::now_utc())?,
+            status: LeaseConsumptionStatus::Consumed {
+                consume_response: Box::new(stored.consume_response),
+            },
+        },
+    )?;
+    write_json_frame(stream, &status)?;
+    eprintln!("pressure-peer-scenario: recovered-consumed-status");
     Ok(())
 }
 

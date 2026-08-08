@@ -52,7 +52,7 @@ jobs:
 
       - name: Verify exact Ota source identity
         env:
-          EXPECTED_OTA_REVISION: 257be61dd91799237357390b145be950f2fc6b3f
+          EXPECTED_OTA_REVISION: 9244eb2bc6a44151c4172c0634ac44bdb216a65a
           OBSERVED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
         run: test "$OBSERVED_OTA_REVISION" = "$EXPECTED_OTA_REVISION"
 
@@ -142,7 +142,7 @@ jobs:
               socket:*) echo "broker descriptor leaked into task" >&2; exit 97 ;;
             esac
           done
-          touch broker-executed
+          printf x >> broker-executed
           SH
             chmod 0755 "$repo/pressure-task.sh"
             printf '.ota/\n' > "$repo/.gitignore"
@@ -257,9 +257,60 @@ jobs:
             fi
           done
 
+          make_repo consume-recovery
+          recovery_repo="$PRESSURE_ROOT/consume-recovery"
+          recovery_first="$EVIDENCE_DIR/consume-recovery-first.output"
+          if (
+            cd "$recovery_repo"
+            sudo /usr/lib/ota-authority/bin/ota-authority-pressure-peer execute \
+              --launcher /usr/lib/ota-authority/bin/ota-authority-launcher \
+              --scenario consume-response-lost \
+              -- run publish --grant platform-release-authority --reason pressure
+          ) >"$recovery_first" 2>&1; then
+            echo "lost consume response unexpectedly executed" >&2
+            exit 1
+          fi
+          test ! -e "$recovery_repo/broker-executed"
+          test "$(stat -c '%U:%G:%a' /var/lib/ota/pressure-consumption-recovery.json)" = "root:root:600"
+          grep -q 'pressure-peer-scenario: consume-response-lost' "$recovery_first"
+          grep -q 'crossing_broker_consumption_refused' "$recovery_first"
+          (
+            cd "$recovery_repo"
+            find . -path './.ota' -prune -o -printf '%y %P %l\n' | sort
+            find . -path './.ota' -prune -o -type f -print0 | sort -z | xargs -0 sha256sum
+          ) > "$EVIDENCE_DIR/consume-recovery.after-first"
+          cmp "$EVIDENCE_DIR/consume-recovery.before" "$EVIDENCE_DIR/consume-recovery.after-first"
+
+          recovery_second="$EVIDENCE_DIR/consume-recovery-second.output"
+          (
+            cd "$recovery_repo"
+            sudo /usr/lib/ota-authority/bin/ota-authority-pressure-peer execute \
+              --launcher /usr/lib/ota-authority/bin/ota-authority-launcher \
+              --scenario recovery-consumed \
+              -- run publish --grant platform-release-authority --reason pressure
+          ) >"$recovery_second" 2>&1
+          test -f "$recovery_repo/broker-executed"
+          test "$(wc -c < "$recovery_repo/broker-executed")" -eq 1
+          grep -q 'pressure-peer-scenario: recovered-consumed-status' "$recovery_second"
+          grep -q 'pressure-peer-scenario: recovery-consumed-then-fresh-consumed' "$recovery_second"
+          jq -s -e '
+            map(select(
+              .state == "incomplete" and
+              .receipt_status == "broker_consumption_recovered_without_execution" and
+              .broker_consumption.consume_response.payload.state == "consumed" and
+              .broker_consumption_recovery.status.payload.status.state == "consumed"
+            )) | length == 1
+          ' "$recovery_repo"/.ota/state/crossings/*/*.json
+          (
+            cd "$recovery_repo"
+            ota receipt --history --json
+          ) > "$EVIDENCE_DIR/consume-recovery.receipt-history.json"
+          jq -e '.summary.archive_count == 1 and .summary.invalid_archive_count == 0' \
+            "$EVIDENCE_DIR/consume-recovery.receipt-history.json"
+
           ota --version --json > "$EVIDENCE_DIR/ota-version.json"
           jq -e \
-            '.source_build == true and .dirty == false and .commit == "257be61dd"' \
+            '.source_build == true and .dirty == false and .commit == "9244eb2b"' \
             "$EVIDENCE_DIR/ota-version.json"
 
       - name: Exercise proof-wide broker authority
