@@ -131,7 +131,7 @@ jobs:
       - name: Exercise signed live and adversarial broker scenarios
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/authority-pressure-evidence
-          PRESSURE_ROOT: ${{ runner.temp }}/authority-pressure-repos
+          PRESSURE_ROOT: /tmp/ota-authority-pressure-repos-${{ github.run_id }}
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR" "$PRESSURE_ROOT"
@@ -486,7 +486,7 @@ jobs:
       - name: Exercise proof-wide broker authority
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/authority-pressure-evidence
-          PROOF_ROOT: ${{ runner.temp }}/authority-proof-repos
+          PROOF_ROOT: /tmp/ota-authority-proof-repos-${{ github.run_id }}
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR" "$PROOF_ROOT/runtime" "$PROOF_ROOT/lifecycle"
