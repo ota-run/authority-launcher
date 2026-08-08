@@ -52,7 +52,7 @@ jobs:
 
       - name: Verify exact Ota source identity
         env:
-          EXPECTED_OTA_REVISION: 9244eb2bc6a44151c4172c0634ac44bdb216a65a
+          EXPECTED_OTA_REVISION: 787ac35f7d0195d2adae85e1113e26ce4a30acc2
           OBSERVED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
         run: test "$OBSERVED_OTA_REVISION" = "$EXPECTED_OTA_REVISION"
 
@@ -72,13 +72,24 @@ jobs:
       - name: Build pressure-only signed peer
         run: cargo build --features pressure-peer --bins
 
+      - name: Create constrained pressure principal
+        run: |
+          sudo useradd --create-home --shell /usr/sbin/nologin ota-pressure
+          pressure_uid=$(id -u ota-pressure)
+          pressure_gid=$(id -g ota-pressure)
+          test "$pressure_uid" -ne 0
+          test "$(id -G ota-pressure | wc -w)" -eq 1
+          test ! -S /var/run/docker.sock || sudo -u ota-pressure test ! -r /var/run/docker.sock
+          printf 'PRESSURE_UID=%s\nPRESSURE_GID=%s\nPRESSURE_HOME=/home/ota-pressure\n' \
+            "$pressure_uid" "$pressure_gid" >> "$GITHUB_ENV"
+
       - name: Install protected pressure binaries and authority binding
         run: |
           sudo install -d -o root -g root -m 0755 /usr/lib/ota-authority/bin /usr/lib/ota-authority/pressure-bin
           sudo install -d -o root -g root -m 0755 /etc/ota /var/lib/ota
           sudo install -o root -g root -m 0755 "$(command -v ota)" /usr/lib/ota-authority/bin/ota-pressure-core
           sudo install -o root -g root -m 0755 target/debug/ota-authority-launcher /usr/lib/ota-authority/bin/ota-authority-launcher
-          sudo install -o root -g root -m 0755 target/debug/ota-authority-pressure-peer /usr/lib/ota-authority/bin/ota-authority-pressure-peer
+          sudo install -o root -g root -m 0700 target/debug/ota-authority-pressure-peer /usr/lib/ota-authority/bin/ota-authority-pressure-peer
           pressure_docker=$(mktemp)
           cat > "$pressure_docker" <<'SH'
           #!/bin/sh
@@ -101,11 +112,20 @@ jobs:
           rm -f "$pressure_docker"
           sudo /usr/lib/ota-authority/bin/ota-authority-pressure-peer provision \
             --ota-binary /usr/lib/ota-authority/bin/ota-pressure-core \
-            --run-uid "$(id -u)" \
-            --run-gid "$(id -g)" \
-            --run-home "$HOME"
+            --run-uid "$PRESSURE_UID" \
+            --run-gid "$PRESSURE_GID" \
+            --run-home "$PRESSURE_HOME"
           test "$(stat -c '%U:%G:%a' /etc/ota/crossing-brokers.json)" = "root:root:644"
           test "$(stat -c '%U:%G:%a' /etc/ota/authority-launcher.json)" = "root:root:600"
+          test "$(stat -c '%U:%G:%a' /usr/lib/ota-authority/bin/ota-authority-pressure-peer)" = "root:root:700"
+          sudo -u ota-pressure test ! -w /etc/ota/crossing-brokers.json
+          sudo -u ota-pressure test ! -r /etc/ota/authority-launcher.json
+          sudo -u ota-pressure test ! -r /usr/lib/ota-authority/bin/ota-authority-pressure-peer
+          chmod 0700 "$GITHUB_WORKSPACE"
+          sudo -u ota-pressure test ! -r "$GITHUB_WORKSPACE/src/bin/ota-authority-pressure-peer.rs"
+          for socket in /var/run/docker.sock /run/docker.sock /run/containerd/containerd.sock /var/run/crio/crio.sock /run/podman/podman.sock; do
+            test ! -S "$socket" || sudo -u ota-pressure test ! -r "$socket"
+          done
           namei -l /etc/ota/authority-launcher.json /etc/ota/crossing-brokers.json /usr/lib/ota-authority/bin/ota-pressure-core
 
       - name: Exercise signed live and adversarial broker scenarios
@@ -115,6 +135,14 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR" "$PRESSURE_ROOT"
+          cat > "$EVIDENCE_DIR/runtime-boundary.txt" <<'EOF'
+          Bounded hosted conformance checks:
+          - Core target principal is non-root and has no supplemental groups.
+          - Standard Docker, containerd, CRI-O, and Podman control sockets are absent or unreadable.
+          - Protected launcher configuration and pressure-only signing material are unreadable.
+          - Ota launcher process policy applies no_new_privs and descriptor sanitization.
+          This is not provider attestation or proof of host-wide isolation.
+          EOF
 
           make_repo() {
             local scenario="$1"
@@ -146,6 +174,7 @@ jobs:
           SH
             chmod 0755 "$repo/pressure-task.sh"
             printf '.ota/\n' > "$repo/.gitignore"
+            sudo chown -R "$PRESSURE_UID:$PRESSURE_GID" "$repo"
             (
               cd "$repo"
               find . -path './.ota' -prune -o -printf '%y %P %l\n' | sort
@@ -178,6 +207,26 @@ jobs:
               fi
               jq -e '
                 .receipt.crossing.authority.authority_carrier == "authority_broker" and
+                .receipt.crossing.authority.authority_separation_posture == "protected_launcher_attested_one_use" and
+                .receipt.crossing.authority.archive_evidence.admission.binding_snapshot.schema_version == 2 and
+                .receipt.crossing.authority.archive_evidence.admission.attestation.payload.attestation_protocol_version == "ota-runtime-boundary-attestation/v2" and
+                .receipt.crossing.authority.archive_evidence.admission.attestation.payload.runtime_boundary.profile_id == "ota.runtime-boundary.protected-launcher/v1" and
+                .receipt.crossing.authority.archive_evidence.admission.attestation.payload.runtime_boundary.profile_identity == .receipt.crossing.authority.archive_evidence.admission.binding_snapshot.attestation.profile_identity and
+                [.receipt.crossing.authority.archive_evidence.admission.attestation.payload.runtime_boundary.observations[].name] == [
+                  "job_principal_non_root",
+                  "authority_binding_write_denied",
+                  "attestor_state_write_denied",
+                  "broker_credentials_absent_from_job",
+                  "broker_credentials_absent_from_task",
+                  "broker_session_non_inheritable",
+                  "broker_session_not_reacquirable",
+                  "host_control_socket_unavailable",
+                  "privilege_escalation_unavailable",
+                  "launcher_binary_identity_bound",
+                  "launcher_config_identity_bound"
+                ] and
+                all(.receipt.crossing.authority.archive_evidence.admission.attestation.payload.runtime_boundary.observations[]; .state == "verified") and
+                .receipt.crossing.authority.archive_evidence.admission.binding_snapshot.broker_verifiers[0].public_key != .receipt.crossing.authority.archive_evidence.admission.binding_snapshot.attestation.verifiers[0].public_key and
                 .receipt.crossing.authority.transaction.state == "completed" and
                 .receipt.crossing.authority.transaction.broker_consumption.consume_response.payload.state == "consumed" and
                 .receipt.crossing.id == .receipt.crossing.authority.transaction.transaction_id and
@@ -374,6 +423,7 @@ jobs:
           SH
           chmod 0755 "$catch_all_repo/pressure-task.sh"
           printf '.ota/\n' > "$catch_all_repo/.gitignore"
+          sudo chown -R "$PRESSURE_UID:$PRESSURE_GID" "$catch_all_repo"
 
           catch_all_first="$EVIDENCE_DIR/catch-all-first.output"
           (
@@ -412,6 +462,8 @@ jobs:
             fi
             jq -e '
               .receipt.crossing.authority.authority_carrier == "authority_broker" and
+              .receipt.crossing.authority.authority_separation_posture == "protected_launcher_attested_one_use" and
+              .receipt.crossing.authority.archive_evidence.admission.binding_snapshot.schema_version == 2 and
               .receipt.crossing.authority.transaction.state == "completed" and
               .receipt.crossing.authority.archive_evidence.admission.semantic_scope.breadth.closure_node_count == 3 and
               .receipt.crossing.authority.archive_evidence.admission.semantic_scope.breadth.closure_edge_count >= 2 and
@@ -428,7 +480,7 @@ jobs:
 
           ota --version --json > "$EVIDENCE_DIR/ota-version.json"
           jq -e \
-            '.source_build == true and .dirty == false and .commit == "9244eb2bc"' \
+            '.source_build == true and .dirty == false and .commit == "787ac35f"' \
             "$EVIDENCE_DIR/ota-version.json"
 
       - name: Exercise proof-wide broker authority
@@ -515,6 +567,7 @@ jobs:
             git add ota.yaml runtime-task.sh .gitignore
             git commit -qm "test: freeze runtime proof source"
           )
+          sudo chown -R "$PRESSURE_UID:$PRESSURE_GID" "$PROOF_ROOT/runtime"
 
           (
             cd "$PROOF_ROOT/runtime"
@@ -527,6 +580,7 @@ jobs:
             .ok == true and
             .proof_verdict == "passed_with_unproven_boundaries" and
             .crossing_evidence.authority.authority_carrier == "authority_broker" and
+            .crossing_evidence.authority.authority_separation_posture == "protected_launcher_attested_one_use" and
             .crossing_evidence.proof_execution_id == .execution_id and
             .crossing_evidence.transaction_id == .crossing_evidence.authority.transaction.transaction_id and
             .crossing_evidence.authority.transaction.state == "completed" and
@@ -540,6 +594,25 @@ jobs:
           jq -e '
             .version == 6 and
             .proof.execution_id == .proof.crossing_evidence.proof_execution_id and
+            .proof.crossing_evidence.authority.archive_evidence.admission.binding_snapshot.schema_version == 2 and
+            .proof.crossing_evidence.authority.archive_evidence.admission.attestation.payload.attestation_protocol_version == "ota-runtime-boundary-attestation/v2" and
+            .proof.crossing_evidence.authority.archive_evidence.admission.attestation.payload.runtime_boundary.profile_id == "ota.runtime-boundary.protected-launcher/v1" and
+            .proof.crossing_evidence.authority.archive_evidence.admission.attestation.payload.runtime_boundary.profile_identity == .proof.crossing_evidence.authority.archive_evidence.admission.binding_snapshot.attestation.profile_identity and
+            [.proof.crossing_evidence.authority.archive_evidence.admission.attestation.payload.runtime_boundary.observations[].name] == [
+              "job_principal_non_root",
+              "authority_binding_write_denied",
+              "attestor_state_write_denied",
+              "broker_credentials_absent_from_job",
+              "broker_credentials_absent_from_task",
+              "broker_session_non_inheritable",
+              "broker_session_not_reacquirable",
+              "host_control_socket_unavailable",
+              "privilege_escalation_unavailable",
+              "launcher_binary_identity_bound",
+              "launcher_config_identity_bound"
+            ] and
+            all(.proof.crossing_evidence.authority.archive_evidence.admission.attestation.payload.runtime_boundary.observations[]; .state == "verified") and
+            .proof.crossing_evidence.authority.archive_evidence.admission.binding_snapshot.broker_verifiers[0].public_key != .proof.crossing_evidence.authority.archive_evidence.admission.binding_snapshot.attestation.verifiers[0].public_key and
             .proof.crossing_evidence.authority.transaction.state == "completed"
           ' "$runtime_archive"
           if (
@@ -624,6 +697,7 @@ jobs:
           exec "$@"
           SH
           chmod 0755 "$PROOF_ROOT/lifecycle/assert-no-session.sh"
+          sudo chown -R "$PRESSURE_UID:$PRESSURE_GID" "$PROOF_ROOT/lifecycle"
           printf '%s\n' \
             'Pressure-only deterministic Compose control stub.' \
             'Proves Ota lifecycle authority, assertion ordering, finalization, and cleanup.' \
@@ -641,6 +715,7 @@ jobs:
             .ok == true and
             .proof_verdict == "passed_with_unproven_boundaries" and
             .crossing_evidence.authority.authority_carrier == "authority_broker" and
+            .crossing_evidence.authority.authority_separation_posture == "protected_launcher_attested_one_use" and
             .crossing_evidence.proof_execution_id == .transaction_id and
             .crossing_evidence.transaction_id == .crossing_evidence.authority.transaction.transaction_id and
             .crossing_evidence.authority.transaction.state == "completed" and
@@ -655,10 +730,29 @@ jobs:
           jq -e '
             .version == 3 and
             .proof.transaction_id == .proof.crossing_evidence.proof_execution_id and
+            .proof.crossing_evidence.authority.archive_evidence.admission.binding_snapshot.schema_version == 2 and
+            .proof.crossing_evidence.authority.archive_evidence.admission.attestation.payload.attestation_protocol_version == "ota-runtime-boundary-attestation/v2" and
+            .proof.crossing_evidence.authority.archive_evidence.admission.attestation.payload.runtime_boundary.profile_id == "ota.runtime-boundary.protected-launcher/v1" and
+            .proof.crossing_evidence.authority.archive_evidence.admission.attestation.payload.runtime_boundary.profile_identity == .proof.crossing_evidence.authority.archive_evidence.admission.binding_snapshot.attestation.profile_identity and
+            [.proof.crossing_evidence.authority.archive_evidence.admission.attestation.payload.runtime_boundary.observations[].name] == [
+              "job_principal_non_root",
+              "authority_binding_write_denied",
+              "attestor_state_write_denied",
+              "broker_credentials_absent_from_job",
+              "broker_credentials_absent_from_task",
+              "broker_session_non_inheritable",
+              "broker_session_not_reacquirable",
+              "host_control_socket_unavailable",
+              "privilege_escalation_unavailable",
+              "launcher_binary_identity_bound",
+              "launcher_config_identity_bound"
+            ] and
+            all(.proof.crossing_evidence.authority.archive_evidence.admission.attestation.payload.runtime_boundary.observations[]; .state == "verified") and
+            .proof.crossing_evidence.authority.archive_evidence.admission.binding_snapshot.broker_verifiers[0].public_key != .proof.crossing_evidence.authority.archive_evidence.admission.binding_snapshot.attestation.verifiers[0].public_key and
             .proof.crossing_evidence.authority.transaction.state == "completed" and
             .proof.finalization.state == "completed"
           ' "$lifecycle_archive"
-          test ! -e "$HOME/.ota-authority-pressure-compose-running"
+          test ! -e "$PRESSURE_HOME/.ota-authority-pressure-compose-running"
 
       - name: Upload bounded pressure evidence
         if: always()

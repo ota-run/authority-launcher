@@ -52,14 +52,25 @@ component is deployed with independently protected credentials and attestation, 
 one authority-system building block rather than a complete authority system.
 
 The feature-gated `ota-authority-pressure-peer` binary is an exception for conformance testing
-only. It uses fixed public test keys and deterministic scenarios to exercise the complete protocol
-through a real launcher/Core process chain. Its scenarios prove live consumption plus expired,
-revoked, wrong-scope, already-consumed, unavailable, timed-out, cancelled, and ambiguous
+only. It uses fixed public test keys and deterministic scenarios to exercise protocol v2 through a
+real launcher/Core process chain. The hosted lane runs Core as a dedicated non-root principal with
+no supplemental groups, no readable Docker socket, root-only pressure-peer access, protected
+authority files, and a strict signed protected-launcher profile. Its scenarios prove live
+consumption plus expired, revoked, wrong-scope, already-consumed, unavailable, timed-out,
+cancelled, and ambiguous
 pre-execution refusal. A paired recovery scenario withholds an already-consumed response, then
 proves that a fresh launcher session re-queries the exact durable intent, closes the abandoned
 transaction without execution, and requires a newly consumed lease before work starts. The
 separate reference-store regression proves atomic one-use state. The pressure peer is not installed
 by default and must never be used as an operator broker or authority issuer.
+
+Immediately before signing each challenge, the pressure attestor reconciles the live Ota child
+through Linux procfs: all UID/GID slots, supplementary groups, capabilities, `no_new_privs`, the
+exact launcher environment, the unnamed close-on-exec Unix session, protected-path access, common
+host-control sockets, and measured launcher/configuration identities.
+
+This is bounded conformance evidence for the test launcher boundary. It is not provider attestation,
+does not establish host-wide isolation, and does not turn the production launcher into an issuer.
 
 ## Why it exists
 

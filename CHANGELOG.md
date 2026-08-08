@@ -39,6 +39,12 @@
   transaction path. Its paired recovery case now withholds an already-consumed response, then
   proves exact signed status re-query and fresh-lease execution on a second launcher session;
   atomic one-use state remains covered by the reference-store regression.
+- Upgrade the pressure carrier to protocol v2 with disjoint broker and attestor keys, an exact
+  protected-launcher runtime-boundary profile, and receipt/archive assertions over the signed
+  profile. The hosted lane uses a dedicated non-root principal without supplemental groups or
+  readable Docker control and keeps the pressure peer root-only. The signer re-observes the live
+  child principal, capabilities, environment, unnamed session, protected access, and measured
+  launcher state after receiving the frozen challenge.
 - Start one fixed Ota binary as a configured non-root principal with Linux `no_new_privs`,
   parent-death signaling, and bounded process/session cleanup.
 - Add a contract-owned Linux/macOS verification matrix pinned to an exact Ota Core revision.
@@ -50,3 +56,5 @@
 
 - The current implementation does not create launcher attestations, connect to a remote broker,
   issue or consume leases, or establish provider-attested authority separation.
+- Protocol-v2 attestations are emitted only by the feature-gated pressure peer as bounded
+  conformance evidence; they do not establish provider-attested or host-wide isolation.
