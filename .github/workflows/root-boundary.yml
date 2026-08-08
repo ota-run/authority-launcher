@@ -480,7 +480,7 @@ jobs:
 
           ota --version --json > "$EVIDENCE_DIR/ota-version.json"
           jq -e \
-            '.source_build == true and .dirty == false and .commit == "787ac35f"' \
+            '.source_build == true and .dirty == false and .commit == "787ac35f7"' \
             "$EVIDENCE_DIR/ota-version.json"
 
       - name: Exercise proof-wide broker authority
