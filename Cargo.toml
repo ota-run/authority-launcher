@@ -57,11 +57,17 @@ pressure-peer = [
   "dep:serde_jcs",
   "dep:time",
 ]
+systemd-pressure-client = []
 
 [[bin]]
 name = "ota-authority-pressure-peer"
 path = "src/bin/ota-authority-pressure-peer.rs"
 required-features = ["pressure-peer"]
+
+[[bin]]
+name = "ota-authority-systemd-pressure-client"
+path = "src/bin/ota-authority-systemd-pressure-client.rs"
+required-features = ["systemd-pressure-client"]
 
 [profile.release]
 lto = "thin"

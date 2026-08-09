@@ -501,15 +501,27 @@ fn proc_unix_socket_matches_path(socket_inode: libc::ino_t, expected_path: &Path
     let Ok(table) = std::fs::read_to_string("/proc/net/unix") else {
         return false;
     };
-    let mut matching_paths = table.lines().skip(1).filter_map(|line| {
-        let mut fields = line.split_whitespace();
-        let inode = fields.nth(6)?;
-        if fields.next() != Some(expected_path) {
+    proc_unix_table_has_unique_listener(&table, socket_inode, expected_path)
+}
+
+fn proc_unix_table_has_unique_listener(
+    table: &str,
+    socket_inode: libc::ino_t,
+    expected_path: &str,
+) -> bool {
+    let mut matching_listeners = table.lines().skip(1).filter_map(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 8
+            || fields[3] != "00010000"
+            || fields[4] != "0001"
+            || fields[5] != "01"
+            || fields[7] != expected_path
+        {
             return None;
         }
-        inode.parse::<libc::ino_t>().ok()
+        fields[6].parse::<libc::ino_t>().ok()
     });
-    matching_paths.next() == Some(socket_inode) && matching_paths.next().is_none()
+    matching_listeners.next() == Some(socket_inode) && matching_listeners.next().is_none()
 }
 
 fn receive_request(
@@ -635,6 +647,24 @@ fn verify_listener_socket(descriptor: RawFd) -> Result<(), SystemdServiceError> 
     };
     if result != 0
         || socket_type != libc::SOCK_STREAM
+        || length != std::mem::size_of::<i32>() as libc::socklen_t
+    {
+        return Err(SystemdServiceError::ListenerUnavailable);
+    }
+    let mut accepts_connections = 0_i32;
+    let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
+    // SAFETY: `accepts_connections` is a valid writable buffer for `SO_ACCEPTCONN`.
+    let result = unsafe {
+        libc::getsockopt(
+            descriptor,
+            libc::SOL_SOCKET,
+            libc::SO_ACCEPTCONN,
+            (&mut accepts_connections as *mut i32).cast(),
+            &mut length,
+        )
+    };
+    if result != 0
+        || accepts_connections != 1
         || length != std::mem::size_of::<i32>() as libc::socklen_t
     {
         return Err(SystemdServiceError::ListenerUnavailable);
@@ -830,6 +860,41 @@ mod tests {
     }
 
     #[test]
+    fn listener_table_ignores_connected_rows_for_the_protected_path() {
+        let table = "Num RefCount Protocol Flags Type St Inode Path\n\
+                     0000: 00000003 00000000 00000000 0001 02 0 /run/ota/authority-launcher.sock\n\
+                     0000: 00000002 00000000 00010000 0001 01 46556936 /run/ota/authority-launcher.sock\n";
+        assert!(proc_unix_table_has_unique_listener(
+            table,
+            46_556_936,
+            "/run/ota/authority-launcher.sock",
+        ));
+    }
+
+    #[test]
+    fn listener_verification_rejects_a_connected_unix_stream() {
+        let (stream, _peer) = UnixStream::pair().expect("socket pair");
+        assert!(verify_listener_socket(stream.as_raw_fd()).is_err());
+    }
+
+    #[test]
+    fn listener_table_rejects_missing_or_ambiguous_listener_identity() {
+        let table = "Num RefCount Protocol Flags Type St Inode Path\n\
+                     0000: 00000002 00000000 00010000 0001 01 41 /run/ota/authority-launcher.sock\n\
+                     0000: 00000002 00000000 00010000 0001 01 42 /run/ota/authority-launcher.sock\n";
+        assert!(!proc_unix_table_has_unique_listener(
+            table,
+            41,
+            "/run/ota/authority-launcher.sock",
+        ));
+        assert!(!proc_unix_table_has_unique_listener(
+            "Num RefCount Protocol Flags Type St Inode Path\n",
+            41,
+            "/run/ota/authority-launcher.sock",
+        ));
+    }
+
+    #[test]
     fn disabled_service_journals_stopped_child_and_confirms_cleanup() {
         if unsafe { libc::geteuid() } != 0 {
             return;
@@ -992,8 +1057,10 @@ mod tests {
             .record_child(absent_child)
             .expect("record recoverable child");
         drop(recoverable);
+        let loaded =
+            ActiveSlot::load_all(&active, 0, temporary.path()).expect("load recoverable slots");
         assert!(matches!(
-            reconcile_active_slots(&active, 0, temporary.path(), Duration::from_secs(1)),
+            reconcile_loaded_slots(loaded, &AbsentScopeBoundary, Duration::from_secs(1)),
             Err(SystemdServiceError::ActiveSlotUnavailable)
         ));
         let mut retained_intent =
@@ -1081,8 +1148,10 @@ mod tests {
             .record_child(mismatched_child)
             .expect("record mismatched child");
         drop(stale);
+        let stale_slots =
+            ActiveSlot::load_all(&active, 0, temporary.path()).expect("load stale child slot");
         assert!(matches!(
-            reconcile_active_slots(&active, 0, temporary.path(), Duration::from_secs(1)),
+            reconcile_loaded_slots(stale_slots, &AbsentScopeBoundary, Duration::from_secs(1)),
             Err(SystemdServiceError::ChildCleanupFailed)
         ));
         let mut retained =

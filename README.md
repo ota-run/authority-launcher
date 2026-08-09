@@ -213,6 +213,13 @@ as a stopped root child. Before fork it creates and fsyncs a root-owned active-s
 working-directory device/inode, principal mapping, PID/start time, binary identity, and complete
 child descriptor boundary.
 
+The execution-disabled Linux pressure unit needs root system-manager access and
+`CAP_SYS_PTRACE` so it can re-observe the exact stopped child's protected descriptor posture.
+It also reads the host `/proc/net/unix` table to reconcile the inherited socket inode, so a unit
+with `PrivateNetwork=yes` cannot establish that observation. These are bounded adapter
+requirements, not evidence of provider-attested isolation; the effective unit and capability
+posture must remain part of the later signed hardening profile.
+
 The child receives only standard streams, the systemd profile's fixed private Ota session
 descriptor, the fixed
 binary descriptor, and the retained repository descriptor. Production code re-observes that exact
@@ -232,6 +239,15 @@ This foundation does **not** resume Ota, obtain V3 attestation, contact the brok
 or execute repository work. OrbStack's systemd currently refuses the real pre-exec PID attachment
 with `ENOTTY`; the implementation remains fail-closed there, and positive kernel proof requires the
 prepared hardened Linux runner.
+
+The feature-gated `ota-authority-systemd-pressure-client` is the unprivileged side of that positive
+kernel proof. It connects only to `/run/ota/authority-launcher.sock`, submits one bounded
+`LauncherInvocationRequestV1`, and accepts only the execution-disabled terminal refusal emitted
+after the service has confirmed scope and child cleanup. Before sending the request it requires the
+fixed socket and parent to have the protected root-owned posture and requires the connected Unix
+peer to be root-owned. It cannot select another socket, install configuration, mutate systemd,
+provide authority, or enable execution. The binary is not installed as part of the production
+launcher.
 
 ## What belongs here
 

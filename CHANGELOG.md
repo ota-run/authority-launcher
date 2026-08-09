@@ -26,6 +26,16 @@
 
 ## Unreleased
 
+- Add a feature-gated, unprivileged systemd pressure client that retains canonical request and
+  terminal identities while accepting only the execution-disabled post-cleanup refusal from the
+  fixed launcher socket.
+- Require the inherited Unix descriptor to accept connections, reconcile it against the unique
+  listening `/proc/net/unix` row without rejecting same-path connection rows, and read scope-owned
+  systemd properties from the Scope interface.
+- Treat a collected transient scope as terminal only when the exact recorded unit is absent and
+  its recorded cgroup is empty or absent, closing the `KillUnit`/`StopUnit` collection race without
+  weakening cleanup confirmation.
+
 ### Added
 
 - Add the initial Unix session-isolating launcher wrapper for Ota broker crossing authority.

@@ -627,6 +627,8 @@ mod tests {
     #[test]
     fn protected_file_verifier_rejects_symlink_and_writable_parent() {
         let root = tempdir().expect("temp root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("trusted root permissions");
         let uid = unsafe { libc::geteuid() };
         let protected = root.path().join("protected");
         fs::create_dir(&protected).expect("protected directory");

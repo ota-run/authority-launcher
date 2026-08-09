@@ -245,30 +245,44 @@ impl SystemdScopeManager {
         timeout: Duration,
     ) -> Result<(), SystemdScopeError> {
         self.verify_scope(expected, child)?;
-        self.stop_unit_by_name(expected.unit_name.as_str(), timeout)
+        self.stop_unit_by_name(
+            expected.unit_name.as_str(),
+            expected.control_group.as_str(),
+            timeout,
+        )
     }
 
     fn stop_unit_by_name(
         &self,
         unit_name: &str,
+        expected_control_group: &str,
         timeout: Duration,
     ) -> Result<(), SystemdScopeError> {
         let manager = self.manager_proxy()?;
-        let _: () = manager
-            .call("KillUnit", &(unit_name, "all", libc::SIGKILL))
-            .map_err(|_| SystemdScopeError::CleanupFailed)?;
-        let _: OwnedObjectPath = manager
-            .call("StopUnit", &(unit_name, "replace"))
-            .map_err(|_| SystemdScopeError::CleanupFailed)?;
+        let killed: Result<(), zbus::Error> =
+            manager.call("KillUnit", &(unit_name, "all", libc::SIGKILL));
+        if killed.is_err() {
+            return if self.scope_is_terminal(unit_name, expected_control_group) {
+                Ok(())
+            } else {
+                Err(SystemdScopeError::CleanupFailed)
+            };
+        }
+        let stopped: Result<OwnedObjectPath, zbus::Error> =
+            manager.call("StopUnit", &(unit_name, "replace"));
+        if stopped.is_err() && self.scope_is_terminal(unit_name, expected_control_group) {
+            return Ok(());
+        }
+        stopped.map_err(|_| SystemdScopeError::CleanupFailed)?;
         let deadline = Instant::now() + timeout;
         loop {
             match self.observe_existing_scope(unit_name) {
-                Ok(observed) => {
-                    if cgroup_is_empty_or_absent(observed.control_group.as_str()) {
-                        return Ok(());
-                    }
+                Ok(_) => {}
+                Err(SystemdScopeError::ScopeAbsent)
+                    if cgroup_is_empty_or_absent(expected_control_group) =>
+                {
+                    return Ok(());
                 }
-                Err(SystemdScopeError::ScopeAbsent) => return Ok(()),
                 Err(_) => {}
             }
             if Instant::now() >= deadline {
@@ -276,6 +290,13 @@ impl SystemdScopeManager {
             }
             thread::sleep(POLL_INTERVAL);
         }
+    }
+
+    fn scope_is_terminal(&self, unit_name: &str, expected_control_group: &str) -> bool {
+        matches!(
+            self.observe_existing_scope(unit_name),
+            Err(SystemdScopeError::ScopeAbsent)
+        ) && cgroup_is_empty_or_absent(expected_control_group)
     }
 
     fn observe_scope(
@@ -358,10 +379,10 @@ impl SystemdScopeManager {
         }
         let observed = ObservedScope {
             unit_object_path: path.to_string(),
-            slice: unit
+            slice: scope
                 .get_property("Slice")
                 .map_err(|_| SystemdScopeError::ScopeMismatch)?,
-            control_group: unit
+            control_group: scope
                 .get_property("ControlGroup")
                 .map_err(|_| SystemdScopeError::ScopeMismatch)?,
             delegate: scope
@@ -597,6 +618,11 @@ mod tests {
             let _ = child.wait();
             panic!("remove exact scope: {error:?}");
         }
+        assert!(matches!(
+            manager.observe_existing_scope(scope.unit_name.as_str()),
+            Err(SystemdScopeError::ScopeAbsent)
+        ));
+        assert!(cgroup_is_empty_or_absent(scope.control_group.as_str()));
         let status = child.wait().expect("reap pressure child");
         assert!(!status.success());
     }
