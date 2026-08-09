@@ -29,6 +29,8 @@ mod prepared_child;
 #[cfg(test)]
 mod reference_peer;
 #[cfg(target_os = "linux")]
+mod systemd_scope;
+#[cfg(target_os = "linux")]
 mod systemd_service;
 #[cfg(target_os = "linux")]
 mod target_directory;

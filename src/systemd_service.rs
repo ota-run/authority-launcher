@@ -22,10 +22,10 @@
 
 //! Linux socket-activation admission for the planned protected launcher service.
 //!
-//! This foundation deliberately stops before systemd-scope admission, broker traffic, or child
-//! execution. It proves the service can consume only the fixed listener, derive the connecting job
-//! principal through `SO_PEERCRED`, durably prepare an exact stopped Ota child, and confirm cleanup
-//! without ever resuming that child.
+//! This foundation deliberately stops before broker traffic or child execution. It proves the
+//! service can consume only the fixed listener, derive the connecting job principal through
+//! `SO_PEERCRED`, durably prepare an exact stopped Ota child, attach and verify its transient
+//! systemd scope, and confirm cleanup without ever resuming that child.
 
 use std::env;
 use std::io::{Read, Write};
@@ -50,8 +50,10 @@ use crate::config::{
     load_systemd_launcher_service_config, systemd_principal_mapping,
 };
 use crate::prepared_child::{
-    PreparedChildBinding, PreparedChildError, prepare_stopped_child, terminate_recorded_child,
+    PreparedChildBinding, PreparedChildError, prepare_stopped_child, recorded_child_is_live_exact,
+    terminate_recorded_child,
 };
+use crate::systemd_scope::{ScopeBoundary, SystemdScopeError, SystemdScopeManager};
 use crate::target_directory::{TargetDirectoryError, open_repository_directory};
 
 const SYSTEMD_LISTEN_FD: RawFd = 3;
@@ -78,6 +80,10 @@ pub(crate) enum SystemdServiceError {
     ChildPreparationFailed,
     #[error("the systemd launcher could not confirm terminal child cleanup")]
     ChildCleanupFailed,
+    #[error("the systemd launcher transient scope boundary is unavailable")]
+    ScopeUnavailable,
+    #[error("the systemd launcher could not confirm terminal scope cleanup")]
+    ScopeCleanupFailed,
     #[error("the systemd launcher admission foundation does not yet execute governed work")]
     ExecutionNotEnabled,
 }
@@ -181,6 +187,34 @@ fn prepare_disabled_child_boundary(
     active_slot_owner_uid: u32,
     active_slot_trusted_root: &Path,
 ) -> Result<ota_authority_protocol::LauncherChildProcessV1, SystemdServiceError> {
+    let scope_manager = SystemdScopeManager::connect().map_err(map_systemd_scope_error)?;
+    prepare_disabled_child_boundary_with_scope(
+        config,
+        ota_binary,
+        repository,
+        mapping,
+        request,
+        invocation_id,
+        active_slot_directory,
+        active_slot_owner_uid,
+        active_slot_trusted_root,
+        &scope_manager,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_disabled_child_boundary_with_scope(
+    config: &SystemdLauncherServiceConfigV1,
+    ota_binary: &std::fs::File,
+    repository: &crate::target_directory::OpenedRepositoryDirectory,
+    mapping: &crate::config::SystemdPrincipalMappingV1,
+    request: &LauncherInvocationRequestV1,
+    invocation_id: &str,
+    active_slot_directory: &Path,
+    active_slot_owner_uid: u32,
+    active_slot_trusted_root: &Path,
+    scope_manager: &impl ScopeBoundary,
+) -> Result<ota_authority_protocol::LauncherChildProcessV1, SystemdServiceError> {
     let request_identity = launcher_invocation_request_identity(request)
         .map_err(|_| SystemdServiceError::InvalidRequest)?;
     let principal_mapping = systemd_principal_mapping(config, mapping)
@@ -229,7 +263,50 @@ fn prepare_disabled_child_boundary(
             .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
         return Err(SystemdServiceError::ActiveSlotUnavailable);
     }
+    let scope = match scope_manager.attach_stopped_child(
+        invocation_id,
+        request_identity.as_str(),
+        &child.record,
+        Duration::from_secs(config.maximum_startup_seconds),
+    ) {
+        Ok(scope) => scope,
+        Err(error) => {
+            child
+                .terminate_and_reap()
+                .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
+            if error == SystemdScopeError::CleanupFailed {
+                return Err(SystemdServiceError::ScopeCleanupFailed);
+            }
+            active_slot
+                .finalize()
+                .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
+            return Err(map_systemd_scope_error(error));
+        }
+    };
+    if active_slot.record_scope(scope.clone()).is_err() {
+        scope_manager
+            .stop_and_confirm_empty(
+                &scope,
+                &child.record,
+                Duration::from_secs(config.maximum_terminal_wait_seconds),
+            )
+            .map_err(|_| SystemdServiceError::ScopeCleanupFailed)?;
+        child
+            .terminate_and_reap()
+            .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
+        active_slot
+            .finalize()
+            .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
+        return Err(SystemdServiceError::ActiveSlotUnavailable);
+    }
     let child_record = child.record.clone();
+    scope_manager
+        .stop_and_confirm_empty(
+            &scope,
+            &child.record,
+            Duration::from_secs(config.maximum_terminal_wait_seconds),
+        )
+        .map_err(|_| SystemdServiceError::ScopeCleanupFailed)?;
     child
         .terminate_and_reap()
         .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
@@ -237,6 +314,13 @@ fn prepare_disabled_child_boundary(
         .finalize()
         .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
     Ok(child_record)
+}
+
+fn map_systemd_scope_error(error: SystemdScopeError) -> SystemdServiceError {
+    match error {
+        SystemdScopeError::CleanupFailed => SystemdServiceError::ScopeCleanupFailed,
+        _ => SystemdServiceError::ScopeUnavailable,
+    }
 }
 
 fn map_active_slot_error(_error: ActiveSlotError) -> SystemdServiceError {
@@ -272,6 +356,19 @@ fn reconcile_active_slots(
         active_slot_trusted_root,
     )
     .map_err(map_active_slot_error)?;
+    if slots.is_empty() {
+        return Ok(());
+    }
+    let scope_manager =
+        SystemdScopeManager::connect().map_err(|_| SystemdServiceError::ScopeCleanupFailed)?;
+    reconcile_loaded_slots(slots, &scope_manager, cleanup_timeout)
+}
+
+fn reconcile_loaded_slots(
+    slots: Vec<ActiveSlot>,
+    scope_manager: &impl ScopeBoundary,
+    cleanup_timeout: Duration,
+) -> Result<(), SystemdServiceError> {
     let mut failure = None;
     for slot in slots {
         let Some(child) = slot.child() else {
@@ -280,6 +377,42 @@ fn reconcile_active_slots(
             }
             continue;
         };
+        if let Some(scope) = slot.scope() {
+            match scope_manager.stop_and_confirm_empty(scope, child, cleanup_timeout) {
+                Ok(()) => {}
+                Err(SystemdScopeError::ScopeAbsent) => {
+                    match recorded_child_is_live_exact(child) {
+                        Ok(false) => {
+                            if slot.finalize().is_err() {
+                                failure = Some(SystemdServiceError::ChildCleanupFailed);
+                            }
+                            continue;
+                        }
+                        Ok(true) => {
+                            let _ = terminate_recorded_child(child, cleanup_timeout);
+                        }
+                        Err(_) => {}
+                    }
+                    failure = Some(SystemdServiceError::ScopeCleanupFailed);
+                    continue;
+                }
+                Err(_) => {
+                    failure = Some(SystemdServiceError::ScopeCleanupFailed);
+                    continue;
+                }
+            }
+        } else if scope_manager
+            .recover_unrecorded_scope(
+                child.invocation_id.as_str(),
+                child.request_identity.as_str(),
+                child,
+                cleanup_timeout,
+            )
+            .is_err()
+        {
+            failure = Some(SystemdServiceError::ScopeCleanupFailed);
+            continue;
+        }
         if terminate_recorded_child(child, cleanup_timeout).is_err() {
             failure = Some(SystemdServiceError::ChildCleanupFailed);
             continue;
@@ -524,6 +657,7 @@ fn verify_listener_socket(descriptor: RawFd) -> Result<(), SystemdServiceError> 
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
@@ -533,6 +667,131 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingScopeBoundary {
+        attached: RefCell<Vec<ota_authority_protocol::LauncherSystemdScopeV1>>,
+        stopped: RefCell<Vec<String>>,
+    }
+
+    struct UncertainScopeBoundary;
+    struct AbsentScopeBoundary;
+
+    impl ScopeBoundary for AbsentScopeBoundary {
+        fn attach_stopped_child(
+            &self,
+            _invocation_id: &str,
+            _request_identity: &str,
+            _child: &ota_authority_protocol::LauncherChildProcessV1,
+            _timeout: Duration,
+        ) -> Result<ota_authority_protocol::LauncherSystemdScopeV1, SystemdScopeError> {
+            Err(SystemdScopeError::ScopeAbsent)
+        }
+
+        fn stop_and_confirm_empty(
+            &self,
+            _expected: &ota_authority_protocol::LauncherSystemdScopeV1,
+            _child: &ota_authority_protocol::LauncherChildProcessV1,
+            _timeout: Duration,
+        ) -> Result<(), SystemdScopeError> {
+            Err(SystemdScopeError::ScopeAbsent)
+        }
+
+        fn recover_unrecorded_scope(
+            &self,
+            _invocation_id: &str,
+            _request_identity: &str,
+            _child: &ota_authority_protocol::LauncherChildProcessV1,
+            _timeout: Duration,
+        ) -> Result<(), SystemdScopeError> {
+            Ok(())
+        }
+    }
+
+    impl ScopeBoundary for UncertainScopeBoundary {
+        fn attach_stopped_child(
+            &self,
+            _invocation_id: &str,
+            _request_identity: &str,
+            _child: &ota_authority_protocol::LauncherChildProcessV1,
+            _timeout: Duration,
+        ) -> Result<ota_authority_protocol::LauncherSystemdScopeV1, SystemdScopeError> {
+            Err(SystemdScopeError::CleanupFailed)
+        }
+
+        fn stop_and_confirm_empty(
+            &self,
+            _expected: &ota_authority_protocol::LauncherSystemdScopeV1,
+            _child: &ota_authority_protocol::LauncherChildProcessV1,
+            _timeout: Duration,
+        ) -> Result<(), SystemdScopeError> {
+            Err(SystemdScopeError::CleanupFailed)
+        }
+
+        fn recover_unrecorded_scope(
+            &self,
+            _invocation_id: &str,
+            _request_identity: &str,
+            _child: &ota_authority_protocol::LauncherChildProcessV1,
+            _timeout: Duration,
+        ) -> Result<(), SystemdScopeError> {
+            Err(SystemdScopeError::CleanupFailed)
+        }
+    }
+
+    impl ScopeBoundary for RecordingScopeBoundary {
+        fn attach_stopped_child(
+            &self,
+            invocation_id: &str,
+            request_identity: &str,
+            child: &ota_authority_protocol::LauncherChildProcessV1,
+            _timeout: Duration,
+        ) -> Result<ota_authority_protocol::LauncherSystemdScopeV1, SystemdScopeError> {
+            let digest = request_identity
+                .strip_prefix("sha256:")
+                .ok_or(SystemdScopeError::ScopeMismatch)?;
+            let unit_name = format!("ota-authority-invocation-{digest}.scope");
+            let mut scope = ota_authority_protocol::LauncherSystemdScopeV1 {
+                schema_version: 1,
+                identity: String::new(),
+                invocation_id: invocation_id.into(),
+                request_identity: request_identity.into(),
+                child_identity: child.identity.clone(),
+                child_pid: child.pid,
+                unit_name: unit_name.clone(),
+                unit_object_path: format!("/org/freedesktop/systemd1/unit/{unit_name}"),
+                slice: crate::systemd_scope::INVOCATION_SLICE.into(),
+                control_group: format!("/ota-authority-invocations.slice/{unit_name}"),
+                delegate: false,
+                kill_mode: String::from("control-group"),
+                collect_mode: String::from("inactive-or-failed"),
+            };
+            scope.identity = ota_authority_protocol::launcher_systemd_scope_identity(&scope)
+                .map_err(|_| SystemdScopeError::ScopeMismatch)?;
+            self.attached.borrow_mut().push(scope.clone());
+            Ok(scope)
+        }
+
+        fn stop_and_confirm_empty(
+            &self,
+            expected: &ota_authority_protocol::LauncherSystemdScopeV1,
+            _child: &ota_authority_protocol::LauncherChildProcessV1,
+            _timeout: Duration,
+        ) -> Result<(), SystemdScopeError> {
+            self.stopped.borrow_mut().push(expected.identity.clone());
+            Ok(())
+        }
+
+        fn recover_unrecorded_scope(
+            &self,
+            _invocation_id: &str,
+            _request_identity: &str,
+            _child: &ota_authority_protocol::LauncherChildProcessV1,
+            _timeout: Duration,
+        ) -> Result<(), SystemdScopeError> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn unsupported_command_refuses_during_systemd_request_admission() {
@@ -631,7 +890,8 @@ mod tests {
             repository_path: repository_path.to_string_lossy().into_owned(),
         };
         let executable = std::fs::File::open("/bin/true").expect("test executable");
-        let child = prepare_disabled_child_boundary(
+        let scope_boundary = RecordingScopeBoundary::default();
+        let child = prepare_disabled_child_boundary_with_scope(
             &config,
             &executable,
             &repository,
@@ -641,10 +901,39 @@ mod tests {
             &active,
             0,
             temporary.path(),
+            &scope_boundary,
         )
         .expect("prepare and clean child boundary");
+        assert_eq!(scope_boundary.attached.borrow().len(), 1);
+        assert_eq!(scope_boundary.stopped.borrow().len(), 1);
         assert!(!PathBuf::from(format!("/proc/{}", child.pid)).exists());
         assert_eq!(fs::read_dir(&active).expect("active directory").count(), 0);
+
+        assert!(matches!(
+            prepare_disabled_child_boundary_with_scope(
+                &config,
+                &executable,
+                &repository,
+                &config.mappings[0],
+                &request,
+                "invocation-uncertain-scope",
+                &active,
+                0,
+                temporary.path(),
+                &UncertainScopeBoundary,
+            ),
+            Err(SystemdServiceError::ScopeCleanupFailed)
+        ));
+        let mut uncertain =
+            ActiveSlot::load_all(&active, 0, temporary.path()).expect("load uncertain scope slot");
+        assert_eq!(uncertain.len(), 1);
+        assert!(uncertain[0].child().is_some());
+        assert!(uncertain[0].scope().is_none());
+        uncertain
+            .pop()
+            .expect("uncertain scope slot")
+            .finalize()
+            .expect("uncertain scope test cleanup");
 
         let principal =
             systemd_principal_mapping(&config, &config.mappings[0]).expect("principal mapping");
@@ -715,6 +1004,54 @@ mod tests {
             .expect("retained intent")
             .finalize()
             .expect("intent test cleanup");
+
+        let absent_mapping = identity('5');
+        let absent_request = identity('4');
+        let mut scope_removed = ActiveSlot::begin(
+            &active,
+            0,
+            temporary.path(),
+            "invocation-scope-removed",
+            absent_mapping.as_str(),
+            absent_request.as_str(),
+            working.clone(),
+        )
+        .expect("scope-removed slot");
+        let mut absent_after_scope = ota_authority_protocol::LauncherChildProcessV1 {
+            schema_version: 1,
+            identity: String::new(),
+            invocation_id: String::from("invocation-scope-removed"),
+            request_identity: absent_request.clone(),
+            pid: u32::MAX - 1,
+            process_start_time_identity: identity('3'),
+            ota_binary_identity: config.ota_binary_identity.clone(),
+            principal_mapping_identity: absent_mapping,
+            working_directory_identity: working.identity.clone(),
+        };
+        absent_after_scope.identity =
+            ota_authority_protocol::launcher_child_process_identity(&absent_after_scope)
+                .expect("scope-removed child identity");
+        scope_removed
+            .record_child(absent_after_scope.clone())
+            .expect("record scope-removed child");
+        let scope_factory = RecordingScopeBoundary::default();
+        let removed_scope = scope_factory
+            .attach_stopped_child(
+                "invocation-scope-removed",
+                absent_request.as_str(),
+                &absent_after_scope,
+                Duration::from_secs(1),
+            )
+            .expect("scope-removed scope");
+        scope_removed
+            .record_scope(removed_scope)
+            .expect("record removed scope");
+        drop(scope_removed);
+        let removed_slots =
+            ActiveSlot::load_all(&active, 0, temporary.path()).expect("load removed scope slot");
+        reconcile_loaded_slots(removed_slots, &AbsentScopeBoundary, Duration::from_secs(1))
+            .expect("scope and child absence is terminal");
+        assert_eq!(fs::read_dir(&active).expect("active directory").count(), 0);
 
         let mut stale = ActiveSlot::begin(
             &active,

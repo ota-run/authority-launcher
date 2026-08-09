@@ -33,7 +33,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use ota_authority_protocol::{
-    LauncherChildProcessV1, LauncherWorkingDirectoryV1, launcher_child_process_identity,
+    LauncherChildProcessV1, LauncherSystemdScopeV1, LauncherWorkingDirectoryV1,
+    launcher_child_process_identity, launcher_systemd_scope_identity,
     launcher_working_directory_identity, message_identity,
 };
 use serde::{Deserialize, Serialize};
@@ -49,6 +50,7 @@ const MAX_ACTIVE_SLOT_BYTES: u64 = 64 * 1024;
 pub(crate) enum ActiveSlotStage {
     Intent,
     ChildPrepared,
+    ScopeAttached,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,6 +65,8 @@ pub(crate) struct ActiveSlotJournalV1 {
     pub working_directory: LauncherWorkingDirectoryV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child: Option<LauncherChildProcessV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<LauncherSystemdScopeV1>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -94,6 +98,7 @@ impl ActiveSlot {
         verify_store(directory, expected_owner_uid, trusted_root)?;
         let mut canonical = BTreeMap::new();
         let mut temporary = BTreeMap::new();
+        let mut temporary_paths = Vec::new();
         let mut entries = fs::read_dir(directory)
             .map_err(|_| ActiveSlotError::StoreUnavailable)?
             .collect::<Result<Vec<_>, _>>()
@@ -106,25 +111,50 @@ impl ActiveSlot {
                 .into_string()
                 .map_err(|_| ActiveSlotError::StoreInvalid)?;
             verify_journal_file(&path, expected_owner_uid)?;
-            let journal = load_journal(&path)?;
             if name.starts_with('.') && name.ends_with(".tmp") {
-                if name != format!(".{}.tmp", journal.invocation_id)
-                    || journal.stage != ActiveSlotStage::ChildPrepared
-                {
-                    return Err(ActiveSlotError::InvalidJournal);
-                }
-                if temporary
-                    .insert(journal.principal_mapping_identity.clone(), (path, journal))
-                    .is_some()
-                {
-                    return Err(ActiveSlotError::InvalidJournal);
-                }
+                temporary_paths.push((path, name));
                 continue;
             }
+            let journal = load_journal(&path)?;
             if slot_path(directory, journal.principal_mapping_identity.as_str())? != path {
                 return Err(ActiveSlotError::InvalidJournal);
             }
             if canonical
+                .insert(journal.principal_mapping_identity.clone(), (path, journal))
+                .is_some()
+            {
+                return Err(ActiveSlotError::InvalidJournal);
+            }
+        }
+
+        for (path, name) in temporary_paths {
+            let invocation_id = name
+                .strip_prefix('.')
+                .and_then(|name| name.strip_suffix(".tmp"))
+                .filter(|value| is_bounded_label(value))
+                .ok_or(ActiveSlotError::InvalidJournal)?;
+            let journal = match load_journal(&path) {
+                Ok(journal) => journal,
+                Err(ActiveSlotError::InvalidJournal) => {
+                    let matching = canonical
+                        .values()
+                        .filter(|(_, journal)| journal.invocation_id == invocation_id)
+                        .count();
+                    if matching != 1 {
+                        return Err(ActiveSlotError::InvalidJournal);
+                    }
+                    fs::remove_file(&path).map_err(|_| ActiveSlotError::PersistenceFailed)?;
+                    sync_directory(directory)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if name != format!(".{}.tmp", journal.invocation_id)
+                || journal.stage == ActiveSlotStage::Intent
+            {
+                return Err(ActiveSlotError::InvalidJournal);
+            }
+            if temporary
                 .insert(journal.principal_mapping_identity.clone(), (path, journal))
                 .is_some()
             {
@@ -138,8 +168,7 @@ impl ActiveSlot {
             else {
                 return Err(ActiveSlotError::InvalidJournal);
             };
-            if intent.stage != ActiveSlotStage::Intent
-                || intent.child.is_some()
+            if !is_direct_successor(intent, &recovered)
                 || intent.invocation_id != recovered.invocation_id
                 || intent.request_identity != recovered.request_identity
                 || intent.working_directory != recovered.working_directory
@@ -182,6 +211,7 @@ impl ActiveSlot {
             request_identity: request_identity.into(),
             working_directory,
             child: None,
+            scope: None,
         };
         journal.identity = active_slot_identity(&journal)?;
         write_new(&path, &journal)?;
@@ -210,9 +240,41 @@ impl ActiveSlot {
         self.journal.child.as_ref()
     }
 
+    pub(crate) fn record_scope(
+        &mut self,
+        scope: LauncherSystemdScopeV1,
+    ) -> Result<(), ActiveSlotError> {
+        if self.journal.stage != ActiveSlotStage::ChildPrepared
+            || self.journal.child.is_none()
+            || self.journal.scope.is_some()
+        {
+            return Err(ActiveSlotError::InvalidJournal);
+        }
+        self.journal.stage = ActiveSlotStage::ScopeAttached;
+        self.journal.scope = Some(scope);
+        self.journal.identity = active_slot_identity(&self.journal)?;
+        replace_atomically(&self.directory, &self.path, &self.journal)
+    }
+
+    pub(crate) fn scope(&self) -> Option<&LauncherSystemdScopeV1> {
+        self.journal.scope.as_ref()
+    }
+
     pub(crate) fn finalize(self) -> Result<(), ActiveSlotError> {
         fs::remove_file(&self.path).map_err(|_| ActiveSlotError::PersistenceFailed)?;
         sync_directory(&self.directory)
+    }
+}
+
+fn is_direct_successor(current: &ActiveSlotJournalV1, recovered: &ActiveSlotJournalV1) -> bool {
+    match (current.stage, recovered.stage) {
+        (ActiveSlotStage::Intent, ActiveSlotStage::ChildPrepared) => {
+            current.child.is_none() && current.scope.is_none() && recovered.scope.is_none()
+        }
+        (ActiveSlotStage::ChildPrepared, ActiveSlotStage::ScopeAttached) => {
+            current.child == recovered.child && current.scope.is_none() && recovered.scope.is_some()
+        }
+        _ => false,
     }
 }
 
@@ -228,15 +290,35 @@ pub(crate) fn active_slot_identity(
             .as_deref()
             != Some(journal.working_directory.identity.as_str())
         || match journal.stage {
-            ActiveSlotStage::Intent => journal.child.is_some(),
-            ActiveSlotStage::ChildPrepared => journal.child.as_ref().is_none_or(|child| {
-                launcher_child_process_identity(child).ok().as_deref()
-                    != Some(child.identity.as_str())
-                    || child.invocation_id != journal.invocation_id
-                    || child.request_identity != journal.request_identity
-                    || child.principal_mapping_identity != journal.principal_mapping_identity
-                    || child.working_directory_identity != journal.working_directory.identity
-            }),
+            ActiveSlotStage::Intent => journal.child.is_some() || journal.scope.is_some(),
+            ActiveSlotStage::ChildPrepared => {
+                journal.child.as_ref().is_none_or(|child| {
+                    launcher_child_process_identity(child).ok().as_deref()
+                        != Some(child.identity.as_str())
+                        || child.invocation_id != journal.invocation_id
+                        || child.request_identity != journal.request_identity
+                        || child.principal_mapping_identity != journal.principal_mapping_identity
+                        || child.working_directory_identity != journal.working_directory.identity
+                }) || journal.scope.is_some()
+            }
+            ActiveSlotStage::ScopeAttached => {
+                journal.child.as_ref().is_none_or(|child| {
+                    launcher_child_process_identity(child).ok().as_deref()
+                        != Some(child.identity.as_str())
+                        || child.invocation_id != journal.invocation_id
+                        || child.request_identity != journal.request_identity
+                        || child.principal_mapping_identity != journal.principal_mapping_identity
+                        || child.working_directory_identity != journal.working_directory.identity
+                }) || journal.scope.as_ref().is_none_or(|scope| {
+                    launcher_systemd_scope_identity(scope).ok().as_deref()
+                        != Some(scope.identity.as_str())
+                        || scope.invocation_id != journal.invocation_id
+                        || scope.request_identity != journal.request_identity
+                        || Some(scope.child_identity.as_str())
+                            != journal.child.as_ref().map(|child| child.identity.as_str())
+                        || Some(scope.child_pid) != journal.child.as_ref().map(|child| child.pid)
+                })
+            }
         }
     {
         return Err(ActiveSlotError::InvalidJournal);
@@ -370,7 +452,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use ota_authority_protocol::{
-        LauncherChildProcessV1, LauncherWorkingDirectoryV1, launcher_child_process_identity,
+        LauncherChildProcessV1, LauncherSystemdScopeV1, LauncherWorkingDirectoryV1,
+        launcher_child_process_identity, launcher_systemd_scope_identity,
         launcher_working_directory_identity,
     };
     use tempfile::tempdir;
@@ -421,9 +504,34 @@ mod tests {
             request_identity: request_identity.into(),
             working_directory,
             child: Some(child),
+            scope: None,
         };
         journal.identity = active_slot_identity(&journal).expect("journal identity");
         journal
+    }
+
+    fn attached_scope(child: &LauncherChildProcessV1) -> LauncherSystemdScopeV1 {
+        let unit_name = format!(
+            "ota-authority-invocation-{}.scope",
+            child.request_identity.trim_start_matches("sha256:")
+        );
+        let mut scope = LauncherSystemdScopeV1 {
+            schema_version: 1,
+            identity: String::new(),
+            invocation_id: child.invocation_id.clone(),
+            request_identity: child.request_identity.clone(),
+            child_identity: child.identity.clone(),
+            child_pid: child.pid,
+            unit_name: unit_name.clone(),
+            unit_object_path: format!("/org/freedesktop/systemd1/unit/{unit_name}"),
+            slice: String::from("ota-authority-invocations.slice"),
+            control_group: format!("/ota-authority-invocations.slice/{unit_name}"),
+            delegate: false,
+            kill_mode: String::from("control-group"),
+            collect_mode: String::from("inactive-or-failed"),
+        };
+        scope.identity = launcher_systemd_scope_identity(&scope).expect("scope identity");
+        scope
     }
 
     #[test]
@@ -476,7 +584,12 @@ mod tests {
         slot.record_child(child.clone()).expect("record child");
         let prepared = load_journal(&path).expect("prepared journal");
         assert_eq!(prepared.stage, ActiveSlotStage::ChildPrepared);
-        assert_eq!(prepared.child, Some(child));
+        assert_eq!(prepared.child, Some(child.clone()));
+        let scope = attached_scope(&child);
+        slot.record_scope(scope.clone()).expect("record scope");
+        let attached = load_journal(&path).expect("scope journal");
+        assert_eq!(attached.stage, ActiveSlotStage::ScopeAttached);
+        assert_eq!(attached.scope, Some(scope));
 
         drop(slot);
         assert!(
@@ -529,6 +642,7 @@ mod tests {
                 principal_mapping_identity: identity('e'),
                 working_directory_identity: identity('f'),
             }),
+            scope: None,
         };
         let child = journal.child.as_mut().expect("child");
         child.identity = launcher_child_process_identity(child).expect("child identity");
@@ -585,6 +699,51 @@ mod tests {
         let promoted = slots.pop().expect("promoted slot");
         assert_eq!(promoted.child(), Some(&child));
         promoted.finalize().expect("finalize promoted slot");
+    }
+
+    #[test]
+    fn incomplete_scope_temporary_journal_recovers_from_canonical_child() {
+        let temporary = tempdir().expect("temporary directory");
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))
+            .expect("permissions");
+        let owner = unsafe { libc::geteuid() };
+        let mapping = identity('a');
+        let request = identity('b');
+        let journal = prepared_journal("invocation-partial", mapping.as_str(), request.as_str());
+        let mut slot = ActiveSlot::begin(
+            temporary.path(),
+            owner,
+            temporary.path(),
+            journal.invocation_id.as_str(),
+            mapping.as_str(),
+            request.as_str(),
+            journal.working_directory.clone(),
+        )
+        .expect("begin slot");
+        slot.record_child(journal.child.clone().expect("prepared child"))
+            .expect("record child");
+        let incomplete = temporary.path().join(".invocation-partial.tmp");
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        let mut file = options.open(&incomplete).expect("incomplete journal");
+        file.write_all(b"{\"schema_version\":1")
+            .and_then(|_| file.sync_all())
+            .expect("persist incomplete journal");
+        sync_directory(temporary.path()).expect("sync incomplete journal");
+        drop(file);
+        drop(slot);
+
+        let slots = ActiveSlot::load_all(temporary.path(), owner, temporary.path())
+            .expect("recover canonical child journal");
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].journal.stage, ActiveSlotStage::ChildPrepared);
+        assert!(!incomplete.exists());
+        slots
+            .into_iter()
+            .next()
+            .expect("recovered slot")
+            .finalize()
+            .expect("cleanup recovered slot");
     }
 
     #[test]

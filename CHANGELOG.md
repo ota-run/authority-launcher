@@ -57,13 +57,19 @@
   set, and startup cleanup through a PID-bound handle. Child-bearing temporary state is promoted;
   intent-only, uncertain, or mismatched recovery retains the journal and refuses new work. No code
   path resumes the child.
+- Add the execution-disabled transient-scope boundary. The launcher requests one exact scope from
+  the root systemd manager, independently reconciles its fixed slice, controls, cgroup, and sole
+  stopped PID, then atomically records that identity before cleanup. Scope-bearing recovery stops
+  and observes the scope empty before releasing the principal slot. The child is still never
+  resumed.
 
 ### Boundaries
 
 - The current implementation does not create launcher attestations, connect to a remote broker,
   issue or consume leases, or establish provider-attested authority separation.
-- The systemd service foundation does not create a transient scope, resume its prepared child,
-  contact the broker, or execute selected work. Pre-scope recovery requires Linux `pidfd`; when it
-  is unavailable or identity cannot be reconciled, the durable slot remains a hard refusal.
+- The systemd service foundation does not resume its prepared child, contact the broker, or execute
+  selected work. Pre-scope recovery requires Linux `pidfd`; scope-bearing recovery additionally
+  requires exact systemd and kernel-cgroup reconciliation. Unavailable or uncertain cleanup
+  retains the durable slot and refuses new work.
 - Protocol-v2 attestations are emitted only by the feature-gated pressure peer as bounded
   conformance evidence; they do not establish provider-attested or host-wide isolation.

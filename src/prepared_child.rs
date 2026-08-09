@@ -398,7 +398,7 @@ fn wait_for_stop(pid: libc::pid_t, timeout: Duration) -> Result<(), PreparedChil
     }
 }
 
-fn process_start_identity(pid: libc::pid_t) -> Result<String, PreparedChildError> {
+pub(crate) fn process_start_identity(pid: libc::pid_t) -> Result<String, PreparedChildError> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .map_err(|_| PreparedChildError::IdentityUnavailable)?;
     let closing = stat
@@ -549,6 +549,20 @@ pub(crate) fn terminate_recorded_child(
             continue;
         }
         return Err(PreparedChildError::CleanupFailed);
+    }
+}
+
+pub(crate) fn recorded_child_is_live_exact(
+    child: &LauncherChildProcessV1,
+) -> Result<bool, PreparedChildError> {
+    match process_start_identity(child.pid as libc::pid_t) {
+        Ok(identity) if identity == child.process_start_time_identity => Ok(true),
+        Err(PreparedChildError::IdentityUnavailable)
+            if !std::path::Path::new(format!("/proc/{}", child.pid).as_str()).exists() =>
+        {
+            Ok(false)
+        }
+        _ => Err(PreparedChildError::IdentityUnavailable),
     }
 }
 

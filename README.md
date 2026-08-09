@@ -216,16 +216,22 @@ child descriptor boundary.
 The child receives only standard streams, the systemd profile's fixed private Ota session
 descriptor, the fixed
 binary descriptor, and the retained repository descriptor. Production code re-observes that exact
-root/stopped posture and descriptor set before recording the child. The current service then kills
-and reaps the child without resuming it and removes the slot only after confirmed cleanup.
+root/stopped posture and descriptor set before recording the child. It then asks the root systemd
+manager for one request-derived transient scope in the fixed invocation slice, confirms the exact
+unit properties and sole PID through the kernel cgroup, and durably records that scope. The current
+service kills the complete scope, confirms it empty, kills/reaps the child, and removes the slot
+without ever resuming or executing Ota.
 
-On startup, retained pre-scope journals are reconciled before accepting a client. A valid
-child-bearing temporary journal is promoted rather than discarded. Intent-only state remains a
-hard refusal because it cannot establish child absence. An exact recorded child is terminated
-through Linux `pidfd`; PID reuse, identity mismatch, unsupported `pidfd`, or any uncertain outcome
-retains the slot and fails closed.
-This foundation does **not** create a transient systemd scope, resume Ota, obtain V3 attestation,
-contact the broker, consume a lease, or execute repository work.
+On startup, retained journals are reconciled before accepting a client. A valid child- or
+scope-bearing temporary journal is promoted rather than discarded. Intent-only state remains a
+hard refusal because it cannot establish child absence. An exact pre-scope child is terminated
+through Linux `pidfd`; a scope-bearing journal additionally requires the exact unit and kernel
+cgroup to be stopped and observed empty. PID reuse, identity mismatch, unsupported cleanup, or any
+uncertain outcome retains the slot and fails closed.
+This foundation does **not** resume Ota, obtain V3 attestation, contact the broker, consume a lease,
+or execute repository work. OrbStack's systemd currently refuses the real pre-exec PID attachment
+with `ENOTTY`; the implementation remains fail-closed there, and positive kernel proof requires the
+prepared hardened Linux runner.
 
 ## What belongs here
 
