@@ -74,7 +74,6 @@ pub(crate) enum TargetDirectoryError {
 #[derive(Debug)]
 pub(crate) struct OpenedRepositoryDirectory {
     pub descriptor: OwnedFd,
-    pub logical_path: PathBuf,
     pub device: u64,
     pub inode: u64,
 }
@@ -139,7 +138,6 @@ pub(crate) fn open_repository_directory(
     }
     Ok(OpenedRepositoryDirectory {
         descriptor,
-        logical_path: requested.to_path_buf(),
         device: metadata.st_dev,
         inode: metadata.st_ino,
     })

@@ -20,8 +20,12 @@
 //
 //   If you need additional information or have any questions, please email: os@ota.run
 
+#[cfg(target_os = "linux")]
+mod active_slot;
 #[cfg(unix)]
 mod config;
+#[cfg(target_os = "linux")]
+mod prepared_child;
 #[cfg(test)]
 mod reference_peer;
 #[cfg(target_os = "linux")]

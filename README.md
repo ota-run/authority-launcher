@@ -203,6 +203,30 @@ governance:
 Administrator-owned protected configuration binds that identity to the launcher and broker. No
 usable key, grant, lease, credential, or trust path belongs in `ota.yaml`.
 
+## Systemd service foundation
+
+The Linux `systemd_protected_launcher/v1` service path remains execution-disabled. It accepts only
+the fixed socket-activated listener, derives the job peer through `SO_PEERCRED`, opens the allowed
+repository through the configured execution principal, and prepares the exact protected Ota binary
+as a stopped root child. Before fork it creates and fsyncs a root-owned active-slot intent under
+`/var/lib/ota/authority-launcher/active`; after fork it atomically binds the request,
+working-directory device/inode, principal mapping, PID/start time, binary identity, and complete
+child descriptor boundary.
+
+The child receives only standard streams, the systemd profile's fixed private Ota session
+descriptor, the fixed
+binary descriptor, and the retained repository descriptor. Production code re-observes that exact
+root/stopped posture and descriptor set before recording the child. The current service then kills
+and reaps the child without resuming it and removes the slot only after confirmed cleanup.
+
+On startup, retained pre-scope journals are reconciled before accepting a client. A valid
+child-bearing temporary journal is promoted rather than discarded. Intent-only state remains a
+hard refusal because it cannot establish child absence. An exact recorded child is terminated
+through Linux `pidfd`; PID reuse, identity mismatch, unsupported `pidfd`, or any uncertain outcome
+retains the slot and fails closed.
+This foundation does **not** create a transient systemd scope, resume Ota, obtain V3 attestation,
+contact the broker, consume a lease, or execute repository work.
+
 ## What belongs here
 
 - the Unix launcher-session implementation;

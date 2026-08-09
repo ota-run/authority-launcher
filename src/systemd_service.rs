@@ -22,9 +22,10 @@
 
 //! Linux socket-activation admission for the planned protected launcher service.
 //!
-//! This foundation deliberately stops before broker or child-process work. It proves the service
-//! can consume only the fixed systemd listener, derive the connecting job principal through
-//! `SO_PEERCRED`, and reject invalid requests before any governed process exists.
+//! This foundation deliberately stops before systemd-scope admission, broker traffic, or child
+//! execution. It proves the service can consume only the fixed listener, derive the connecting job
+//! principal through `SO_PEERCRED`, durably prepare an exact stopped Ota child, and confirm cleanup
+//! without ever resuming that child.
 
 use std::env;
 use std::io::{Read, Write};
@@ -36,18 +37,25 @@ use std::time::Duration;
 
 use ota_authority_protocol::{
     LAUNCHER_TERMINAL, LauncherInvocationRequestV1, LauncherTerminalFrameV1,
-    LauncherTerminalOutcomeV1, MAX_FRAME_BYTES, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, decode_frame,
-    encode_frame, validate_launcher_invocation_request_v1, validate_launcher_terminal_frame_v1,
+    LauncherTerminalOutcomeV1, LauncherWorkingDirectoryV1, MAX_FRAME_BYTES,
+    SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, decode_frame, encode_frame,
+    launcher_invocation_request_identity, launcher_working_directory_identity,
+    validate_launcher_invocation_request_v1, validate_launcher_terminal_frame_v1,
 };
 use thiserror::Error;
 
+use crate::active_slot::{ActiveSlot, ActiveSlotError};
 use crate::config::{
     SYSTEMD_AUTHORITY_LAUNCHER_CONFIG_PATH, SessionPeer, SystemdLauncherServiceConfigV1,
-    load_systemd_launcher_service_config,
+    load_systemd_launcher_service_config, systemd_principal_mapping,
+};
+use crate::prepared_child::{
+    PreparedChildBinding, PreparedChildError, prepare_stopped_child, terminate_recorded_child,
 };
 use crate::target_directory::{TargetDirectoryError, open_repository_directory};
 
 const SYSTEMD_LISTEN_FD: RawFd = 3;
+const ACTIVE_SLOT_DIRECTORY: &str = "/var/lib/ota/authority-launcher/active";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
@@ -64,6 +72,12 @@ pub(crate) enum SystemdServiceError {
     RepositoryOutsideAllowedRoots,
     #[error("the systemd launcher repository is unavailable to the configured execution principal")]
     RepositoryUnavailableToExecutionPrincipal,
+    #[error("the systemd launcher active-slot boundary is unavailable")]
+    ActiveSlotUnavailable,
+    #[error("the systemd launcher could not prepare the protected Ota child")]
+    ChildPreparationFailed,
+    #[error("the systemd launcher could not confirm terminal child cleanup")]
+    ChildCleanupFailed,
     #[error("the systemd launcher admission foundation does not yet execute governed work")]
     ExecutionNotEnabled,
 }
@@ -77,6 +91,12 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
     let config = &loaded.config;
     let listener =
         inherited_systemd_listener(config.socket_path.as_path(), config.socket_group_gid)?;
+    reconcile_active_slots(
+        Path::new(ACTIVE_SLOT_DIRECTORY),
+        0,
+        Path::new("/"),
+        Duration::from_secs(config.maximum_terminal_wait_seconds),
+    )?;
     let (mut stream, _) = listener
         .accept()
         .map_err(|_| SystemdServiceError::ListenerUnavailable)?;
@@ -113,21 +133,165 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
         }
     };
 
-    // The service intentionally refuses here until V3 attestation and broker relay are complete.
-    write_terminal(
-        &mut stream,
-        invocation_id.as_str(),
-        LauncherTerminalOutcomeV1::Refused,
-        Some(2),
-    )?;
-    let _retained_authority_inputs = (
+    let child_boundary = prepare_disabled_child_boundary(
+        config,
         &loaded.ota_binary,
-        repository.descriptor.as_raw_fd(),
-        repository.logical_path.as_path(),
-        repository.device,
-        repository.inode,
+        &repository,
+        mapping,
+        &request,
+        invocation_id.as_str(),
+        Path::new(ACTIVE_SLOT_DIRECTORY),
+        0,
+        Path::new("/"),
     );
-    Err(SystemdServiceError::ExecutionNotEnabled)
+
+    match child_boundary {
+        Ok(_prepared_child) => {
+            // Execution remains disabled. Refusal is emitted only after the prepared child was
+            // killed, reaped, and removed from the durable active-slot store.
+            write_terminal(
+                &mut stream,
+                invocation_id.as_str(),
+                LauncherTerminalOutcomeV1::Refused,
+                Some(2),
+            )?;
+            Err(SystemdServiceError::ExecutionNotEnabled)
+        }
+        Err(error) => {
+            write_terminal(
+                &mut stream,
+                invocation_id.as_str(),
+                LauncherTerminalOutcomeV1::Failed,
+                Some(1),
+            )?;
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_disabled_child_boundary(
+    config: &SystemdLauncherServiceConfigV1,
+    ota_binary: &std::fs::File,
+    repository: &crate::target_directory::OpenedRepositoryDirectory,
+    mapping: &crate::config::SystemdPrincipalMappingV1,
+    request: &LauncherInvocationRequestV1,
+    invocation_id: &str,
+    active_slot_directory: &Path,
+    active_slot_owner_uid: u32,
+    active_slot_trusted_root: &Path,
+) -> Result<ota_authority_protocol::LauncherChildProcessV1, SystemdServiceError> {
+    let request_identity = launcher_invocation_request_identity(request)
+        .map_err(|_| SystemdServiceError::InvalidRequest)?;
+    let principal_mapping = systemd_principal_mapping(config, mapping)
+        .map_err(|_| SystemdServiceError::ActiveSlotUnavailable)?;
+    let mut working_directory = LauncherWorkingDirectoryV1 {
+        schema_version: 1,
+        identity: String::new(),
+        logical_path: request.repository_path.clone(),
+        device: repository.device,
+        inode: repository.inode,
+    };
+    working_directory.identity = launcher_working_directory_identity(&working_directory)
+        .map_err(|_| SystemdServiceError::ActiveSlotUnavailable)?;
+    let mut active_slot = ActiveSlot::begin(
+        active_slot_directory,
+        active_slot_owner_uid,
+        active_slot_trusted_root,
+        invocation_id,
+        principal_mapping.identity.as_str(),
+        request_identity.as_str(),
+        working_directory.clone(),
+    )
+    .map_err(map_active_slot_error)?;
+    let mut child = match prepare_stopped_child(
+        config,
+        ota_binary,
+        repository,
+        &mapping.execution,
+        &PreparedChildBinding {
+            invocation_id,
+            request_identity: request_identity.as_str(),
+            principal_mapping_identity: principal_mapping.identity.as_str(),
+            working_directory_identity: working_directory.identity.as_str(),
+        },
+        request.ota_arguments.as_slice(),
+    ) {
+        Ok(child) => child,
+        Err(error) => return Err(preparation_failure(active_slot, error)),
+    };
+    if active_slot.record_child(child.record.clone()).is_err() {
+        child
+            .terminate_and_reap()
+            .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
+        active_slot
+            .finalize()
+            .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
+        return Err(SystemdServiceError::ActiveSlotUnavailable);
+    }
+    let child_record = child.record.clone();
+    child
+        .terminate_and_reap()
+        .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
+    active_slot
+        .finalize()
+        .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
+    Ok(child_record)
+}
+
+fn map_active_slot_error(_error: ActiveSlotError) -> SystemdServiceError {
+    SystemdServiceError::ActiveSlotUnavailable
+}
+
+fn map_prepared_child_error(error: PreparedChildError) -> SystemdServiceError {
+    match error {
+        PreparedChildError::CleanupFailed => SystemdServiceError::ChildCleanupFailed,
+        _ => SystemdServiceError::ChildPreparationFailed,
+    }
+}
+
+fn preparation_failure(active_slot: ActiveSlot, error: PreparedChildError) -> SystemdServiceError {
+    if error == PreparedChildError::CleanupFailed {
+        return SystemdServiceError::ChildCleanupFailed;
+    }
+    if active_slot.finalize().is_err() {
+        return SystemdServiceError::ChildCleanupFailed;
+    }
+    map_prepared_child_error(error)
+}
+
+fn reconcile_active_slots(
+    active_slot_directory: &Path,
+    active_slot_owner_uid: u32,
+    active_slot_trusted_root: &Path,
+    cleanup_timeout: Duration,
+) -> Result<(), SystemdServiceError> {
+    let slots = ActiveSlot::load_all(
+        active_slot_directory,
+        active_slot_owner_uid,
+        active_slot_trusted_root,
+    )
+    .map_err(map_active_slot_error)?;
+    let mut failure = None;
+    for slot in slots {
+        let Some(child) = slot.child() else {
+            if failure.is_none() {
+                failure = Some(SystemdServiceError::ActiveSlotUnavailable);
+            }
+            continue;
+        };
+        if terminate_recorded_child(child, cleanup_timeout).is_err() {
+            failure = Some(SystemdServiceError::ChildCleanupFailed);
+            continue;
+        }
+        if slot.finalize().is_err() {
+            failure = Some(SystemdServiceError::ChildCleanupFailed);
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn validate_requested_command(
@@ -360,9 +524,11 @@ fn verify_listener_socket(descriptor: RawFd) -> Result<(), SystemdServiceError> 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::PathBuf;
 
     use tempfile::tempdir;
 
@@ -402,5 +568,193 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).expect("permissions");
         assert!(verify_listener_path(&listener, &path, 1001).is_err());
         drop(replacement);
+    }
+
+    #[test]
+    fn disabled_service_journals_stopped_child_and_confirms_cleanup() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let temporary = tempdir().expect("temporary directory");
+        let active = temporary.path().join("active");
+        let repository_path = temporary.path().join("repository");
+        fs::create_dir(&active).expect("active directory");
+        fs::create_dir(&repository_path).expect("repository directory");
+        fs::set_permissions(&active, fs::Permissions::from_mode(0o700))
+            .expect("active permissions");
+        let repository_file = std::fs::File::open(&repository_path).expect("repository descriptor");
+        let repository_metadata = repository_file.metadata().expect("repository metadata");
+        let repository = crate::target_directory::OpenedRepositoryDirectory {
+            descriptor: repository_file.into(),
+            device: repository_metadata.dev(),
+            inode: repository_metadata.ino(),
+        };
+        let identity = |character: char| format!("sha256:{}", character.to_string().repeat(64));
+        let config = SystemdLauncherServiceConfigV1 {
+            schema_version: 1,
+            identity: identity('a'),
+            adapter: ota_authority_protocol::SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1.into(),
+            socket_path: PathBuf::from("/run/ota/authority-launcher.sock"),
+            socket_group_gid: 1001,
+            ota_binary: PathBuf::from("/bin/true"),
+            environment: BTreeMap::from([(String::from("PATH"), String::from("/usr/bin"))]),
+            allowed_repository_roots: vec![temporary.path().into()],
+            mappings: vec![crate::config::SystemdPrincipalMappingV1 {
+                authority_id: String::from("release"),
+                job_peer: SessionPeer {
+                    uid: 1001,
+                    gid: 1001,
+                },
+                execution: crate::config::RunAs {
+                    uid: 65_534,
+                    gid: 65_534,
+                },
+            }],
+            broker_proxy_socket: PathBuf::from("/run/ota/broker-proxy.sock"),
+            broker_proxy_peer: SessionPeer { uid: 0, gid: 0 },
+            attestor_credential_name: String::from("authority-attestor"),
+            service_unit_identity: identity('b'),
+            socket_unit_identity: identity('c'),
+            ota_binary_identity: identity('d'),
+            broker_proxy_identity: identity('e'),
+            attestor_key_set_identity: identity('f'),
+            maximum_request_bytes: 4096,
+            maximum_active_sessions: 1,
+            maximum_startup_seconds: 5,
+            maximum_terminal_wait_seconds: 30,
+        };
+        let request = LauncherInvocationRequestV1 {
+            message_kind: ota_authority_protocol::LAUNCHER_INVOCATION_REQUEST.into(),
+            protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
+            authority_id: String::from("release"),
+            ota_arguments: vec![String::from("run"), String::from("verify")],
+            repository_path: repository_path.to_string_lossy().into_owned(),
+        };
+        let executable = std::fs::File::open("/bin/true").expect("test executable");
+        let child = prepare_disabled_child_boundary(
+            &config,
+            &executable,
+            &repository,
+            &config.mappings[0],
+            &request,
+            "invocation-test",
+            &active,
+            0,
+            temporary.path(),
+        )
+        .expect("prepare and clean child boundary");
+        assert!(!PathBuf::from(format!("/proc/{}", child.pid)).exists());
+        assert_eq!(fs::read_dir(&active).expect("active directory").count(), 0);
+
+        let principal =
+            systemd_principal_mapping(&config, &config.mappings[0]).expect("principal mapping");
+        let mut working = LauncherWorkingDirectoryV1 {
+            schema_version: 1,
+            identity: String::new(),
+            logical_path: request.repository_path.clone(),
+            device: repository.device,
+            inode: repository.inode,
+        };
+        working.identity =
+            launcher_working_directory_identity(&working).expect("working-directory identity");
+        let request_identity =
+            launcher_invocation_request_identity(&request).expect("request identity");
+        let intent = ActiveSlot::begin(
+            &active,
+            0,
+            temporary.path(),
+            "invocation-intent-only",
+            principal.identity.as_str(),
+            request_identity.as_str(),
+            working.clone(),
+        )
+        .expect("intent-only slot");
+        assert!(matches!(
+            preparation_failure(intent, PreparedChildError::CleanupFailed),
+            SystemdServiceError::ChildCleanupFailed
+        ));
+        let recoverable_mapping = identity('8');
+        let recoverable_request = identity('7');
+        let mut recoverable = ActiveSlot::begin(
+            &active,
+            0,
+            temporary.path(),
+            "invocation-recoverable",
+            recoverable_mapping.as_str(),
+            recoverable_request.as_str(),
+            working.clone(),
+        )
+        .expect("recoverable slot");
+        let mut absent_child = ota_authority_protocol::LauncherChildProcessV1 {
+            schema_version: 1,
+            identity: String::new(),
+            invocation_id: String::from("invocation-recoverable"),
+            request_identity: recoverable_request,
+            pid: u32::MAX,
+            process_start_time_identity: identity('6'),
+            ota_binary_identity: config.ota_binary_identity.clone(),
+            principal_mapping_identity: recoverable_mapping,
+            working_directory_identity: working.identity.clone(),
+        };
+        absent_child.identity =
+            ota_authority_protocol::launcher_child_process_identity(&absent_child)
+                .expect("absent child identity");
+        recoverable
+            .record_child(absent_child)
+            .expect("record recoverable child");
+        drop(recoverable);
+        assert!(matches!(
+            reconcile_active_slots(&active, 0, temporary.path(), Duration::from_secs(1)),
+            Err(SystemdServiceError::ActiveSlotUnavailable)
+        ));
+        let mut retained_intent =
+            ActiveSlot::load_all(&active, 0, temporary.path()).expect("load retained intent");
+        assert_eq!(retained_intent.len(), 1);
+        retained_intent
+            .pop()
+            .expect("retained intent")
+            .finalize()
+            .expect("intent test cleanup");
+
+        let mut stale = ActiveSlot::begin(
+            &active,
+            0,
+            temporary.path(),
+            "invocation-stale",
+            principal.identity.as_str(),
+            request_identity.as_str(),
+            working.clone(),
+        )
+        .expect("stale slot");
+        let mut mismatched_child = ota_authority_protocol::LauncherChildProcessV1 {
+            schema_version: 1,
+            identity: String::new(),
+            invocation_id: String::from("invocation-stale"),
+            request_identity,
+            pid: std::process::id(),
+            process_start_time_identity: identity('9'),
+            ota_binary_identity: config.ota_binary_identity.clone(),
+            principal_mapping_identity: principal.identity,
+            working_directory_identity: working.identity,
+        };
+        mismatched_child.identity =
+            ota_authority_protocol::launcher_child_process_identity(&mismatched_child)
+                .expect("mismatched child identity");
+        stale
+            .record_child(mismatched_child)
+            .expect("record mismatched child");
+        drop(stale);
+        assert!(matches!(
+            reconcile_active_slots(&active, 0, temporary.path(), Duration::from_secs(1)),
+            Err(SystemdServiceError::ChildCleanupFailed)
+        ));
+        let mut retained =
+            ActiveSlot::load_all(&active, 0, temporary.path()).expect("load retained mismatch");
+        assert_eq!(retained.len(), 1);
+        retained
+            .pop()
+            .expect("retained slot")
+            .finalize()
+            .expect("test cleanup");
     }
 }

@@ -51,10 +51,19 @@
 - Permit the exact `ota proof runtime` and `ota proof lifecycle` surfaces so one protected launcher
   session can carry Core's proof-wide crossing transaction through terminal cleanup and archive
   reconciliation.
+- Extend the execution-disabled Linux systemd service foundation with a root-owned active-slot
+  journal created and fsynced before fork, an exact fixed-binary child stopped before privilege
+  drop or execution, production verification of its root/stopped posture and complete descriptor
+  set, and startup cleanup through a PID-bound handle. Child-bearing temporary state is promoted;
+  intent-only, uncertain, or mismatched recovery retains the journal and refuses new work. No code
+  path resumes the child.
 
 ### Boundaries
 
 - The current implementation does not create launcher attestations, connect to a remote broker,
   issue or consume leases, or establish provider-attested authority separation.
+- The systemd service foundation does not create a transient scope, resume its prepared child,
+  contact the broker, or execute selected work. Pre-scope recovery requires Linux `pidfd`; when it
+  is unavailable or identity cannot be reconciled, the durable slot remains a hard refusal.
 - Protocol-v2 attestations are emitted only by the feature-gated pressure peer as bounded
   conformance evidence; they do not establish provider-attested or host-wide isolation.

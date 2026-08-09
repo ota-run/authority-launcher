@@ -30,8 +30,11 @@ use std::path::{Path, PathBuf};
 
 #[cfg(any(test, target_os = "linux"))]
 use ota_authority_protocol::{
-    MAX_FRAME_BYTES, SYSTEMD_LAUNCHER_SERVICE_CONFIGURATION_IDENTITY_DOMAIN_V1,
-    SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1, message_identity,
+    LauncherPrincipalMappingV1, MAX_FRAME_BYTES,
+    SYSTEMD_LAUNCHER_SERVICE_CONFIGURATION_IDENTITY_DOMAIN_V1,
+    SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1, UnixPrincipalIdentity,
+    launcher_principal_mapping_identity, message_identity, systemd_job_principal_profile_identity,
+    systemd_job_principal_profile_v1,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
@@ -215,6 +218,37 @@ pub(crate) fn systemd_launcher_service_config_identity(
         &canonical,
     )
     .map_err(|_| ConfigError::Malformed)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn systemd_principal_mapping(
+    config: &SystemdLauncherServiceConfigV1,
+    mapping: &SystemdPrincipalMappingV1,
+) -> Result<LauncherPrincipalMappingV1, ConfigError> {
+    let principal = |uid: u32, gid: u32| UnixPrincipalIdentity {
+        real_uid: uid,
+        effective_uid: uid,
+        saved_uid: uid,
+        filesystem_uid: uid,
+        real_gid: gid,
+        effective_gid: gid,
+        saved_gid: gid,
+        filesystem_gid: gid,
+    };
+    let mut canonical = LauncherPrincipalMappingV1 {
+        schema_version: 1,
+        identity: String::new(),
+        job_peer: principal(mapping.job_peer.uid, mapping.job_peer.gid),
+        execution: principal(mapping.execution.uid, mapping.execution.gid),
+        job_principal_profile_identity: systemd_job_principal_profile_identity(
+            &systemd_job_principal_profile_v1(),
+        )
+        .map_err(|_| ConfigError::Malformed)?,
+        launcher_session_binding_identity: config.identity.clone(),
+    };
+    canonical.identity =
+        launcher_principal_mapping_identity(&canonical).map_err(|_| ConfigError::Malformed)?;
+    Ok(canonical)
 }
 
 pub(crate) fn load_core_binding(
@@ -420,7 +454,12 @@ fn open_protected_executable(
     expected_uid: u32,
     trusted_root: &Path,
 ) -> Result<File, ConfigError> {
-    verify_protected_path(path, expected_uid, trusted_root, true)?;
+    verify_protected_path(
+        path,
+        expected_uid,
+        trusted_root,
+        ProtectedPathKind::Executable,
+    )?;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -446,7 +485,7 @@ fn open_protected_file(
     expected_uid: u32,
     trusted_root: &Path,
 ) -> Result<File, ConfigError> {
-    verify_protected_path(path, expected_uid, trusted_root, false)?;
+    verify_protected_path(path, expected_uid, trusted_root, ProtectedPathKind::File)?;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -465,14 +504,41 @@ fn verify_protected_executable(
     expected_uid: u32,
     trusted_root: &Path,
 ) -> Result<(), ConfigError> {
-    verify_protected_path(path, expected_uid, trusted_root, true)
+    verify_protected_path(
+        path,
+        expected_uid,
+        trusted_root,
+        ProtectedPathKind::Executable,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_protected_directory(
+    path: &Path,
+    expected_uid: u32,
+    trusted_root: &Path,
+) -> Result<(), ConfigError> {
+    verify_protected_path(
+        path,
+        expected_uid,
+        trusted_root,
+        ProtectedPathKind::Directory,
+    )
+}
+
+#[derive(Clone, Copy)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum ProtectedPathKind {
+    File,
+    Executable,
+    Directory,
 }
 
 fn verify_protected_path(
     path: &Path,
     expected_uid: u32,
     trusted_root: &Path,
-    executable: bool,
+    kind: ProtectedPathKind,
 ) -> Result<(), ConfigError> {
     if !path.is_absolute() || !trusted_root.is_absolute() || !path.starts_with(trusted_root) {
         return Err(ConfigError::Unprotected);
@@ -489,9 +555,16 @@ fn verify_protected_path(
             return Err(ConfigError::Unprotected);
         }
         if candidate == path {
-            if !metadata.is_file()
-                || (executable && (metadata.mode() & 0o111 == 0 || metadata.mode() & 0o6000 != 0))
-            {
+            let valid = match kind {
+                ProtectedPathKind::File => metadata.is_file(),
+                ProtectedPathKind::Executable => {
+                    metadata.is_file()
+                        && metadata.mode() & 0o111 != 0
+                        && metadata.mode() & 0o6000 == 0
+                }
+                ProtectedPathKind::Directory => metadata.is_dir(),
+            };
+            if !valid {
                 return Err(ConfigError::Unprotected);
             }
         } else if !metadata.is_dir() {
@@ -562,15 +635,24 @@ mod tests {
         let file = protected.join("config.json");
         fs::write(&file, b"{}").expect("protected file");
         fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).expect("file permissions");
-        assert!(verify_protected_path(&file, uid, root.path(), false).is_ok());
+        assert!(verify_protected_path(&file, uid, root.path(), ProtectedPathKind::File).is_ok());
 
         let alias = protected.join("alias.json");
         std::os::unix::fs::symlink(&file, &alias).expect("symlink");
-        assert!(verify_protected_path(&alias, uid, root.path(), false).is_err());
+        assert!(verify_protected_path(&alias, uid, root.path(), ProtectedPathKind::File).is_err());
 
         fs::set_permissions(&protected, fs::Permissions::from_mode(0o722))
             .expect("writable permissions");
-        assert!(verify_protected_path(&file, uid, root.path(), false).is_err());
+        assert!(verify_protected_path(&file, uid, root.path(), ProtectedPathKind::File).is_err());
+
+        let directory = root.path().join("state");
+        fs::create_dir(&directory).expect("state directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("state permissions");
+        assert!(
+            verify_protected_path(&directory, uid, root.path(), ProtectedPathKind::Directory,)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -643,6 +725,11 @@ mod tests {
     fn systemd_service_config_requires_exact_identity_and_one_to_one_mappings() {
         let config = systemd_service_config();
         assert!(validate_systemd_launcher_service_config(&config).is_ok());
+        let mapping =
+            systemd_principal_mapping(&config, &config.mappings[0]).expect("principal mapping");
+        assert_eq!(mapping.launcher_session_binding_identity, config.identity);
+        assert_eq!(mapping.job_peer.real_uid, config.mappings[0].job_peer.uid);
+        assert_eq!(mapping.execution.real_uid, config.mappings[0].execution.uid);
 
         let mut changed_root = config.clone();
         changed_root
