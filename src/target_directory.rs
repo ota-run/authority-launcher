@@ -540,6 +540,57 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a Linux host exposing openat2"]
+    fn positive_openat2_pressure_refuses_symlink_escape() {
+        let temporary = tempdir().expect("temporary root");
+        let allowed = temporary.path().join("allowed");
+        let repository = allowed.join("repository");
+        let outside = temporary.path().join("outside");
+        fs::create_dir(&allowed).expect("allowed root");
+        fs::create_dir(&repository).expect("repository");
+        fs::create_dir(&outside).expect("outside directory");
+
+        let root_path = CString::new(allowed.as_os_str().as_bytes()).expect("root C string");
+        let root_descriptor = open_directory(
+            libc::AT_FDCWD,
+            root_path.as_ptr(),
+            libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_SYMLINKS,
+        );
+        assert!(
+            root_descriptor >= 0,
+            "positive pressure requires openat2: {}",
+            io::Error::last_os_error()
+        );
+
+        let relative = CString::new("repository").expect("relative path");
+        let repository_descriptor = open_directory(
+            root_descriptor,
+            relative.as_ptr(),
+            libc::RESOLVE_BENEATH
+                | libc::RESOLVE_NO_MAGICLINKS
+                | libc::RESOLVE_NO_SYMLINKS
+                | libc::RESOLVE_NO_XDEV,
+        );
+        assert!(repository_descriptor >= 0, "contained directory open");
+        unsafe { libc::close(repository_descriptor) };
+
+        symlink(&outside, allowed.join("escape")).expect("escape symlink");
+        let escape = CString::new("escape").expect("escape path");
+        assert!(
+            open_directory(
+                root_descriptor,
+                escape.as_ptr(),
+                libc::RESOLVE_BENEATH
+                    | libc::RESOLVE_NO_MAGICLINKS
+                    | libc::RESOLVE_NO_SYMLINKS
+                    | libc::RESOLVE_NO_XDEV,
+            ) < 0,
+            "symlink escape must refuse"
+        );
+        unsafe { libc::close(root_descriptor) };
+    }
+
+    #[test]
     fn target_principal_open_binds_descriptor_and_refuses_symlink_escape() {
         if unsafe { libc::geteuid() } != 0 {
             return;
