@@ -23,13 +23,25 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::BufReader;
+#[cfg(target_os = "linux")]
+use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+#[cfg(any(test, target_os = "linux"))]
+use ota_authority_protocol::{
+    MAX_FRAME_BYTES, SYSTEMD_LAUNCHER_SERVICE_CONFIGURATION_IDENTITY_DOMAIN_V1,
+    SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1, message_identity,
+};
+use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub(crate) const AUTHORITY_LAUNCHER_CONFIG_PATH: &str = "/etc/ota/authority-launcher.json";
+#[cfg(target_os = "linux")]
+pub(crate) const SYSTEMD_AUTHORITY_LAUNCHER_CONFIG_PATH: &str =
+    "/etc/ota/authority-launcher-systemd.json";
 pub(crate) const CROSSING_BROKER_STORE_PATH: &str = "/etc/ota/crossing-brokers.json";
 
 #[derive(Debug, Error)]
@@ -56,7 +68,7 @@ pub(crate) struct LauncherConfig {
     pub sessions: Vec<LauncherSessionBinding>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RunAs {
     pub uid: u32,
@@ -71,11 +83,52 @@ pub(crate) struct LauncherSessionBinding {
     pub expected_peer: SessionPeer,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionPeer {
     pub uid: u32,
     pub gid: u32,
+}
+
+/// Administrator-owned configuration for the Linux systemd service branch.
+///
+/// This does not reinterpret the legacy inherited-descriptor configuration. The identity is
+/// derived with the `identity` field cleared, then must match the V3 broker binding's
+/// `launcher_session_binding_identity` before Core admits a crossing.
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SystemdLauncherServiceConfigV1 {
+    pub schema_version: u32,
+    pub identity: String,
+    pub adapter: String,
+    pub socket_path: PathBuf,
+    pub socket_group_gid: u32,
+    pub ota_binary: PathBuf,
+    pub environment: BTreeMap<String, String>,
+    pub allowed_repository_roots: Vec<PathBuf>,
+    pub mappings: Vec<SystemdPrincipalMappingV1>,
+    pub broker_proxy_socket: PathBuf,
+    pub broker_proxy_peer: SessionPeer,
+    pub attestor_credential_name: String,
+    pub service_unit_identity: String,
+    pub socket_unit_identity: String,
+    pub ota_binary_identity: String,
+    pub broker_proxy_identity: String,
+    pub attestor_key_set_identity: String,
+    pub maximum_request_bytes: usize,
+    pub maximum_active_sessions: u32,
+    pub maximum_startup_seconds: u64,
+    pub maximum_terminal_wait_seconds: u64,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SystemdPrincipalMappingV1 {
+    pub authority_id: String,
+    pub job_peer: SessionPeer,
+    pub execution: RunAs,
 }
 
 impl LauncherConfig {
@@ -126,6 +179,42 @@ pub(crate) fn load_launcher_config(path: &str) -> Result<LauncherConfig, ConfigE
     validate_launcher_config(&config)?;
     verify_protected_executable(config.ota_binary.as_path(), 0, Path::new("/"))?;
     Ok(config)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn load_systemd_launcher_service_config(
+    path: &str,
+) -> Result<LoadedSystemdLauncherServiceConfigV1, ConfigError> {
+    let path = Path::new(path);
+    let file = open_protected_file(path, 0, Path::new("/"))?;
+    let config: SystemdLauncherServiceConfigV1 =
+        serde_json::from_reader(BufReader::new(file)).map_err(|_| ConfigError::Malformed)?;
+    validate_systemd_launcher_service_config(&config)?;
+    let mut ota_binary = open_protected_executable(config.ota_binary.as_path(), 0, Path::new("/"))?;
+    if sha256_file_identity(&mut ota_binary)? != config.ota_binary_identity {
+        return Err(ConfigError::Unprotected);
+    }
+    Ok(LoadedSystemdLauncherServiceConfigV1 { config, ota_binary })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct LoadedSystemdLauncherServiceConfigV1 {
+    pub config: SystemdLauncherServiceConfigV1,
+    /// The exact protected executable whose identity was verified during configuration loading.
+    pub ota_binary: File,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) fn systemd_launcher_service_config_identity(
+    config: &SystemdLauncherServiceConfigV1,
+) -> Result<String, ConfigError> {
+    let mut canonical = config.clone();
+    canonical.identity.clear();
+    message_identity(
+        SYSTEMD_LAUNCHER_SERVICE_CONFIGURATION_IDENTITY_DOMAIN_V1,
+        &canonical,
+    )
+    .map_err(|_| ConfigError::Malformed)
 }
 
 pub(crate) fn load_core_binding(
@@ -187,6 +276,169 @@ fn validate_launcher_config(config: &LauncherConfig) -> Result<(), ConfigError> 
         }
     }
     Ok(())
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn validate_systemd_launcher_service_config(
+    config: &SystemdLauncherServiceConfigV1,
+) -> Result<(), ConfigError> {
+    if config.schema_version != 1
+        || config.adapter != SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1
+        || config.socket_path != Path::new("/run/ota/authority-launcher.sock")
+        || config.socket_group_gid == 0
+        || !config.ota_binary.is_absolute()
+        || !config.broker_proxy_socket.is_absolute()
+        || config.broker_proxy_socket == config.socket_path
+        || config.allowed_repository_roots.is_empty()
+        || config.mappings.is_empty()
+        || config.maximum_request_bytes == 0
+        || config.maximum_request_bytes > MAX_FRAME_BYTES
+        || config.maximum_active_sessions == 0
+        || config.maximum_active_sessions > 16
+        || config.maximum_startup_seconds == 0
+        || config.maximum_startup_seconds > 600
+        || config.maximum_terminal_wait_seconds == 0
+        || config.maximum_terminal_wait_seconds > 3600
+        || !is_bounded_identifier(config.attestor_credential_name.as_str())
+        || !is_sha256_identity(config.service_unit_identity.as_str())
+        || !is_sha256_identity(config.socket_unit_identity.as_str())
+        || !is_sha256_identity(config.ota_binary_identity.as_str())
+        || !is_sha256_identity(config.broker_proxy_identity.as_str())
+        || !is_sha256_identity(config.attestor_key_set_identity.as_str())
+        || config.broker_proxy_peer.uid != 0
+        || config.broker_proxy_peer.gid != 0
+        || config.environment.len() > 64
+        || config.environment.iter().any(|(name, value)| {
+            !is_environment_name(name.as_str()) || value.len() > 4096 || value.contains('\0')
+        })
+    {
+        return Err(ConfigError::Unsupported);
+    }
+
+    let mut roots = BTreeSet::new();
+    for root in &config.allowed_repository_roots {
+        if !root.is_absolute()
+            || root == Path::new("/")
+            || root.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            })
+            || !roots.insert(root.as_path())
+        {
+            return Err(ConfigError::Unsupported);
+        }
+    }
+    if config
+        .allowed_repository_roots
+        .iter()
+        .enumerate()
+        .any(|(index, root)| {
+            config
+                .allowed_repository_roots
+                .iter()
+                .skip(index + 1)
+                .any(|other| root.starts_with(other) || other.starts_with(root))
+        })
+    {
+        return Err(ConfigError::Unsupported);
+    }
+
+    let mut authorities = BTreeSet::new();
+    let mut job_peers = BTreeSet::new();
+    let mut executions = BTreeSet::new();
+    for mapping in &config.mappings {
+        if !is_bounded_identifier(mapping.authority_id.as_str())
+            || mapping.job_peer.uid == 0
+            || mapping.job_peer.gid == 0
+            || mapping.job_peer.gid != config.socket_group_gid
+            || mapping.execution.uid == 0
+            || mapping.execution.gid == 0
+            || (mapping.job_peer.uid == mapping.execution.uid
+                && mapping.job_peer.gid == mapping.execution.gid)
+            || !authorities.insert(mapping.authority_id.as_str())
+            || !job_peers.insert((mapping.job_peer.uid, mapping.job_peer.gid))
+            || !executions.insert((mapping.execution.uid, mapping.execution.gid))
+        {
+            return Err(ConfigError::Unsupported);
+        }
+    }
+
+    if config.identity != systemd_launcher_service_config_identity(config)? {
+        return Err(ConfigError::Unprotected);
+    }
+    Ok(())
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn is_bounded_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn is_environment_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn is_sha256_identity(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value.as_bytes()[7..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+#[cfg(target_os = "linux")]
+fn sha256_file_identity(file: &mut File) -> Result<String, ConfigError> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| ConfigError::Unavailable)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("sha256:{:x}", digest.finalize()))
+}
+
+#[cfg(target_os = "linux")]
+fn open_protected_executable(
+    path: &Path,
+    expected_uid: u32,
+    trusted_root: &Path,
+) -> Result<File, ConfigError> {
+    verify_protected_path(path, expected_uid, trusted_root, true)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| ConfigError::Unavailable)?;
+    let opened = file.metadata().map_err(|_| ConfigError::Unavailable)?;
+    let observed = path.metadata().map_err(|_| ConfigError::Unavailable)?;
+    if opened.dev() != observed.dev()
+        || opened.ino() != observed.ino()
+        || !opened.is_file()
+        || opened.uid() != expected_uid
+        || opened.mode() & 0o022 != 0
+        || opened.mode() & 0o111 == 0
+        || opened.mode() & 0o6000 != 0
+    {
+        return Err(ConfigError::Unprotected);
+    }
+    Ok(file)
 }
 
 fn open_protected_file(
@@ -330,5 +582,114 @@ mod tests {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o4755))
             .expect("setuid permissions");
         assert!(verify_protected_executable(&executable, uid, root.path()).is_err());
+    }
+
+    fn identity(value: char) -> String {
+        format!("sha256:{}", value.to_string().repeat(64))
+    }
+
+    fn systemd_service_config() -> SystemdLauncherServiceConfigV1 {
+        let mut config = SystemdLauncherServiceConfigV1 {
+            schema_version: 1,
+            identity: String::new(),
+            adapter: String::from(SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1),
+            socket_path: PathBuf::from("/run/ota/authority-launcher.sock"),
+            socket_group_gid: 1001,
+            ota_binary: PathBuf::from("/opt/ota/bin/ota"),
+            environment: BTreeMap::from([(String::from("HOME"), String::from("/var/empty"))]),
+            allowed_repository_roots: vec![PathBuf::from("/srv/ota-repositories")],
+            mappings: vec![
+                SystemdPrincipalMappingV1 {
+                    authority_id: String::from("release"),
+                    job_peer: SessionPeer {
+                        uid: 1001,
+                        gid: 1001,
+                    },
+                    execution: RunAs {
+                        uid: 2001,
+                        gid: 2001,
+                    },
+                },
+                SystemdPrincipalMappingV1 {
+                    authority_id: String::from("publish"),
+                    job_peer: SessionPeer {
+                        uid: 1002,
+                        gid: 1001,
+                    },
+                    execution: RunAs {
+                        uid: 2002,
+                        gid: 2002,
+                    },
+                },
+            ],
+            broker_proxy_socket: PathBuf::from("/run/ota/broker-proxy.sock"),
+            broker_proxy_peer: SessionPeer { uid: 0, gid: 0 },
+            attestor_credential_name: String::from("authority-attestor"),
+            service_unit_identity: identity('a'),
+            socket_unit_identity: identity('b'),
+            ota_binary_identity: identity('c'),
+            broker_proxy_identity: identity('d'),
+            attestor_key_set_identity: identity('e'),
+            maximum_request_bytes: 4096,
+            maximum_active_sessions: 2,
+            maximum_startup_seconds: 30,
+            maximum_terminal_wait_seconds: 300,
+        };
+        config.identity = systemd_launcher_service_config_identity(&config).expect("identity");
+        config
+    }
+
+    #[test]
+    fn systemd_service_config_requires_exact_identity_and_one_to_one_mappings() {
+        let config = systemd_service_config();
+        assert!(validate_systemd_launcher_service_config(&config).is_ok());
+
+        let mut changed_root = config.clone();
+        changed_root
+            .allowed_repository_roots
+            .push(PathBuf::from("/srv/other-repositories"));
+        assert!(matches!(
+            validate_systemd_launcher_service_config(&changed_root),
+            Err(ConfigError::Unprotected)
+        ));
+
+        let mut shared_execution = config.clone();
+        shared_execution.mappings[1].execution = shared_execution.mappings[0].execution.clone();
+        shared_execution.identity =
+            systemd_launcher_service_config_identity(&shared_execution).expect("identity");
+        assert!(matches!(
+            validate_systemd_launcher_service_config(&shared_execution),
+            Err(ConfigError::Unsupported)
+        ));
+
+        let mut root_escape = config.clone();
+        root_escape.allowed_repository_roots = vec![PathBuf::from("/srv/../etc")];
+        root_escape.identity =
+            systemd_launcher_service_config_identity(&root_escape).expect("identity");
+        assert!(matches!(
+            validate_systemd_launcher_service_config(&root_escape),
+            Err(ConfigError::Unsupported)
+        ));
+
+        let mut overlapping_roots = config.clone();
+        overlapping_roots.allowed_repository_roots = vec![
+            PathBuf::from("/srv/repositories"),
+            PathBuf::from("/srv/repositories/team"),
+        ];
+        overlapping_roots.identity =
+            systemd_launcher_service_config_identity(&overlapping_roots).expect("identity");
+        assert!(matches!(
+            validate_systemd_launcher_service_config(&overlapping_roots),
+            Err(ConfigError::Unsupported)
+        ));
+
+        let mut uppercase_identity = config.clone();
+        uppercase_identity.ota_binary_identity = identity('A');
+        uppercase_identity.identity =
+            systemd_launcher_service_config_identity(&uppercase_identity).expect("identity");
+        assert!(matches!(
+            validate_systemd_launcher_service_config(&uppercase_identity),
+            Err(ConfigError::Unsupported)
+        ));
     }
 }

@@ -24,6 +24,10 @@
 mod config;
 #[cfg(test)]
 mod reference_peer;
+#[cfg(target_os = "linux")]
+mod systemd_service;
+#[cfg(target_os = "linux")]
+mod target_directory;
 #[cfg(unix)]
 mod unix;
 
@@ -53,6 +57,11 @@ enum Command {
         #[arg(last = true, required = true)]
         ota_args: Vec<String>,
     },
+
+    /// Internal systemd socket-activation entrypoint. This remains execution-disabled until the
+    /// service can establish V3 attestation and a broker-backed one-use lease.
+    #[command(hide = true)]
+    ServeSystemd,
 }
 
 fn main() -> ExitCode {
@@ -62,6 +71,7 @@ fn main() -> ExitCode {
             authority_id,
             ota_args,
         } => run(authority_id.as_str(), ota_args.as_slice()),
+        Command::ServeSystemd => serve_systemd(),
     };
     match result {
         Ok(code) => ExitCode::from(code),
@@ -69,6 +79,20 @@ fn main() -> ExitCode {
             eprintln!("ota-authority-launcher: {error}");
             ExitCode::from(1)
         }
+    }
+}
+
+fn serve_systemd() -> Result<u8, String> {
+    #[cfg(target_os = "linux")]
+    {
+        systemd_service::serve_once().map_err(|error| error.to_string())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(String::from(
+            "the systemd protected launcher adapter supports Linux only",
+        ))
     }
 }
 
