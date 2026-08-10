@@ -265,6 +265,16 @@ synced before termination. The repository job cannot create the marker; an admin
 it before dispatch. The next socket activation must reconcile and remove that exact boundary
 before it can accept another request. Production builds omit the feature and marker behavior.
 
+Hosted normal pressure
+[31389237232](https://github.com/bobaikato/create-chrome-extension/actions/runs/31389237232)
+and root-armed crash/recovery pressure
+[31389713244](https://github.com/bobaikato/create-chrome-extension/actions/runs/31389713244)
+bind launcher `d8aa1d0bf9783d29d53d0a5e912f09f1fa414624` to exact reproducible installed
+binary identities, unchanged repository state, zero terminal scopes, and the typed post-admission
+cleanup stage. The crash run records launcher exit `86` before fresh reconciliation. These runs do
+not prove V3 attestation, broker authorization, lease consumption, selected execution, receipt or
+archive evidence, or provider-attested separation.
+
 ## What belongs here
 
 - the Unix launcher-session implementation;
