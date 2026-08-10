@@ -35,7 +35,7 @@ clap = { version = "4.5.39", features = ["derive"] }
 ed25519-dalek = { version = "3.0.0", optional = true }
 getrandom = "0.2"
 libc = "0.2.177"
-ota-authority-protocol = { git = "https://github.com/ota-run/authority-protocol", rev = "b4f36fe450dc4047bd7bd623ea8ba60fd951e31d" }
+ota-authority-protocol = { git = "https://github.com/ota-run/authority-protocol.git", rev = "953e9e6407c9de030822b1f891046c2829b3c714" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_jcs = { version = "0.2.0", optional = true }
 serde_json = "1.0.145"
@@ -47,7 +47,7 @@ time = { version = "0.3.48", features = ["formatting"], optional = true }
 zbus = { version = "5.18.0", features = ["blocking-api"] }
 
 [dev-dependencies]
-ota-authority-protocol = { git = "https://github.com/ota-run/authority-protocol", rev = "b4f36fe450dc4047bd7bd623ea8ba60fd951e31d" }
+ota-authority-protocol = { git = "https://github.com/ota-run/authority-protocol.git", rev = "953e9e6407c9de030822b1f891046c2829b3c714" }
 tempfile = "3.23.0"
 
 [features]

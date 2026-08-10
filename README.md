@@ -227,9 +227,13 @@ asks the root systemd manager for one request-derived transient scope in the fix
 confirms the exact unit properties and sole PID through the kernel cgroup, and durably records that
 scope. Only after that persistence does the launcher resume the exact PID through `pidfd`, admit one
 bounded `ota_process_posture/v1` frame, and reconcile its identity, PID/start time, Ota binary, and
-principal mapping to the prepared child. The launcher forwards no broker challenge. It then kills
-the complete scope, confirms it absent and its cgroup empty or absent, kills/reaps the child, and
-removes the slot.
+principal mapping to the prepared child. It then sends one identity-bound local continuation that
+binds the exact invocation, child, working directory, posture, and principal mapping so Core can
+parse the command and freeze the real semantic scope. The launcher connects only to the
+protected root-owned proxy, relays Core's exact challenge and one structurally valid signed V3
+response, then observes Core's exact matching authorization request without forwarding it. It
+finally kills the complete scope, confirms it absent and its cgroup empty or absent, kills/reaps the
+child, and removes the slot.
 
 On startup, retained journals are reconciled before accepting a client. A valid child- or
 scope-bearing temporary journal is promoted rather than discarded. Intent-only state remains a
@@ -237,25 +241,26 @@ hard refusal because it cannot establish child absence. An exact pre-scope child
 through Linux `pidfd`; a scope-bearing journal additionally requires the exact unit and kernel
 cgroup to be stopped and observed empty. PID reuse, identity mismatch, unsupported cleanup, or any
 uncertain outcome retains the slot and fails closed.
-This foundation resumes Ota only through its private posture preface. It does **not** create or sign
-V3 attestation, contact the broker, consume a lease, or execute repository work. Missing, malformed,
-oversized, self-inconsistent, or child-mismatched posture fails closed and enters the same exact
-cleanup path. Core emits this preface before CLI dispatch and waits for a launcher continuation;
-this slice deliberately sends none. OrbStack's systemd currently refuses the real pre-exec PID
-attachment with `ENOTTY`; the
+This foundation remains execution-disabled after signed V3 admission. It does **not** forward the
+authorization request, obtain a decision, issue or consume a lease, execute repository work, or
+create crossing receipt/archive evidence. The protected proxy remains the attestation producer;
+the configured service credential is not consumed by this bridge slice. Missing, malformed,
+oversized, self-inconsistent, or substituted posture, continuation, challenge, attestation, or
+authorization admission fails closed and enters the same exact cleanup path. OrbStack's systemd
+currently refuses the real pre-exec PID attachment with `ENOTTY`; the
 implementation remains fail-closed there, and positive posture-plus-scope proof requires the
 prepared hardened Linux runner.
 
 The feature-gated `ota-authority-systemd-pressure-client` is the unprivileged side of that positive
 kernel proof. It connects only to `/run/ota/authority-launcher.sock`, submits one bounded
 `LauncherInvocationRequestV1`, and accepts only the execution-disabled terminal refusal emitted
-with the typed `posture_admitted_boundary_removed` stage after the service has admitted Core's
-private posture and confirmed exact scope and child cleanup. A repository-open refusal or generic
-boundary failure cannot satisfy this pressure client. Before sending the request it requires the
-fixed socket and parent to have the protected root-owned posture and requires the connected Unix
-peer to be root-owned. It cannot select another socket, install configuration, mutate systemd,
-provide authority, or enable execution. The binary is not installed as part of the production
-launcher.
+with the typed `attestation_admitted_before_authorization_boundary_removed` stage after the service
+has admitted Core's signed V3 response and confirmed exact scope and child cleanup. A posture-only,
+repository-open, or generic boundary refusal cannot satisfy this pressure client. Before sending
+the request it requires the fixed socket and parent to have the protected root-owned posture and
+requires the connected Unix peer to be root-owned. It cannot select another socket, install
+configuration, mutate systemd, provide authority, or enable execution. The binary is not installed
+as part of the production launcher.
 
 Immutable crash/recovery pressure may additionally build the launcher with the
 `systemd-pressure-faults` feature. In that build only, a root-owned mode-`0600` one-shot marker at

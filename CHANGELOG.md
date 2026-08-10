@@ -26,7 +26,22 @@
 
 ## Unreleased
 
-- Advance the execution-disabled systemd service through one posture-only child transition. After
+- Advance the systemd protected-launcher boundary through one signed V3 attestation bridge. Core's
+  exact posture admission now receives an identity-bound launcher continuation, freezes the real
+  semantic scope, and sends its broker challenge over the same private descriptor. The launcher
+  relays only that challenge and one protocol-valid V3 response, observes Core's exact matching
+  authorization request, and deliberately does not forward it. Exact scope, cgroup, child, and
+  active-slot cleanup remain mandatory before the typed
+  `attestation_admitted_before_authorization_boundary_removed` refusal is emitted.
+- Keep the new bridge explicitly execution-disabled. It does not obtain an authorization decision,
+  issue or consume a lease, execute selected work, or produce crossing receipt/archive evidence.
+  Missing or unprotected proxy state, malformed or substituted V3 evidence, mismatched Core
+  authorization admission, and continuation substitution fail closed through the same cleanup
+  authority and emit `pre_authorization_protocol_refused_boundary_removed`, not a broker authority
+  decision or provider-boundary failure.
+
+- In the preceding posture-only slice, advance the execution-disabled systemd service through one
+  child transition. After
   the exact transient scope and active slot are durable, the launcher resumes the child through
   `pidfd`, accepts one bounded `ota_process_posture/v1` frame, and reconciles its semantic identity,
   PID/start time, binary identity, and protected principal mapping before exact cleanup. Missing,

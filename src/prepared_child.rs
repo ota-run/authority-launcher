@@ -23,22 +23,28 @@
 //! Stopped fixed-binary child preparation for the systemd launcher.
 //!
 //! The child remains root and stopped until the launcher has durably recorded its identity and
-//! bound it to the exact systemd invocation scope. The only resume path admits one bounded Ota
-//! process-posture preface; it does not relay broker traffic or selected execution.
+//! bound it to the exact systemd invocation scope. The resume path admits one bounded Ota
+//! process-posture preface and one signed V3 attestation bridge, then stops before authorization or
+//! selected execution.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use ota_authority_protocol::{
-    LauncherChildProcessV1, MAX_FRAME_BYTES, OtaProcessPostureV1, decode_frame,
-    launcher_child_process_identity, ota_process_posture_identity, sha256_identity,
+    ATTESTATION_RESPONSE, AUTHORIZATION_REQUEST, AuthorizationRequest, BrokerChallenge,
+    LauncherChildProcessV1, LauncherStartupContinuationV1, MAX_FRAME_BYTES, OtaProcessPostureV1,
+    SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3, SignedLauncherAttestationV3, decode_frame,
+    encode_frame, launcher_attestation_identity_v3, launcher_child_process_identity,
+    launcher_startup_continuation_identity, ota_process_posture_identity, sha256_identity,
 };
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 use crate::config::{RunAs, SystemdLauncherServiceConfigV1};
@@ -66,6 +72,10 @@ pub(crate) enum PreparedChildError {
     PostureUnavailable,
     #[error("the protected Ota child process posture does not match the prepared child")]
     PostureMismatch,
+    #[error("the protected Ota child attestation bridge is unavailable")]
+    AttestationBridgeUnavailable,
+    #[error("the protected Ota child did not reach exact authorization admission")]
+    AuthorizationAdmissionMismatch,
 }
 
 pub(crate) struct PreparedChild {
@@ -115,6 +125,94 @@ impl PreparedChild {
         }
 
         self.receive_process_posture_after_resume(expected_principal_mapping_identity, timeout)
+    }
+
+    pub(crate) fn continue_and_bridge_v3_attestation(
+        &mut self,
+        posture: &OtaProcessPostureV1,
+        broker_proxy: &mut UnixStream,
+        timeout: Duration,
+    ) -> Result<(), PreparedChildError> {
+        let mut continuation = LauncherStartupContinuationV1 {
+            schema_version: 1,
+            identity: String::new(),
+            message_kind: ota_authority_protocol::LAUNCHER_STARTUP_CONTINUATION.into(),
+            invocation_id: self.record.invocation_id.clone(),
+            child_process_identity: self.record.identity.clone(),
+            working_directory_identity: self.record.working_directory_identity.clone(),
+            process_posture_identity: posture.identity.clone(),
+            principal_mapping_identity: posture.principal_mapping_identity.clone(),
+        };
+        continuation.identity = launcher_startup_continuation_identity(&continuation)
+            .map_err(|_| PreparedChildError::AttestationBridgeUnavailable)?;
+        write_json_frame(&mut self.launcher_session, &continuation, timeout)?;
+
+        let challenge: BrokerChallenge = read_json_frame(&mut self.launcher_session, timeout)?;
+        if challenge.message_kind != ota_authority_protocol::CHALLENGE_REQUEST
+            || challenge.protocol_version != ota_authority_protocol::PROTOCOL_VERSION_V1
+        {
+            return Err(PreparedChildError::AttestationBridgeUnavailable);
+        }
+        write_json_frame(broker_proxy, &challenge, timeout)?;
+        let attestation: SignedLauncherAttestationV3 = read_json_frame(broker_proxy, timeout)?;
+        let attestation_identity = launcher_attestation_identity_v3(&attestation)
+            .map_err(|_| PreparedChildError::AttestationBridgeUnavailable)?;
+        if attestation.payload.message_kind != ATTESTATION_RESPONSE
+            || attestation.payload.attestation_protocol_version
+                != SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3
+            || attestation.payload.binding_identity != challenge.binding_identity
+            || attestation.payload.challenge_nonce_commitment != challenge.nonce_commitment
+            || attestation.payload.work_unit_identity != challenge.work_unit_identity
+            || attestation.payload.semantic_scope_identity != challenge.semantic_scope_identity
+            || attestation.payload.invocation_id != self.record.invocation_id
+            || attestation.payload.runner_principal != posture.principal_mapping_identity
+            || attestation
+                .payload
+                .systemd_protected_launcher
+                .instance_v1
+                .child_process_identity
+                != self.record.identity
+            || attestation
+                .payload
+                .systemd_protected_launcher
+                .instance_v1
+                .working_directory_identity
+                != self.record.working_directory_identity
+            || attestation
+                .payload
+                .systemd_protected_launcher
+                .instance_v1
+                .process_posture
+                .identity
+                != posture.identity
+            || attestation
+                .payload
+                .systemd_protected_launcher
+                .instance_v1
+                .principal_mapping
+                .identity
+                != posture.principal_mapping_identity
+        {
+            return Err(PreparedChildError::AttestationBridgeUnavailable);
+        }
+        write_json_frame(&mut self.launcher_session, &attestation, timeout)?;
+
+        let authorization: AuthorizationRequest =
+            read_json_frame(&mut self.launcher_session, timeout)?;
+        if authorization.message_kind != AUTHORIZATION_REQUEST
+            || authorization.binding_identity != challenge.binding_identity
+            || authorization.attestation_identity != attestation_identity
+            || authorization.challenge_nonce_commitment != challenge.nonce_commitment
+            || authorization.work_unit_identity != challenge.work_unit_identity
+            || authorization.contract_identity != challenge.contract_identity
+            || authorization.semantic_scope_identity != challenge.semantic_scope_identity
+            || authorization.runner_principal != attestation.payload.runner_principal
+        {
+            return Err(PreparedChildError::AuthorizationAdmissionMismatch);
+        }
+
+        // Authorization remains disabled in this slice. The request is intentionally not relayed.
+        Ok(())
     }
 
     fn receive_process_posture_after_resume(
@@ -314,7 +412,7 @@ fn child_environment(
     );
     environment.insert(
         String::from("OTA_SYSTEMD_LAUNCHER_STARTUP_GATE"),
-        String::from("posture_only_v1"),
+        String::from("attestation_v1"),
     );
     environment
         .iter()
@@ -341,6 +439,43 @@ fn receive_process_posture(
     read_exact_until(stream, &mut frame[4..], deadline)?;
     let payload = decode_frame(&frame).map_err(|_| PreparedChildError::PostureUnavailable)?;
     serde_json::from_slice(payload).map_err(|_| PreparedChildError::PostureUnavailable)
+}
+
+fn write_json_frame<T: Serialize>(
+    stream: &mut UnixStream,
+    value: &T,
+    timeout: Duration,
+) -> Result<(), PreparedChildError> {
+    let payload =
+        serde_json::to_vec(value).map_err(|_| PreparedChildError::AttestationBridgeUnavailable)?;
+    let frame =
+        encode_frame(&payload).map_err(|_| PreparedChildError::AttestationBridgeUnavailable)?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .and_then(|()| stream.write_all(&frame))
+        .map_err(|_| PreparedChildError::AttestationBridgeUnavailable)
+}
+
+fn read_json_frame<T: DeserializeOwned>(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<T, PreparedChildError> {
+    let deadline = Instant::now() + timeout;
+    let mut header = [0_u8; 4];
+    read_exact_until(stream, &mut header, deadline)
+        .map_err(|_| PreparedChildError::AttestationBridgeUnavailable)?;
+    let length = u32::from_be_bytes(header) as usize;
+    if length == 0 || length > MAX_FRAME_BYTES {
+        return Err(PreparedChildError::AttestationBridgeUnavailable);
+    }
+    let mut frame = Vec::with_capacity(4 + length);
+    frame.extend_from_slice(&header);
+    frame.resize(4 + length, 0);
+    read_exact_until(stream, &mut frame[4..], deadline)
+        .map_err(|_| PreparedChildError::AttestationBridgeUnavailable)?;
+    let payload =
+        decode_frame(&frame).map_err(|_| PreparedChildError::AttestationBridgeUnavailable)?;
+    serde_json::from_slice(payload).map_err(|_| PreparedChildError::AttestationBridgeUnavailable)
 }
 
 fn read_exact_until(
@@ -729,8 +864,15 @@ mod tests {
     use std::path::PathBuf;
 
     use ota_authority_protocol::{
-        LauncherWorkingDirectoryV1, OTA_PROCESS_POSTURE, encode_frame,
-        launcher_working_directory_identity,
+        AuthorizationRequest, LauncherAttestationPayloadV3, LauncherPrincipalMappingV1,
+        LauncherWorkingDirectoryV1, OTA_PROCESS_POSTURE, RuntimeBoundaryObservationState,
+        SignedLauncherAttestationV3, SystemdJobPrincipalObservation, SystemdLauncherObservation,
+        SystemdProtectedLauncherInstanceEvidenceV1, SystemdProtectedLauncherInstanceEvidenceV2,
+        UnixPrincipalIdentity, encode_frame, launcher_principal_mapping_identity,
+        launcher_working_directory_identity, systemd_job_principal_profile_identity,
+        systemd_job_principal_profile_v1, systemd_launcher_profile_identity,
+        systemd_launcher_profile_v1, systemd_protected_launcher_instance_identity,
+        systemd_protected_launcher_instance_v2_identity,
     };
     use tempfile::tempdir;
 
@@ -755,6 +897,271 @@ mod tests {
         };
         posture.identity = ota_process_posture_identity(&posture).expect("posture identity");
         posture
+    }
+
+    fn attestation_for(
+        challenge: &BrokerChallenge,
+        child: &LauncherChildProcessV1,
+        posture: &OtaProcessPostureV1,
+    ) -> SignedLauncherAttestationV3 {
+        let principal = |uid, gid| UnixPrincipalIdentity {
+            real_uid: uid,
+            effective_uid: uid,
+            saved_uid: uid,
+            filesystem_uid: uid,
+            real_gid: gid,
+            effective_gid: gid,
+            saved_gid: gid,
+            filesystem_gid: gid,
+        };
+        let launcher_profile = systemd_launcher_profile_v1();
+        let job_profile = systemd_job_principal_profile_v1();
+        let launcher_profile_identity = systemd_launcher_profile_identity(&launcher_profile)
+            .expect("launcher profile identity");
+        let job_profile_identity =
+            systemd_job_principal_profile_identity(&job_profile).expect("job profile identity");
+        let mut mapping = LauncherPrincipalMappingV1 {
+            schema_version: 1,
+            identity: String::new(),
+            job_peer: principal(1001, 1001),
+            execution: principal(1002, 1002),
+            job_principal_profile_identity: job_profile_identity.clone(),
+            launcher_session_binding_identity: identity('9'),
+        };
+        mapping.identity = launcher_principal_mapping_identity(&mapping).expect("mapping identity");
+        assert_eq!(mapping.identity, posture.principal_mapping_identity);
+        let mut instance_v1 = SystemdProtectedLauncherInstanceEvidenceV1 {
+            schema_version: 1,
+            identity: String::new(),
+            adapter: ota_authority_protocol::SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1.into(),
+            principal_mapping: mapping,
+            process_posture: posture.clone(),
+            systemd_launcher_profile_identity: launcher_profile_identity,
+            systemd_job_principal_profile_identity: job_profile_identity,
+            launcher_session_binding_identity: identity('9'),
+            systemd_invocation_identity: identity('8'),
+            working_directory_identity: child.working_directory_identity.clone(),
+            child_process_identity: child.identity.clone(),
+        };
+        instance_v1.identity =
+            systemd_protected_launcher_instance_identity(&instance_v1).expect("instance identity");
+        let mut instance = SystemdProtectedLauncherInstanceEvidenceV2 {
+            schema_version: 2,
+            identity: String::new(),
+            instance_v1,
+            launcher_observations: launcher_profile
+                .evidence_sources
+                .iter()
+                .map(|source| SystemdLauncherObservation {
+                    source: *source,
+                    state: RuntimeBoundaryObservationState::Verified,
+                    reason_code: String::from("verified_by_test_launcher"),
+                })
+                .collect(),
+            job_principal_observations: job_profile
+                .requirements
+                .iter()
+                .map(|required| SystemdJobPrincipalObservation {
+                    requirement: required.requirement,
+                    evidence_methods: required.evidence_methods.clone(),
+                    state: RuntimeBoundaryObservationState::Verified,
+                    reason_code: String::from("verified_by_test_launcher"),
+                })
+                .collect(),
+        };
+        instance.identity = systemd_protected_launcher_instance_v2_identity(&instance)
+            .expect("complete instance identity");
+        SignedLauncherAttestationV3 {
+            payload: LauncherAttestationPayloadV3 {
+                message_kind: ATTESTATION_RESPONSE.into(),
+                attestation_protocol_version: SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3
+                    .into(),
+                binding_identity: challenge.binding_identity.clone(),
+                challenge_nonce_commitment: challenge.nonce_commitment.clone(),
+                invocation_id: child.invocation_id.clone(),
+                work_unit_identity: challenge.work_unit_identity.clone(),
+                semantic_scope_identity: challenge.semantic_scope_identity.clone(),
+                runner_principal: posture.principal_mapping_identity.clone(),
+                channel_delivery: String::from("launcher_session_fd"),
+                authenticated_origin: String::from("systemd-protected-launcher"),
+                authority_mounts: vec![String::from("authority-system-store")],
+                systemd_protected_launcher: instance,
+                issuer: String::from("test-attestor"),
+                audience: String::from("ota-crossing-broker"),
+                issued_at: String::from("2026-08-10T00:00:00Z"),
+                expires_at: String::from("2026-08-10T00:02:00Z"),
+            },
+            key_id: String::from("test-attestor-key"),
+            algorithm: String::from("ed25519"),
+            signature: String::from("test-signature"),
+        }
+    }
+
+    #[test]
+    fn v3_bridge_stops_after_exact_authorization_admission() {
+        let job_profile_identity =
+            systemd_job_principal_profile_identity(&systemd_job_principal_profile_v1())
+                .expect("job profile identity");
+        let mut mapping = LauncherPrincipalMappingV1 {
+            schema_version: 1,
+            identity: String::new(),
+            job_peer: UnixPrincipalIdentity {
+                real_uid: 1001,
+                effective_uid: 1001,
+                saved_uid: 1001,
+                filesystem_uid: 1001,
+                real_gid: 1001,
+                effective_gid: 1001,
+                saved_gid: 1001,
+                filesystem_gid: 1001,
+            },
+            execution: UnixPrincipalIdentity {
+                real_uid: 1002,
+                effective_uid: 1002,
+                saved_uid: 1002,
+                filesystem_uid: 1002,
+                real_gid: 1002,
+                effective_gid: 1002,
+                saved_gid: 1002,
+                filesystem_gid: 1002,
+            },
+            job_principal_profile_identity: job_profile_identity,
+            launcher_session_binding_identity: identity('9'),
+        };
+        mapping.identity = launcher_principal_mapping_identity(&mapping).expect("mapping identity");
+        let mut record = LauncherChildProcessV1 {
+            schema_version: 1,
+            identity: String::new(),
+            invocation_id: String::from("invocation-test"),
+            request_identity: identity('3'),
+            pid: 41,
+            process_start_time_identity: identity('4'),
+            ota_binary_identity: identity('5'),
+            principal_mapping_identity: mapping.identity.clone(),
+            working_directory_identity: identity('6'),
+        };
+        record.identity = launcher_child_process_identity(&record).expect("child identity");
+        let posture = process_posture(&record, mapping.identity.as_str());
+        let challenge = BrokerChallenge {
+            message_kind: ota_authority_protocol::CHALLENGE_REQUEST.into(),
+            protocol_version: ota_authority_protocol::PROTOCOL_VERSION_V1.into(),
+            binding_identity: identity('a'),
+            nonce_commitment: identity('b'),
+            work_unit_identity: identity('c'),
+            semantic_scope_identity: identity('d'),
+            contract_identity: identity('e'),
+        };
+        let attestation = attestation_for(&challenge, &record, &posture);
+        let attestation_identity =
+            launcher_attestation_identity_v3(&attestation).expect("attestation identity");
+        let authorization = AuthorizationRequest {
+            message_kind: AUTHORIZATION_REQUEST.into(),
+            binding_identity: challenge.binding_identity.clone(),
+            authority_id: String::from("platform-release-authority"),
+            attestation_identity,
+            challenge_nonce_commitment: challenge.nonce_commitment.clone(),
+            work_unit_identity: challenge.work_unit_identity.clone(),
+            contract_identity: challenge.contract_identity.clone(),
+            semantic_scope_identity: challenge.semantic_scope_identity.clone(),
+            runner_principal: mapping.identity,
+            actor_mode: String::from("non_agent"),
+            requested_lifetime_seconds: 60,
+        };
+        let child_record = record.clone();
+        let (launcher_session, mut core) = UnixStream::pair().expect("core session");
+        let (mut proxy, mut proxy_peer) = UnixStream::pair().expect("proxy session");
+        let expected_challenge = challenge.clone();
+        let proxy_challenge = challenge.clone();
+        let expected_attestation = attestation.clone();
+        let expected_authorization = authorization.clone();
+        let core_thread = std::thread::spawn(move || {
+            let _: LauncherStartupContinuationV1 =
+                read_json_frame(&mut core, Duration::from_secs(1)).expect("continuation");
+            write_json_frame(&mut core, &expected_challenge, Duration::from_secs(1))
+                .expect("challenge");
+            let observed: SignedLauncherAttestationV3 =
+                read_json_frame(&mut core, Duration::from_secs(1)).expect("attestation");
+            assert_eq!(observed, expected_attestation);
+            write_json_frame(&mut core, &expected_authorization, Duration::from_secs(1))
+                .expect("authorization");
+        });
+        let proxy_thread = std::thread::spawn(move || {
+            let observed: BrokerChallenge =
+                read_json_frame(&mut proxy_peer, Duration::from_secs(1)).expect("proxy challenge");
+            assert_eq!(observed, proxy_challenge);
+            write_json_frame(&mut proxy_peer, &attestation, Duration::from_secs(1))
+                .expect("proxy attestation");
+            proxy_peer
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("proxy timeout");
+            let mut byte = [0_u8; 1];
+            assert!(proxy_peer.read(&mut byte).is_err());
+        });
+        let mut child = PreparedChild {
+            pid: 0,
+            record,
+            launcher_session,
+        };
+        child
+            .continue_and_bridge_v3_attestation(&posture, &mut proxy, Duration::from_secs(1))
+            .expect("exact bridge admission");
+        core_thread.join().expect("core thread");
+        proxy_thread.join().expect("proxy thread");
+
+        let mut wrong_attestation = attestation_for(&challenge, &child_record, &posture);
+        wrong_attestation
+            .payload
+            .systemd_protected_launcher
+            .instance_v1
+            .child_process_identity = identity('f');
+        wrong_attestation
+            .payload
+            .systemd_protected_launcher
+            .instance_v1
+            .identity = systemd_protected_launcher_instance_identity(
+            &wrong_attestation
+                .payload
+                .systemd_protected_launcher
+                .instance_v1,
+        )
+        .expect("substituted child instance identity");
+        wrong_attestation
+            .payload
+            .systemd_protected_launcher
+            .identity = systemd_protected_launcher_instance_v2_identity(
+            &wrong_attestation.payload.systemd_protected_launcher,
+        )
+        .expect("substituted child complete identity");
+        let (launcher_session, mut core) = UnixStream::pair().expect("wrong core session");
+        let (mut proxy, mut proxy_peer) = UnixStream::pair().expect("wrong proxy session");
+        let wrong_challenge = challenge.clone();
+        let core_thread = std::thread::spawn(move || {
+            let _: LauncherStartupContinuationV1 =
+                read_json_frame(&mut core, Duration::from_secs(1)).expect("continuation");
+            write_json_frame(&mut core, &wrong_challenge, Duration::from_secs(1))
+                .expect("challenge");
+            core.set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("core timeout");
+            let mut byte = [0_u8; 1];
+            assert!(core.read(&mut byte).is_err());
+        });
+        let proxy_thread = std::thread::spawn(move || {
+            let _: BrokerChallenge =
+                read_json_frame(&mut proxy_peer, Duration::from_secs(1)).expect("proxy challenge");
+            write_json_frame(&mut proxy_peer, &wrong_attestation, Duration::from_secs(1))
+                .expect("wrong attestation");
+        });
+        let mut child = PreparedChild {
+            pid: 0,
+            record: child_record,
+            launcher_session,
+        };
+        assert_eq!(
+            child.continue_and_bridge_v3_attestation(&posture, &mut proxy, Duration::from_secs(1),),
+            Err(PreparedChildError::AttestationBridgeUnavailable)
+        );
+        core_thread.join().expect("wrong core thread");
+        proxy_thread.join().expect("wrong proxy thread");
     }
 
     #[test]

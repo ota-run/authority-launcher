@@ -144,7 +144,8 @@ fn run(cli: Cli) -> Result<PressureEvidence, String> {
 fn validate_pressure_terminal(terminal: &LauncherTerminalFrameV1) -> Result<(), String> {
     if terminal.outcome != LauncherTerminalOutcomeV1::Refused
         || terminal.exit_code != Some(2)
-        || terminal.stage != Some(LauncherTerminalStageV1::PostureAdmittedBoundaryRemoved)
+        || terminal.stage
+            != Some(LauncherTerminalStageV1::AttestationAdmittedBeforeAuthorizationBoundaryRemoved)
     {
         return Err(String::from(
             "the execution-disabled launcher did not confirm its bounded terminal refusal",
@@ -282,6 +283,21 @@ mod tests {
         };
 
         assert!(validate_pressure_terminal(&terminal).is_err());
+    }
+
+    #[test]
+    fn pressure_terminal_requires_v3_admission_before_authorization_cleanup() {
+        let terminal = LauncherTerminalFrameV1 {
+            message_kind: LAUNCHER_TERMINAL.into(),
+            protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
+            invocation_id: String::from("invocation-0123456789abcdef0123456789abcdef"),
+            outcome: LauncherTerminalOutcomeV1::Refused,
+            exit_code: Some(2),
+            stage: Some(
+                LauncherTerminalStageV1::AttestationAdmittedBeforeAuthorizationBoundaryRemoved,
+            ),
+        };
+        assert!(validate_pressure_terminal(&terminal).is_ok());
     }
 
     #[test]

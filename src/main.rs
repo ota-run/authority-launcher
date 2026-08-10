@@ -64,8 +64,8 @@ enum Command {
         ota_args: Vec<String>,
     },
 
-    /// Internal systemd socket-activation entrypoint. This remains execution-disabled until the
-    /// service can establish V3 attestation and a broker-backed one-use lease.
+    /// Internal systemd socket-activation entrypoint. This remains execution-disabled after V3
+    /// attestation admission; authorization and one-use lease consumption are not enabled.
     #[command(hide = true)]
     ServeSystemd,
 }

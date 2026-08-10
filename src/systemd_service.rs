@@ -25,8 +25,8 @@
 //! This foundation deliberately stops before broker traffic or selected execution. It proves the
 //! service can consume only the fixed listener, derive the connecting job principal through
 //! `SO_PEERCRED`, durably prepare an exact stopped Ota child, attach and verify its transient
-//! systemd scope, admit only that child's exact bounded process-posture preface, and confirm
-//! cleanup without forwarding a broker challenge.
+//! systemd scope, admit that child's exact bounded process-posture preface, and bridge one signed
+//! V3 attestation. Authorization remains disabled and exact cleanup is still mandatory.
 
 use std::env;
 use std::io::{Read, Write};
@@ -48,11 +48,9 @@ use ota_authority_protocol::{
 use thiserror::Error;
 
 use crate::active_slot::{ActiveSlot, ActiveSlotError};
-#[cfg(feature = "systemd-pressure-faults")]
-use crate::config::verify_protected_directory;
 use crate::config::{
     SYSTEMD_AUTHORITY_LAUNCHER_CONFIG_PATH, SessionPeer, SystemdLauncherServiceConfigV1,
-    load_systemd_launcher_service_config, systemd_principal_mapping,
+    load_systemd_launcher_service_config, systemd_principal_mapping, verify_protected_directory,
 };
 use crate::prepared_child::{
     PreparedChildBinding, PreparedChildError, prepare_stopped_child, recorded_child_is_live_exact,
@@ -92,6 +90,10 @@ pub(crate) enum SystemdServiceError {
     ChildCleanupFailed,
     #[error("the systemd launcher transient scope boundary is unavailable")]
     ScopeUnavailable,
+    #[error("the systemd launcher protected broker proxy is unavailable")]
+    BrokerProxyUnavailable,
+    #[error("the systemd launcher protocol bridge refused before authorization")]
+    PreAuthorizationProtocolRefused,
     #[error("the systemd launcher could not confirm terminal scope cleanup")]
     ScopeCleanupFailed,
     #[error("the systemd launcher admission foundation does not yet execute governed work")]
@@ -171,9 +173,24 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
                 invocation_id.as_str(),
                 LauncherTerminalOutcomeV1::Refused,
                 Some(2),
-                Some(LauncherTerminalStageV1::PostureAdmittedBoundaryRemoved),
+                Some(
+                    LauncherTerminalStageV1::AttestationAdmittedBeforeAuthorizationBoundaryRemoved,
+                ),
             )?;
             Err(SystemdServiceError::ExecutionNotEnabled)
+        }
+        Err(
+            error @ (SystemdServiceError::BrokerProxyUnavailable
+            | SystemdServiceError::PreAuthorizationProtocolRefused),
+        ) => {
+            write_terminal(
+                &mut stream,
+                invocation_id.as_str(),
+                LauncherTerminalOutcomeV1::Refused,
+                Some(2),
+                Some(LauncherTerminalStageV1::PreAuthorizationProtocolRefusedBoundaryRemoved),
+            )?;
+            Err(error)
         }
         Err(error) => {
             write_terminal(
@@ -213,15 +230,60 @@ fn prepare_disabled_child_boundary(
         active_slot_trusted_root,
         &scope_manager,
         |child, principal_mapping| {
-            child
+            let posture = child
                 .resume_and_receive_process_posture(
                     principal_mapping.identity.as_str(),
                     Duration::from_secs(config.maximum_startup_seconds),
                 )
-                .map(|_| ())
+                .map_err(map_prepared_child_error)?;
+            let mut proxy = connect_protected_broker_proxy(config)?;
+            child
+                .continue_and_bridge_v3_attestation(
+                    &posture,
+                    &mut proxy,
+                    Duration::from_secs(config.maximum_startup_seconds),
+                )
                 .map_err(map_prepared_child_error)
         },
     )
+}
+
+fn connect_protected_broker_proxy(
+    config: &SystemdLauncherServiceConfigV1,
+) -> Result<UnixStream, SystemdServiceError> {
+    let path = config.broker_proxy_socket.as_path();
+    let parent = path
+        .parent()
+        .ok_or(SystemdServiceError::BrokerProxyUnavailable)?;
+    verify_protected_directory(parent, 0, Path::new("/"))
+        .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
+    let parent_metadata = std::fs::symlink_metadata(parent)
+        .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
+    let socket_metadata =
+        std::fs::symlink_metadata(path).map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
+    if !parent_metadata.is_dir()
+        || parent_metadata.uid() != 0
+        || parent_metadata.mode() & 0o022 != 0
+        || !socket_metadata.file_type().is_socket()
+        || socket_metadata.uid() != 0
+        || socket_metadata.mode() & 0o007 != 0
+    {
+        return Err(SystemdServiceError::BrokerProxyUnavailable);
+    }
+    let proxy =
+        UnixStream::connect(path).map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
+    if peer_credentials(&proxy).map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?
+        != config.broker_proxy_peer
+    {
+        return Err(SystemdServiceError::BrokerProxyUnavailable);
+    }
+    proxy
+        .set_read_timeout(Some(Duration::from_secs(config.maximum_startup_seconds)))
+        .and_then(|()| {
+            proxy.set_write_timeout(Some(Duration::from_secs(config.maximum_startup_seconds)))
+        })
+        .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
+    Ok(proxy)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -428,6 +490,10 @@ fn map_active_slot_error(_error: ActiveSlotError) -> SystemdServiceError {
 fn map_prepared_child_error(error: PreparedChildError) -> SystemdServiceError {
     match error {
         PreparedChildError::CleanupFailed => SystemdServiceError::ChildCleanupFailed,
+        PreparedChildError::AttestationBridgeUnavailable
+        | PreparedChildError::AuthorizationAdmissionMismatch => {
+            SystemdServiceError::PreAuthorizationProtocolRefused
+        }
         _ => SystemdServiceError::ChildPreparationFailed,
     }
 }
@@ -1010,6 +1076,18 @@ mod tests {
     }
 
     #[test]
+    fn bridge_errors_remain_pre_authorization_protocol_refusals_after_cleanup() {
+        assert!(matches!(
+            map_prepared_child_error(PreparedChildError::AttestationBridgeUnavailable),
+            SystemdServiceError::PreAuthorizationProtocolRefused
+        ));
+        assert!(matches!(
+            map_prepared_child_error(PreparedChildError::AuthorizationAdmissionMismatch),
+            SystemdServiceError::PreAuthorizationProtocolRefused
+        ));
+    }
+
+    #[test]
     fn listener_path_must_reference_the_inherited_socket_inode() {
         if unsafe { libc::geteuid() } != 0 {
             return;
@@ -1174,17 +1252,17 @@ mod tests {
                 &repository,
                 &config.mappings[0],
                 &request,
-                "invocation-posture-refusal",
+                "invocation-authority-refusal",
                 &active,
                 0,
                 temporary.path(),
                 &refused_scope,
                 |child, _principal_mapping| {
                     refused_pid.set(child.record.pid);
-                    Err(SystemdServiceError::ChildPreparationFailed)
+                    Err(SystemdServiceError::PreAuthorizationProtocolRefused)
                 },
             ),
-            Err(SystemdServiceError::ChildPreparationFailed)
+            Err(SystemdServiceError::PreAuthorizationProtocolRefused)
         ));
         assert_eq!(refused_scope.attached.borrow().len(), 1);
         assert_eq!(refused_scope.stopped.borrow().len(), 1);
