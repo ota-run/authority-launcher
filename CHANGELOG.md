@@ -35,6 +35,9 @@
 - Treat a collected transient scope as terminal only when the exact recorded unit is absent and
   its recorded cgroup is empty or absent, closing the `KillUnit`/`StopUnit` collection race without
   weakening cleanup confirmation.
+- Add a compile-time pressure-only, root-owned one-shot crash marker after durable scope recording
+  so immutable hosted recovery can prove that the next activation removes the exact stopped child
+  and transient scope before accepting another request. Production builds omit this fault path.
 
 ### Added
 

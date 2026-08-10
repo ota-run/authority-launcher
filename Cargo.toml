@@ -58,6 +58,7 @@ pressure-peer = [
   "dep:time",
 ]
 systemd-pressure-client = []
+systemd-pressure-faults = []
 
 [[bin]]
 name = "ota-authority-pressure-peer"

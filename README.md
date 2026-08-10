@@ -249,6 +249,14 @@ peer to be root-owned. It cannot select another socket, install configuration, m
 provide authority, or enable execution. The binary is not installed as part of the production
 launcher.
 
+Immutable crash/recovery pressure may additionally build the launcher with the
+`systemd-pressure-faults` feature. In that build only, a root-owned mode-`0600` one-shot marker at
+`/run/ota/authority-launcher-pressure-exit-after-scope` terminates the service immediately after
+the exact child and scope have been durably journaled. The marker is removed and its parent is
+synced before termination. The repository job cannot create the marker; an administrator prepares
+it before dispatch. The next socket activation must reconcile and remove that exact boundary
+before it can accept another request. Production builds omit the feature and marker behavior.
+
 ## What belongs here
 
 - the Unix launcher-session implementation;

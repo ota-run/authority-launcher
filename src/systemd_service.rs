@@ -30,6 +30,8 @@
 use std::env;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+#[cfg(feature = "systemd-pressure-faults")]
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -45,6 +47,8 @@ use ota_authority_protocol::{
 use thiserror::Error;
 
 use crate::active_slot::{ActiveSlot, ActiveSlotError};
+#[cfg(feature = "systemd-pressure-faults")]
+use crate::config::verify_protected_directory;
 use crate::config::{
     SYSTEMD_AUTHORITY_LAUNCHER_CONFIG_PATH, SessionPeer, SystemdLauncherServiceConfigV1,
     load_systemd_launcher_service_config, systemd_principal_mapping,
@@ -59,6 +63,11 @@ use crate::target_directory::{TargetDirectoryError, open_repository_directory};
 const SYSTEMD_LISTEN_FD: RawFd = 3;
 const ACTIVE_SLOT_DIRECTORY: &str = "/var/lib/ota/authority-launcher/active";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(feature = "systemd-pressure-faults")]
+const PRESSURE_EXIT_AFTER_SCOPE_MARKER: &str =
+    "/run/ota/authority-launcher-pressure-exit-after-scope";
+#[cfg(feature = "systemd-pressure-faults")]
+const PRESSURE_EXIT_AFTER_SCOPE_CODE: i32 = 86;
 
 #[derive(Debug, Error)]
 pub(crate) enum SystemdServiceError {
@@ -299,6 +308,22 @@ fn prepare_disabled_child_boundary_with_scope(
             .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
         return Err(SystemdServiceError::ActiveSlotUnavailable);
     }
+    if let Err(error) = pressure_exit_after_scope_recorded() {
+        scope_manager
+            .stop_and_confirm_empty(
+                &scope,
+                &child.record,
+                Duration::from_secs(config.maximum_terminal_wait_seconds),
+            )
+            .map_err(|_| SystemdServiceError::ScopeCleanupFailed)?;
+        child
+            .terminate_and_reap()
+            .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
+        active_slot
+            .finalize()
+            .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
+        return Err(error);
+    }
     let child_record = child.record.clone();
     scope_manager
         .stop_and_confirm_empty(
@@ -314,6 +339,57 @@ fn prepare_disabled_child_boundary_with_scope(
         .finalize()
         .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
     Ok(child_record)
+}
+
+#[cfg(feature = "systemd-pressure-faults")]
+fn pressure_exit_after_scope_recorded() -> Result<(), SystemdServiceError> {
+    if !consume_pressure_exit_marker(
+        Path::new(PRESSURE_EXIT_AFTER_SCOPE_MARKER),
+        Path::new("/"),
+        0,
+    )? {
+        return Ok(());
+    }
+
+    // The pressure-only build exits without unwinding after the root-owned one-shot marker is
+    // durably consumed. The active-slot journal, stopped child, and exact scope must then be
+    // reconciled by the next socket activation before another request is accepted.
+    unsafe { libc::_exit(PRESSURE_EXIT_AFTER_SCOPE_CODE) }
+}
+
+#[cfg(not(feature = "systemd-pressure-faults"))]
+fn pressure_exit_after_scope_recorded() -> Result<(), SystemdServiceError> {
+    Ok(())
+}
+
+#[cfg(feature = "systemd-pressure-faults")]
+fn consume_pressure_exit_marker(
+    path: &Path,
+    trusted_root: &Path,
+    expected_owner_uid: u32,
+) -> Result<bool, SystemdServiceError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(SystemdServiceError::ActiveSlotUnavailable),
+    };
+    let parent = path
+        .parent()
+        .ok_or(SystemdServiceError::ActiveSlotUnavailable)?;
+    verify_protected_directory(parent, expected_owner_uid, trusted_root)
+        .map_err(|_| SystemdServiceError::ActiveSlotUnavailable)?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != expected_owner_uid
+        || metadata.permissions().mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(SystemdServiceError::ActiveSlotUnavailable);
+    }
+    std::fs::remove_file(path).map_err(|_| SystemdServiceError::ActiveSlotUnavailable)?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| SystemdServiceError::ActiveSlotUnavailable)?;
+    Ok(true)
 }
 
 fn map_systemd_scope_error(error: SystemdScopeError) -> SystemdServiceError {
@@ -697,6 +773,77 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[cfg(feature = "systemd-pressure-faults")]
+    #[test]
+    fn pressure_crash_marker_enforces_protected_one_shot_identity() {
+        let temporary = tempdir().expect("temporary pressure root");
+        let owner_uid = unsafe { libc::geteuid() };
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))
+            .expect("protected pressure root");
+        let pressure = temporary.path().join("pressure");
+        fs::create_dir(&pressure).expect("pressure directory");
+        fs::set_permissions(&pressure, fs::Permissions::from_mode(0o700))
+            .expect("protected pressure directory");
+        let marker = pressure.join("exit-after-scope");
+
+        fs::write(&marker, b"1").expect("pressure marker");
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644))
+            .expect("unprotected marker permissions");
+        assert!(matches!(
+            consume_pressure_exit_marker(&marker, temporary.path(), owner_uid),
+            Err(SystemdServiceError::ActiveSlotUnavailable)
+        ));
+
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))
+            .expect("protected marker permissions");
+        let hardlink = pressure.join("hardlink");
+        fs::hard_link(&marker, &hardlink).expect("hardlink marker");
+        assert!(matches!(
+            consume_pressure_exit_marker(&marker, temporary.path(), owner_uid),
+            Err(SystemdServiceError::ActiveSlotUnavailable)
+        ));
+        fs::remove_file(&hardlink).expect("remove hardlink");
+
+        assert!(matches!(
+            consume_pressure_exit_marker(&marker, temporary.path(), owner_uid.wrapping_add(1)),
+            Err(SystemdServiceError::ActiveSlotUnavailable)
+        ));
+
+        fs::remove_file(&marker).expect("remove regular marker");
+        let symlink_target = pressure.join("target");
+        fs::write(&symlink_target, b"1").expect("symlink target");
+        fs::set_permissions(&symlink_target, fs::Permissions::from_mode(0o600))
+            .expect("symlink target permissions");
+        std::os::unix::fs::symlink(&symlink_target, &marker).expect("symlink marker");
+        assert!(matches!(
+            consume_pressure_exit_marker(&marker, temporary.path(), owner_uid),
+            Err(SystemdServiceError::ActiveSlotUnavailable)
+        ));
+        fs::remove_file(&marker).expect("remove symlink marker");
+
+        fs::write(&marker, b"1").expect("replacement pressure marker");
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))
+            .expect("replacement marker permissions");
+        fs::set_permissions(&pressure, fs::Permissions::from_mode(0o720))
+            .expect("writable pressure directory");
+        assert!(matches!(
+            consume_pressure_exit_marker(&marker, temporary.path(), owner_uid),
+            Err(SystemdServiceError::ActiveSlotUnavailable)
+        ));
+        fs::set_permissions(&pressure, fs::Permissions::from_mode(0o700))
+            .expect("restore pressure directory");
+
+        assert!(
+            consume_pressure_exit_marker(&marker, temporary.path(), owner_uid)
+                .expect("consume protected marker")
+        );
+        assert!(!marker.exists());
+        assert!(
+            !consume_pressure_exit_marker(&marker, temporary.path(), owner_uid)
+                .expect("marker is one shot")
+        );
+    }
 
     #[derive(Default)]
     struct RecordingScopeBoundary {
