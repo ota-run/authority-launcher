@@ -40,8 +40,8 @@ use std::time::Duration;
 
 use ota_authority_protocol::{
     LAUNCHER_TERMINAL, LauncherInvocationRequestV1, LauncherTerminalFrameV1,
-    LauncherTerminalOutcomeV1, LauncherWorkingDirectoryV1, MAX_FRAME_BYTES,
-    SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, decode_frame, encode_frame,
+    LauncherTerminalOutcomeV1, LauncherTerminalStageV1, LauncherWorkingDirectoryV1,
+    MAX_FRAME_BYTES, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, decode_frame, encode_frame,
     launcher_invocation_request_identity, launcher_working_directory_identity,
     validate_launcher_invocation_request_v1, validate_launcher_terminal_frame_v1,
 };
@@ -144,6 +144,7 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
                 invocation_id.as_str(),
                 LauncherTerminalOutcomeV1::Refused,
                 Some(2),
+                Some(LauncherTerminalStageV1::RequestRefusedBeforeBoundary),
             )?;
             return Err(map_target_directory_error(error));
         }
@@ -170,6 +171,7 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
                 invocation_id.as_str(),
                 LauncherTerminalOutcomeV1::Refused,
                 Some(2),
+                Some(LauncherTerminalStageV1::PostureAdmittedBoundaryRemoved),
             )?;
             Err(SystemdServiceError::ExecutionNotEnabled)
         }
@@ -179,6 +181,7 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
                 invocation_id.as_str(),
                 LauncherTerminalOutcomeV1::Failed,
                 Some(1),
+                Some(LauncherTerminalStageV1::BoundaryFailed),
             )?;
             Err(error)
         }
@@ -688,6 +691,7 @@ fn write_terminal(
     invocation_id: &str,
     outcome: LauncherTerminalOutcomeV1,
     exit_code: Option<i32>,
+    stage: Option<LauncherTerminalStageV1>,
 ) -> Result<(), SystemdServiceError> {
     let terminal = LauncherTerminalFrameV1 {
         message_kind: LAUNCHER_TERMINAL.into(),
@@ -695,6 +699,7 @@ fn write_terminal(
         invocation_id: invocation_id.into(),
         outcome,
         exit_code,
+        stage,
     };
     validate_launcher_terminal_frame_v1(&terminal)
         .map_err(|_| SystemdServiceError::InvalidRequest)?;

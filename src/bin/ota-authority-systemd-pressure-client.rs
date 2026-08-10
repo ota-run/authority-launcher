@@ -40,8 +40,9 @@ use clap::Parser;
 #[cfg(target_os = "linux")]
 use ota_authority_protocol::{
     LAUNCHER_INVOCATION_REQUEST, LauncherInvocationRequestV1, LauncherTerminalFrameV1,
-    LauncherTerminalOutcomeV1, MAX_FRAME_BYTES, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, decode_frame,
-    encode_frame, launcher_invocation_request_identity, validate_launcher_invocation_request_v1,
+    LauncherTerminalOutcomeV1, LauncherTerminalStageV1, MAX_FRAME_BYTES,
+    SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, decode_frame, encode_frame,
+    launcher_invocation_request_identity, validate_launcher_invocation_request_v1,
     validate_launcher_terminal_frame_v1,
 };
 #[cfg(target_os = "linux")]
@@ -130,17 +131,26 @@ fn run(cli: Cli) -> Result<PressureEvidence, String> {
         .write_all(frame.as_slice())
         .map_err(|_| String::from("the pressure request could not be sent"))?;
     let terminal = read_terminal(&mut stream)?;
-    if terminal.outcome != LauncherTerminalOutcomeV1::Refused || terminal.exit_code != Some(2) {
-        return Err(String::from(
-            "the execution-disabled launcher did not confirm its bounded terminal refusal",
-        ));
-    }
+    validate_pressure_terminal(&terminal)?;
     Ok(PressureEvidence {
         ok: true,
         kind: "systemd_transient_scope_pressure",
         request_identity,
         terminal,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_pressure_terminal(terminal: &LauncherTerminalFrameV1) -> Result<(), String> {
+    if terminal.outcome != LauncherTerminalOutcomeV1::Refused
+        || terminal.exit_code != Some(2)
+        || terminal.stage != Some(LauncherTerminalStageV1::PostureAdmittedBoundaryRemoved)
+    {
+        return Err(String::from(
+            "the execution-disabled launcher did not confirm its bounded terminal refusal",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -229,7 +239,9 @@ fn read_terminal(stream: &mut UnixStream) -> Result<LauncherTerminalFrameV1, Str
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use ota_authority_protocol::{LAUNCHER_TERMINAL, LauncherTerminalOutcomeV1};
+    use ota_authority_protocol::{
+        LAUNCHER_TERMINAL, LauncherTerminalOutcomeV1, LauncherTerminalStageV1,
+    };
 
     #[test]
     fn terminal_reader_accepts_only_a_protocol_valid_frame() {
@@ -240,6 +252,7 @@ mod tests {
             invocation_id: String::from("invocation-0123456789abcdef0123456789abcdef"),
             outcome: LauncherTerminalOutcomeV1::Refused,
             exit_code: Some(2),
+            stage: Some(LauncherTerminalStageV1::PostureAdmittedBoundaryRemoved),
         };
         let payload = serde_json::to_vec(&terminal).expect("terminal payload");
         let frame = encode_frame(payload.as_slice()).expect("terminal frame");
@@ -255,6 +268,20 @@ mod tests {
             .to_be_bytes();
         std::thread::spawn(move || server.write_all(&oversized).expect("write header"));
         assert!(read_terminal(&mut client).is_err());
+    }
+
+    #[test]
+    fn pressure_terminal_rejects_a_pre_boundary_refusal() {
+        let terminal = LauncherTerminalFrameV1 {
+            message_kind: LAUNCHER_TERMINAL.into(),
+            protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
+            invocation_id: String::from("invocation-0123456789abcdef0123456789abcdef"),
+            outcome: LauncherTerminalOutcomeV1::Refused,
+            exit_code: Some(2),
+            stage: Some(LauncherTerminalStageV1::RequestRefusedBeforeBoundary),
+        };
+
+        assert!(validate_pressure_terminal(&terminal).is_err());
     }
 
     #[test]

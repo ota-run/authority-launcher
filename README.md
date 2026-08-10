@@ -249,7 +249,9 @@ prepared hardened Linux runner.
 The feature-gated `ota-authority-systemd-pressure-client` is the unprivileged side of that positive
 kernel proof. It connects only to `/run/ota/authority-launcher.sock`, submits one bounded
 `LauncherInvocationRequestV1`, and accepts only the execution-disabled terminal refusal emitted
-after the service has confirmed scope and child cleanup. Before sending the request it requires the
+with the typed `posture_admitted_boundary_removed` stage after the service has admitted Core's
+private posture and confirmed exact scope and child cleanup. A repository-open refusal or generic
+boundary failure cannot satisfy this pressure client. Before sending the request it requires the
 fixed socket and parent to have the protected root-owned posture and requires the connected Unix
 peer to be root-owned. It cannot select another socket, install configuration, mutate systemd,
 provide authority, or enable execution. The binary is not installed as part of the production
