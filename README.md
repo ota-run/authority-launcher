@@ -45,11 +45,18 @@ The first implementation is a Unix session-isolating exec wrapper. It:
   close-on-exec; and
 - proxies the framed Core protocol without interpreting or rewriting signed messages.
 
-This slice does **not** create launcher attestations, connect to a remote broker, hold signing keys,
-or make authorization decisions. The administrator-controlled process that supplies the connected
-session remains responsible for authenticated transport and protocol responses. Until that
-component is deployed with independently protected credentials and attestation, this launcher is
-one authority-system building block rather than a complete authority system.
+The repository now also contains the feature-gated `ota-authority-attestor` foundation. That
+separate Linux service owns one systemd-delivered Ed25519 credential, accepts one protected
+`SOCK_SEQPACKET` signing request, verifies the live launcher peer, derives producer-owned
+freshness, durably records the exact canonical response bytes, and returns the identical response
+for an identical unexpired replay. The launcher-side verifier loads only the protected public
+producer binding and independently checks the response projection, identity, signature, audience,
+key validity, and freshness.
+
+The production launcher does **not yet** collect the complete closed job-principal observation set
+or invoke that producer. It therefore still does not emit a real V3 attestation, connect to a
+remote broker, or make authorization decisions. The producer foundation is not a usable authority
+path until the protected configuration and observation collector are wired and pressure-proven.
 
 The feature-gated `ota-authority-pressure-peer` binary is an exception for conformance testing
 only. It uses fixed public test keys and deterministic scenarios to exercise protocol v2 through a
@@ -95,6 +102,7 @@ sequenceDiagram
     participant Operator as Protected workflow or operator
     participant Repo as Repository contract
     participant Launcher as authority-launcher
+    participant Attestor as Protected attestor
     participant Ota as Ota Core
     participant Broker as Protected authority session
     participant Task as Selected task
@@ -105,9 +113,12 @@ sequenceDiagram
     Repo->>Ota: Select authority_id and governed lane
     Ota->>Ota: Freeze contract, scope, work unit, and nonce
     Ota->>Launcher: Send challenge over protected session
-    Launcher->>Broker: Proxy framed challenge
-    Broker-->>Launcher: Return signed challenge-bound attestation
-    Launcher-->>Ota: Proxy signed attestation
+    Launcher->>Launcher: Collect complete closed-profile evidence
+    Launcher->>Attestor: Send identity-bound signing request
+    Attestor->>Attestor: Verify peer, sign once, and persist exact response
+    Attestor-->>Launcher: Return signed challenge-bound attestation
+    Launcher->>Launcher: Verify response and claims projection
+    Launcher-->>Ota: Relay only the signed attestation
     Ota->>Launcher: Request exact-scope authorization
     Launcher->>Broker: Proxy signed request
     Broker-->>Launcher: Return signed decision and prepared lease

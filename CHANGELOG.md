@@ -26,6 +26,18 @@
 
 ## Unreleased
 
+- Add the execution-disabled protected V3 attestation producer foundation. The separate
+  `ota-authority-attestor` Linux service consumes only its fixed root-owned `SOCK_SEQPACKET`
+  listener, verifies the live root launcher peer and protected binding, owns the signing credential
+  and clock, derives bounded freshness, persists and fsyncs exact canonical response bytes, and
+  returns only an identical unexpired response for an identical request identity. Ancillary
+  descriptors, truncation, queued second packets, stale state, binding mismatch, and peer races
+  fail closed.
+- Add the launcher-side protected producer binding loader and response verifier. It independently
+  checks canonical request/response and claims projection, the protected public key, signature,
+  audience, key interval, and the narrowest producer/verifier/request freshness bound. This is a
+  foundation only: production launcher collection of the complete closed observation profile and
+  producer invocation remain unwired, so no real V3 bridge or authority claim is enabled yet.
 - Advance the systemd protected-launcher boundary through one signed V3 attestation bridge. Core's
   exact posture admission now receives an identity-bound launcher continuation, freezes the real
   semantic scope, and sends its broker challenge over the same private descriptor. The launcher
