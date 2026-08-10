@@ -221,13 +221,15 @@ requirements, not evidence of provider-attested isolation; the effective unit an
 posture must remain part of the later signed hardening profile.
 
 The child receives only standard streams, the systemd profile's fixed private Ota session
-descriptor, the fixed
-binary descriptor, and the retained repository descriptor. Production code re-observes that exact
-root/stopped posture and descriptor set before recording the child. It then asks the root systemd
-manager for one request-derived transient scope in the fixed invocation slice, confirms the exact
-unit properties and sole PID through the kernel cgroup, and durably records that scope. The current
-service kills the complete scope, confirms it empty, kills/reaps the child, and removes the slot
-without ever resuming or executing Ota.
+descriptor, the fixed binary descriptor, and the retained repository descriptor. Production code
+re-observes that exact root/stopped posture and descriptor set before recording the child. It then
+asks the root systemd manager for one request-derived transient scope in the fixed invocation slice,
+confirms the exact unit properties and sole PID through the kernel cgroup, and durably records that
+scope. Only after that persistence does the launcher resume the exact PID through `pidfd`, admit one
+bounded `ota_process_posture/v1` frame, and reconcile its identity, PID/start time, Ota binary, and
+principal mapping to the prepared child. The launcher forwards no broker challenge. It then kills
+the complete scope, confirms it absent and its cgroup empty or absent, kills/reaps the child, and
+removes the slot.
 
 On startup, retained journals are reconciled before accepting a client. A valid child- or
 scope-bearing temporary journal is promoted rather than discarded. Intent-only state remains a
@@ -235,9 +237,13 @@ hard refusal because it cannot establish child absence. An exact pre-scope child
 through Linux `pidfd`; a scope-bearing journal additionally requires the exact unit and kernel
 cgroup to be stopped and observed empty. PID reuse, identity mismatch, unsupported cleanup, or any
 uncertain outcome retains the slot and fails closed.
-This foundation does **not** resume Ota, obtain V3 attestation, contact the broker, consume a lease,
-or execute repository work. OrbStack's systemd currently refuses the real pre-exec PID attachment
-with `ENOTTY`; the implementation remains fail-closed there, and positive kernel proof requires the
+This foundation resumes Ota only through its private posture preface. It does **not** create or sign
+V3 attestation, contact the broker, consume a lease, or execute repository work. Missing, malformed,
+oversized, self-inconsistent, or child-mismatched posture fails closed and enters the same exact
+cleanup path. Core emits this preface before CLI dispatch and waits for a launcher continuation;
+this slice deliberately sends none. OrbStack's systemd currently refuses the real pre-exec PID
+attachment with `ENOTTY`; the
+implementation remains fail-closed there, and positive posture-plus-scope proof requires the
 prepared hardened Linux runner.
 
 The feature-gated `ota-authority-systemd-pressure-client` is the unprivileged side of that positive

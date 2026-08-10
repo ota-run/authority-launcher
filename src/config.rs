@@ -343,7 +343,13 @@ fn validate_systemd_launcher_service_config(
         || config.broker_proxy_peer.gid != 0
         || config.environment.len() > 64
         || config.environment.iter().any(|(name, value)| {
-            !is_environment_name(name.as_str()) || value.len() > 4096 || value.contains('\0')
+            !is_environment_name(name.as_str())
+                || matches!(
+                    name.as_str(),
+                    "OTA_LAUNCHER_PRINCIPAL_MAPPING_IDENTITY" | "OTA_SYSTEMD_LAUNCHER_STARTUP_GATE"
+                )
+                || value.len() > 4096
+                || value.contains('\0')
         })
     {
         return Err(ConfigError::Unsupported);
@@ -757,6 +763,30 @@ mod tests {
             systemd_launcher_service_config_identity(&root_escape).expect("identity");
         assert!(matches!(
             validate_systemd_launcher_service_config(&root_escape),
+            Err(ConfigError::Unsupported)
+        ));
+
+        let mut reserved_environment = config.clone();
+        reserved_environment.environment.insert(
+            String::from("OTA_LAUNCHER_PRINCIPAL_MAPPING_IDENTITY"),
+            identity('f'),
+        );
+        reserved_environment.identity =
+            systemd_launcher_service_config_identity(&reserved_environment).expect("identity");
+        assert!(matches!(
+            validate_systemd_launcher_service_config(&reserved_environment),
+            Err(ConfigError::Unsupported)
+        ));
+
+        let mut reserved_gate = config.clone();
+        reserved_gate.environment.insert(
+            String::from("OTA_SYSTEMD_LAUNCHER_STARTUP_GATE"),
+            String::from("disabled"),
+        );
+        reserved_gate.identity =
+            systemd_launcher_service_config_identity(&reserved_gate).expect("identity");
+        assert!(matches!(
+            validate_systemd_launcher_service_config(&reserved_gate),
             Err(ConfigError::Unsupported)
         ));
 

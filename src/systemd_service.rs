@@ -22,10 +22,11 @@
 
 //! Linux socket-activation admission for the planned protected launcher service.
 //!
-//! This foundation deliberately stops before broker traffic or child execution. It proves the
+//! This foundation deliberately stops before broker traffic or selected execution. It proves the
 //! service can consume only the fixed listener, derive the connecting job principal through
 //! `SO_PEERCRED`, durably prepare an exact stopped Ota child, attach and verify its transient
-//! systemd scope, and confirm cleanup without ever resuming that child.
+//! systemd scope, admit only that child's exact bounded process-posture preface, and confirm
+//! cleanup without forwarding a broker challenge.
 
 use std::env;
 use std::io::{Read, Write};
@@ -208,11 +209,20 @@ fn prepare_disabled_child_boundary(
         active_slot_owner_uid,
         active_slot_trusted_root,
         &scope_manager,
+        |child, principal_mapping| {
+            child
+                .resume_and_receive_process_posture(
+                    principal_mapping.identity.as_str(),
+                    Duration::from_secs(config.maximum_startup_seconds),
+                )
+                .map(|_| ())
+                .map_err(map_prepared_child_error)
+        },
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_disabled_child_boundary_with_scope(
+fn prepare_disabled_child_boundary_with_scope<F>(
     config: &SystemdLauncherServiceConfigV1,
     ota_binary: &std::fs::File,
     repository: &crate::target_directory::OpenedRepositoryDirectory,
@@ -223,7 +233,14 @@ fn prepare_disabled_child_boundary_with_scope(
     active_slot_owner_uid: u32,
     active_slot_trusted_root: &Path,
     scope_manager: &impl ScopeBoundary,
-) -> Result<ota_authority_protocol::LauncherChildProcessV1, SystemdServiceError> {
+    posture_gate: F,
+) -> Result<ota_authority_protocol::LauncherChildProcessV1, SystemdServiceError>
+where
+    F: FnOnce(
+        &mut crate::prepared_child::PreparedChild,
+        &ota_authority_protocol::LauncherPrincipalMappingV1,
+    ) -> Result<(), SystemdServiceError>,
+{
     let request_identity = launcher_invocation_request_identity(request)
         .map_err(|_| SystemdServiceError::InvalidRequest)?;
     let principal_mapping = systemd_principal_mapping(config, mapping)
@@ -324,6 +341,7 @@ fn prepare_disabled_child_boundary_with_scope(
             .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
         return Err(error);
     }
+    let posture_result = posture_gate(&mut child, &principal_mapping);
     let child_record = child.record.clone();
     scope_manager
         .stop_and_confirm_empty(
@@ -338,6 +356,7 @@ fn prepare_disabled_child_boundary_with_scope(
     active_slot
         .finalize()
         .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
+    posture_result?;
     Ok(child_record)
 }
 
@@ -763,7 +782,7 @@ fn verify_listener_socket(descriptor: RawFd) -> Result<(), SystemdServiceError> 
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
@@ -1103,6 +1122,7 @@ mod tests {
         };
         let executable = std::fs::File::open("/bin/true").expect("test executable");
         let scope_boundary = RecordingScopeBoundary::default();
+        let posture_gate_ran_after_scope = Cell::new(false);
         let child = prepare_disabled_child_boundary_with_scope(
             &config,
             &executable,
@@ -1114,11 +1134,56 @@ mod tests {
             0,
             temporary.path(),
             &scope_boundary,
+            |_child, _principal_mapping| {
+                let journal_path = fs::read_dir(&active)
+                    .expect("active directory")
+                    .next()
+                    .expect("durable active slot")
+                    .expect("active-slot entry")
+                    .path();
+                let journal: serde_json::Value = serde_json::from_slice(
+                    &fs::read(journal_path).expect("read durable active slot"),
+                )
+                .expect("active-slot JSON");
+                posture_gate_ran_after_scope.set(
+                    scope_boundary.attached.borrow().len() == 1
+                        && journal.get("stage").and_then(serde_json::Value::as_str)
+                            == Some("scope_attached"),
+                );
+                Ok(())
+            },
         )
         .expect("prepare and clean child boundary");
+        assert!(posture_gate_ran_after_scope.get());
         assert_eq!(scope_boundary.attached.borrow().len(), 1);
         assert_eq!(scope_boundary.stopped.borrow().len(), 1);
         assert!(!PathBuf::from(format!("/proc/{}", child.pid)).exists());
+        assert_eq!(fs::read_dir(&active).expect("active directory").count(), 0);
+
+        let refused_scope = RecordingScopeBoundary::default();
+        let refused_pid = Cell::new(0_u32);
+        assert!(matches!(
+            prepare_disabled_child_boundary_with_scope(
+                &config,
+                &executable,
+                &repository,
+                &config.mappings[0],
+                &request,
+                "invocation-posture-refusal",
+                &active,
+                0,
+                temporary.path(),
+                &refused_scope,
+                |child, _principal_mapping| {
+                    refused_pid.set(child.record.pid);
+                    Err(SystemdServiceError::ChildPreparationFailed)
+                },
+            ),
+            Err(SystemdServiceError::ChildPreparationFailed)
+        ));
+        assert_eq!(refused_scope.attached.borrow().len(), 1);
+        assert_eq!(refused_scope.stopped.borrow().len(), 1);
+        assert!(!PathBuf::from(format!("/proc/{}", refused_pid.get())).exists());
         assert_eq!(fs::read_dir(&active).expect("active directory").count(), 0);
 
         assert!(matches!(
@@ -1133,6 +1198,7 @@ mod tests {
                 0,
                 temporary.path(),
                 &UncertainScopeBoundary,
+                |_child, _principal_mapping| Ok(()),
             ),
             Err(SystemdServiceError::ScopeCleanupFailed)
         ));

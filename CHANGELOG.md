@@ -26,6 +26,12 @@
 
 ## Unreleased
 
+- Advance the execution-disabled systemd service through one posture-only child transition. After
+  the exact transient scope and active slot are durable, the launcher resumes the child through
+  `pidfd`, accepts one bounded `ota_process_posture/v1` frame, and reconciles its semantic identity,
+  PID/start time, binary identity, and protected principal mapping before exact cleanup. Missing,
+  malformed, oversized, or substituted posture fails closed. Core emits the preface before CLI
+  dispatch and blocks for a continuation that this slice never sends; no broker frame is forwarded.
 - Add a feature-gated, unprivileged systemd pressure client that retains canonical request and
   terminal identities while accepting only the execution-disabled post-cleanup refusal from the
   fixed launcher socket.
@@ -68,21 +74,22 @@
   journal created and fsynced before fork, an exact fixed-binary child stopped before privilege
   drop or execution, production verification of its root/stopped posture and complete descriptor
   set, and startup cleanup through a PID-bound handle. Child-bearing temporary state is promoted;
-  intent-only, uncertain, or mismatched recovery retains the journal and refuses new work. No code
-  path resumes the child.
+  intent-only, uncertain, or mismatched recovery retains the journal and refuses new work. This
+  initial slice did not resume the child.
 - Add the execution-disabled transient-scope boundary. The launcher requests one exact scope from
   the root systemd manager, independently reconciles its fixed slice, controls, cgroup, and sole
   stopped PID, then atomically records that identity before cleanup. Scope-bearing recovery stops
-  and observes the scope empty before releasing the principal slot. The child is still never
-  resumed.
+  and observes the scope empty before releasing the principal slot. This scope-only slice still
+  did not resume the child.
 
 ### Boundaries
 
 - The current implementation does not create launcher attestations, connect to a remote broker,
   issue or consume leases, or establish provider-attested authority separation.
-- The systemd service foundation does not resume its prepared child, contact the broker, or execute
-  selected work. Pre-scope recovery requires Linux `pidfd`; scope-bearing recovery additionally
-  requires exact systemd and kernel-cgroup reconciliation. Unavailable or uncertain cleanup
-  retains the durable slot and refuses new work.
+- The systemd service foundation resumes its prepared child only after exact scope persistence and
+  only far enough to admit the private process-posture preface. It does not sign V3 attestation,
+  contact the broker, consume a lease, or execute selected work. Pre-scope recovery requires Linux
+  `pidfd`; scope-bearing recovery additionally requires exact systemd and kernel-cgroup
+  reconciliation. Unavailable or uncertain cleanup retains the durable slot and refuses new work.
 - Protocol-v2 attestations are emitted only by the feature-gated pressure peer as bounded
   conformance evidence; they do not establish provider-attested or host-wide isolation.

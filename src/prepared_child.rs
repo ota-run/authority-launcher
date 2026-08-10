@@ -22,21 +22,22 @@
 
 //! Stopped fixed-binary child preparation for the systemd launcher.
 //!
-//! The child remains root and stopped until the launcher has durably recorded its identity and a
-//! later slice binds it to the exact systemd invocation scope. No code path in this module resumes
-//! the child. Terminal cleanup kills and reaps it while it is still stopped.
+//! The child remains root and stopped until the launcher has durably recorded its identity and
+//! bound it to the exact systemd invocation scope. The only resume path admits one bounded Ota
+//! process-posture preface; it does not relay broker traffic or selected execution.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs::File;
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use ota_authority_protocol::{
-    LauncherChildProcessV1, launcher_child_process_identity, sha256_identity,
+    LauncherChildProcessV1, MAX_FRAME_BYTES, OtaProcessPostureV1, decode_frame,
+    launcher_child_process_identity, ota_process_posture_identity, sha256_identity,
 };
 use thiserror::Error;
 
@@ -59,12 +60,18 @@ pub(crate) enum PreparedChildError {
     IdentityUnavailable,
     #[error("the protected Ota child could not be terminated")]
     CleanupFailed,
+    #[error("the protected Ota child could not be resumed")]
+    ResumeFailed,
+    #[error("the protected Ota child process posture is unavailable")]
+    PostureUnavailable,
+    #[error("the protected Ota child process posture does not match the prepared child")]
+    PostureMismatch,
 }
 
 pub(crate) struct PreparedChild {
     pid: libc::pid_t,
     pub record: LauncherChildProcessV1,
-    _launcher_session: UnixStream,
+    launcher_session: UnixStream,
 }
 
 pub(crate) struct PreparedChildBinding<'a> {
@@ -82,6 +89,47 @@ struct DescriptorObject {
 }
 
 impl PreparedChild {
+    pub(crate) fn resume_and_receive_process_posture(
+        &mut self,
+        expected_principal_mapping_identity: &str,
+        timeout: Duration,
+    ) -> Result<OtaProcessPostureV1, PreparedChildError> {
+        if self.pid <= 0
+            || process_start_identity(self.pid)? != self.record.process_start_time_identity
+        {
+            return Err(PreparedChildError::IdentityUnavailable);
+        }
+        let pidfd = pidfd_open(self.pid).map_err(|_| PreparedChildError::ResumeFailed)?;
+        if process_start_identity(self.pid)? != self.record.process_start_time_identity
+            || unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    pidfd.as_raw_fd(),
+                    libc::SIGCONT,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            } < 0
+        {
+            return Err(PreparedChildError::ResumeFailed);
+        }
+
+        self.receive_process_posture_after_resume(expected_principal_mapping_identity, timeout)
+    }
+
+    fn receive_process_posture_after_resume(
+        &mut self,
+        expected_principal_mapping_identity: &str,
+        timeout: Duration,
+    ) -> Result<OtaProcessPostureV1, PreparedChildError> {
+        let posture = receive_process_posture(&mut self.launcher_session, timeout)?;
+        validate_process_posture(&posture, &self.record, expected_principal_mapping_identity)?;
+        if process_start_identity(self.pid)? != self.record.process_start_time_identity {
+            return Err(PreparedChildError::PostureMismatch);
+        }
+        Ok(posture)
+    }
+
     pub(crate) fn terminate_and_reap(&mut self) -> Result<(), PreparedChildError> {
         if self.pid <= 0 {
             return Ok(());
@@ -133,7 +181,7 @@ pub(crate) fn prepare_stopped_child(
     let mut argv_pointers: Vec<*const libc::c_char> =
         argv.iter().map(|value| value.as_ptr()).collect();
     argv_pointers.push(std::ptr::null());
-    let environment = child_environment(&config.environment)?;
+    let environment = child_environment(&config.environment, binding)?;
     let mut environment_pointers: Vec<*const libc::c_char> =
         environment.iter().map(|value| value.as_ptr()).collect();
     environment_pointers.push(std::ptr::null());
@@ -244,7 +292,7 @@ pub(crate) fn prepare_stopped_child(
     Ok(PreparedChild {
         pid: child_pid,
         record,
-        _launcher_session: launcher_session,
+        launcher_session,
     })
 }
 
@@ -257,13 +305,84 @@ fn child_arguments(arguments: &[String]) -> Result<Vec<CString>, PreparedChildEr
 
 fn child_environment(
     environment: &BTreeMap<String, String>,
+    binding: &PreparedChildBinding<'_>,
 ) -> Result<Vec<CString>, PreparedChildError> {
+    let mut environment = environment.clone();
+    environment.insert(
+        String::from("OTA_LAUNCHER_PRINCIPAL_MAPPING_IDENTITY"),
+        binding.principal_mapping_identity.into(),
+    );
+    environment.insert(
+        String::from("OTA_SYSTEMD_LAUNCHER_STARTUP_GATE"),
+        String::from("posture_only_v1"),
+    );
     environment
         .iter()
         .map(|(name, value)| {
             CString::new(format!("{name}={value}")).map_err(|_| PreparedChildError::InvalidInputs)
         })
         .collect()
+}
+
+fn receive_process_posture(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> Result<OtaProcessPostureV1, PreparedChildError> {
+    let deadline = Instant::now() + timeout;
+    let mut header = [0_u8; 4];
+    read_exact_until(stream, &mut header, deadline)?;
+    let length = u32::from_be_bytes(header) as usize;
+    if length == 0 || length > MAX_FRAME_BYTES {
+        return Err(PreparedChildError::PostureUnavailable);
+    }
+    let mut frame = Vec::with_capacity(4 + length);
+    frame.extend_from_slice(&header);
+    frame.resize(4 + length, 0);
+    read_exact_until(stream, &mut frame[4..], deadline)?;
+    let payload = decode_frame(&frame).map_err(|_| PreparedChildError::PostureUnavailable)?;
+    serde_json::from_slice(payload).map_err(|_| PreparedChildError::PostureUnavailable)
+}
+
+fn read_exact_until(
+    stream: &mut UnixStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> Result<(), PreparedChildError> {
+    let mut offset = 0;
+    while offset < buffer.len() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(PreparedChildError::PostureUnavailable)?;
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|_| PreparedChildError::PostureUnavailable)?;
+        match stream.read(&mut buffer[offset..]) {
+            Ok(0) => return Err(PreparedChildError::PostureUnavailable),
+            Ok(read) => offset += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(PreparedChildError::PostureUnavailable),
+        }
+    }
+    Ok(())
+}
+
+fn validate_process_posture(
+    posture: &OtaProcessPostureV1,
+    child: &LauncherChildProcessV1,
+    expected_principal_mapping_identity: &str,
+) -> Result<(), PreparedChildError> {
+    let derived_identity =
+        ota_process_posture_identity(posture).map_err(|_| PreparedChildError::PostureMismatch)?;
+    if posture.identity != derived_identity
+        || posture.pid != child.pid
+        || posture.process_start_time_identity != child.process_start_time_identity
+        || posture.ota_binary_identity != child.ota_binary_identity
+        || posture.principal_mapping_identity != expected_principal_mapping_identity
+    {
+        return Err(PreparedChildError::PostureMismatch);
+    }
+    Ok(())
 }
 
 fn open_null() -> Result<OwnedFd, PreparedChildError> {
@@ -360,6 +479,14 @@ fn set_cloexec(descriptor: RawFd) -> Result<(), PreparedChildError> {
         return Err(PreparedChildError::ForkFailed);
     }
     Ok(())
+}
+
+fn pidfd_open(pid: libc::pid_t) -> Result<OwnedFd, ()> {
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if descriptor < 0 {
+        return Err(());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(descriptor as RawFd) })
 }
 
 fn open_maximum() -> RawFd {
@@ -597,16 +724,93 @@ fn kill_and_reap(pid: libc::pid_t) -> Result<(), ()> {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::io::Write;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
 
-    use ota_authority_protocol::{LauncherWorkingDirectoryV1, launcher_working_directory_identity};
+    use ota_authority_protocol::{
+        LauncherWorkingDirectoryV1, OTA_PROCESS_POSTURE, encode_frame,
+        launcher_working_directory_identity,
+    };
     use tempfile::tempdir;
 
     use super::*;
 
     fn identity(character: char) -> String {
         format!("sha256:{}", character.to_string().repeat(64))
+    }
+
+    fn process_posture(child: &LauncherChildProcessV1, mapping: &str) -> OtaProcessPostureV1 {
+        let mut posture = OtaProcessPostureV1 {
+            schema_version: 1,
+            identity: String::new(),
+            message_kind: String::from(OTA_PROCESS_POSTURE),
+            pid: child.pid,
+            process_start_time_identity: child.process_start_time_identity.clone(),
+            ota_binary_identity: child.ota_binary_identity.clone(),
+            no_new_privs: true,
+            dumpable: 0,
+            ptracer_clear_applied: true,
+            principal_mapping_identity: mapping.into(),
+        };
+        posture.identity = ota_process_posture_identity(&posture).expect("posture identity");
+        posture
+    }
+
+    #[test]
+    fn process_posture_frame_is_bounded_and_exactly_child_bound() {
+        let mapping = identity('1');
+        let child = LauncherChildProcessV1 {
+            schema_version: 1,
+            identity: identity('2'),
+            invocation_id: String::from("invocation-test"),
+            request_identity: identity('3'),
+            pid: 41,
+            process_start_time_identity: identity('4'),
+            ota_binary_identity: identity('5'),
+            principal_mapping_identity: mapping.clone(),
+            working_directory_identity: identity('6'),
+        };
+        let posture = process_posture(&child, mapping.as_str());
+        let (mut writer, mut reader) = UnixStream::pair().expect("posture session");
+        let payload = serde_json::to_vec(&posture).expect("posture JSON");
+        writer
+            .write_all(&encode_frame(&payload).expect("posture frame"))
+            .expect("write posture");
+        let observed =
+            receive_process_posture(&mut reader, Duration::from_secs(1)).expect("receive posture");
+        validate_process_posture(&observed, &child, mapping.as_str())
+            .expect("exact posture accepted");
+
+        let mut wrong_mapping = observed.clone();
+        wrong_mapping.principal_mapping_identity = identity('7');
+        wrong_mapping.identity =
+            ota_process_posture_identity(&wrong_mapping).expect("changed posture identity");
+        assert_eq!(
+            validate_process_posture(&wrong_mapping, &child, mapping.as_str()),
+            Err(PreparedChildError::PostureMismatch)
+        );
+
+        let mut invalid_controls = observed;
+        invalid_controls.dumpable = 1;
+        assert_eq!(
+            validate_process_posture(&invalid_controls, &child, mapping.as_str()),
+            Err(PreparedChildError::PostureMismatch)
+        );
+    }
+
+    #[test]
+    fn process_posture_reader_rejects_empty_and_oversized_frames() {
+        for header in [0_u32, (MAX_FRAME_BYTES as u32).saturating_add(1)] {
+            let (mut writer, mut reader) = UnixStream::pair().expect("posture session");
+            writer
+                .write_all(&header.to_be_bytes())
+                .expect("write invalid header");
+            assert_eq!(
+                receive_process_posture(&mut reader, Duration::from_secs(1)),
+                Err(PreparedChildError::PostureUnavailable)
+            );
+        }
     }
 
     #[test]
@@ -632,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn root_prepares_stopped_child_without_executing_it() {
+    fn root_prepares_stopped_child_and_refuses_missing_posture_after_resume() {
         if unsafe { libc::geteuid() } != 0 {
             return;
         }
@@ -698,6 +902,37 @@ mod tests {
         assert!(PathBuf::from(format!("/proc/{}", child.record.pid)).exists());
         child.terminate_and_reap().expect("cleanup child");
         assert!(!PathBuf::from(format!("/proc/{}", child.record.pid)).exists());
+
+        let mut postureless = prepare_stopped_child(
+            &config,
+            &executable,
+            &repository,
+            &RunAs {
+                uid: 65_534,
+                gid: 65_534,
+            },
+            &PreparedChildBinding {
+                invocation_id: "invocation-postureless",
+                request_identity: identity('7').as_str(),
+                principal_mapping_identity: identity('1').as_str(),
+                working_directory_identity: working.identity.as_str(),
+            },
+            &[String::from("run"), String::from("verify")],
+        )
+        .expect("prepare postureless child");
+        assert_eq!(unsafe { libc::kill(postureless.pid, libc::SIGCONT) }, 0);
+        assert_eq!(
+            postureless.receive_process_posture_after_resume(
+                identity('1').as_str(),
+                Duration::from_secs(5),
+            ),
+            Err(PreparedChildError::PostureUnavailable),
+            "the exact child must resume successfully and fail only when no posture arrives"
+        );
+        postureless
+            .terminate_and_reap()
+            .expect("cleanup postureless child");
+        assert!(!PathBuf::from(format!("/proc/{}", postureless.record.pid)).exists());
 
         let abandoned = prepare_stopped_child(
             &config,
