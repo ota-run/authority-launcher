@@ -34,7 +34,7 @@ use ota_authority_protocol::{
     SYSTEMD_LAUNCHER_SERVICE_CONFIGURATION_IDENTITY_DOMAIN_V1,
     SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1, UnixPrincipalIdentity,
     launcher_principal_mapping_identity, message_identity, systemd_job_principal_profile_identity,
-    systemd_job_principal_profile_v1,
+    systemd_job_principal_profile_v2,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
@@ -113,12 +113,13 @@ pub(crate) struct SystemdLauncherServiceConfigV1 {
     pub mappings: Vec<SystemdPrincipalMappingV1>,
     pub broker_proxy_socket: PathBuf,
     pub broker_proxy_peer: SessionPeer,
-    pub attestor_credential_name: String,
     pub service_unit_identity: String,
     pub socket_unit_identity: String,
     pub ota_binary_identity: String,
     pub broker_proxy_identity: String,
     pub attestor_key_set_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_claims: Option<SystemdAttestationClaimsConfigV1>,
     pub maximum_request_bytes: usize,
     pub maximum_active_sessions: u32,
     pub maximum_startup_seconds: u64,
@@ -132,6 +133,29 @@ pub(crate) struct SystemdPrincipalMappingV1 {
     pub authority_id: String,
     pub job_peer: SessionPeer,
     pub execution: RunAs,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_profile: Option<SystemdJobPrincipalClosedProfileV1>,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SystemdJobPrincipalClosedProfileV1 {
+    pub runner_service_unit: String,
+    pub runner_service_fragment_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runner_service_drop_in_paths: Vec<PathBuf>,
+    pub non_login_shell: PathBuf,
+    pub host_control_sockets: Vec<PathBuf>,
+}
+
+#[cfg(any(test, target_os = "linux"))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SystemdAttestationClaimsConfigV1 {
+    pub authenticated_origin: String,
+    pub authority_mounts: Vec<String>,
+    pub requested_maximum_validity_seconds: u64,
 }
 
 impl LauncherConfig {
@@ -241,7 +265,7 @@ pub(crate) fn systemd_principal_mapping(
         job_peer: principal(mapping.job_peer.uid, mapping.job_peer.gid),
         execution: principal(mapping.execution.uid, mapping.execution.gid),
         job_principal_profile_identity: systemd_job_principal_profile_identity(
-            &systemd_job_principal_profile_v1(),
+            &systemd_job_principal_profile_v2(),
         )
         .map_err(|_| ConfigError::Malformed)?,
         launcher_session_binding_identity: config.identity.clone(),
@@ -333,7 +357,6 @@ fn validate_systemd_launcher_service_config(
         || config.maximum_startup_seconds > 600
         || config.maximum_terminal_wait_seconds == 0
         || config.maximum_terminal_wait_seconds > 3600
-        || !is_bounded_identifier(config.attestor_credential_name.as_str())
         || !is_sha256_identity(config.service_unit_identity.as_str())
         || !is_sha256_identity(config.socket_unit_identity.as_str())
         || !is_sha256_identity(config.ota_binary_identity.as_str())
@@ -350,6 +373,17 @@ fn validate_systemd_launcher_service_config(
                 )
                 || value.len() > 4096
                 || value.contains('\0')
+        })
+        || config.attestation_claims.as_ref().is_some_and(|claims| {
+            !is_bounded_public_value(claims.authenticated_origin.as_str())
+                || claims.authority_mounts.is_empty()
+                || claims.authority_mounts.len() > 16
+                || claims
+                    .authority_mounts
+                    .iter()
+                    .any(|value| !is_bounded_identifier(value.as_str()))
+                || claims.requested_maximum_validity_seconds == 0
+                || claims.requested_maximum_validity_seconds > 600
         })
     {
         return Err(ConfigError::Unsupported);
@@ -403,6 +437,17 @@ fn validate_systemd_launcher_service_config(
         {
             return Err(ConfigError::Unsupported);
         }
+        if let Some(profile) = mapping.closed_profile.as_ref()
+            && (!profile.runner_service_unit.ends_with(".service")
+                || !is_bounded_identifier(profile.runner_service_unit.as_str())
+                || !profile.runner_service_fragment_path.is_absolute()
+                || !profile.non_login_shell.is_absolute()
+                || profile.host_control_sockets.is_empty()
+                || !unique_absolute_paths(profile.runner_service_drop_in_paths.as_slice())
+                || !unique_absolute_paths(profile.host_control_sockets.as_slice()))
+        {
+            return Err(ConfigError::Unsupported);
+        }
     }
 
     if config.identity != systemd_launcher_service_config_identity(config)? {
@@ -412,12 +457,32 @@ fn validate_systemd_launcher_service_config(
 }
 
 #[cfg(any(test, target_os = "linux"))]
+fn unique_absolute_paths(paths: &[PathBuf]) -> bool {
+    let mut seen = BTreeSet::new();
+    paths.iter().all(|path| {
+        path.is_absolute()
+            && !path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            })
+            && seen.insert(path.as_path())
+    })
+}
+
+#[cfg(any(test, target_os = "linux"))]
 fn is_bounded_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn is_bounded_public_value(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 512 && !value.chars().any(char::is_control)
 }
 
 #[cfg(any(test, target_os = "linux"))]
@@ -439,7 +504,7 @@ fn is_sha256_identity(value: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn sha256_file_identity(file: &mut File) -> Result<String, ConfigError> {
+pub(crate) fn sha256_file_identity(file: &mut File) -> Result<String, ConfigError> {
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 16 * 1024];
     loop {
@@ -486,7 +551,7 @@ fn open_protected_executable(
     Ok(file)
 }
 
-fn open_protected_file(
+pub(crate) fn open_protected_file(
     path: &Path,
     expected_uid: u32,
     trusted_root: &Path,
@@ -699,6 +764,7 @@ mod tests {
                         uid: 2001,
                         gid: 2001,
                     },
+                    closed_profile: None,
                 },
                 SystemdPrincipalMappingV1 {
                     authority_id: String::from("publish"),
@@ -710,16 +776,17 @@ mod tests {
                         uid: 2002,
                         gid: 2002,
                     },
+                    closed_profile: None,
                 },
             ],
             broker_proxy_socket: PathBuf::from("/run/ota/broker-proxy.sock"),
             broker_proxy_peer: SessionPeer { uid: 0, gid: 0 },
-            attestor_credential_name: String::from("authority-attestor"),
             service_unit_identity: identity('a'),
             socket_unit_identity: identity('b'),
             ota_binary_identity: identity('c'),
             broker_proxy_identity: identity('d'),
             attestor_key_set_identity: identity('e'),
+            attestation_claims: None,
             maximum_request_bytes: 4096,
             maximum_active_sessions: 2,
             maximum_startup_seconds: 30,
@@ -808,6 +875,54 @@ mod tests {
             systemd_launcher_service_config_identity(&uppercase_identity).expect("identity");
         assert!(matches!(
             validate_systemd_launcher_service_config(&uppercase_identity),
+            Err(ConfigError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn systemd_closed_profile_and_attestation_claims_are_identity_bound() {
+        let mut config = systemd_service_config();
+        config.mappings[0].closed_profile = Some(SystemdJobPrincipalClosedProfileV1 {
+            runner_service_unit: String::from("ota-pressure-runner.service"),
+            runner_service_fragment_path: PathBuf::from(
+                "/etc/systemd/system/ota-pressure-runner.service",
+            ),
+            runner_service_drop_in_paths: vec![PathBuf::from(
+                "/etc/systemd/system/ota-pressure-runner.service.d/10-hardening.conf",
+            )],
+            non_login_shell: PathBuf::from("/usr/sbin/nologin"),
+            host_control_sockets: vec![PathBuf::from("/run/docker.sock")],
+        });
+        config.attestation_claims = Some(SystemdAttestationClaimsConfigV1 {
+            authenticated_origin: String::from("local-systemd-pressure"),
+            authority_mounts: vec![String::from("authority-store")],
+            requested_maximum_validity_seconds: 30,
+        });
+        config.identity = systemd_launcher_service_config_identity(&config).expect("identity");
+        assert!(validate_systemd_launcher_service_config(&config).is_ok());
+
+        let mut changed = config.clone();
+        changed
+            .attestation_claims
+            .as_mut()
+            .expect("attestation claims")
+            .requested_maximum_validity_seconds = 31;
+        assert!(matches!(
+            validate_systemd_launcher_service_config(&changed),
+            Err(ConfigError::Unprotected)
+        ));
+
+        let mut incomplete = config;
+        incomplete.mappings[0]
+            .closed_profile
+            .as_mut()
+            .expect("closed profile")
+            .host_control_sockets
+            .clear();
+        incomplete.identity =
+            systemd_launcher_service_config_identity(&incomplete).expect("identity");
+        assert!(matches!(
+            validate_systemd_launcher_service_config(&incomplete),
             Err(ConfigError::Unsupported)
         ));
     }

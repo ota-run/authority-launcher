@@ -20,7 +20,7 @@
 //
 //   If you need additional information or have any questions, please email: os@ota.run
 
-#[cfg(all(feature = "protected-attestor-client", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub mod attestation_client;
 #[cfg(feature = "protected-attestor")]
 pub mod attestor;

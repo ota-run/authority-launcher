@@ -148,7 +148,7 @@ fn verify_peer_process_status_text(
     let expected_gid = [gid; 4];
     if parse_four_ids(required(&fields, "Uid")?)? != expected_uid
         || parse_four_ids(required(&fields, "Gid")?)? != expected_gid
-        || !required(&fields, "Groups")?.trim().is_empty()
+        || !supplementary_groups_limited_to_primary(required(&fields, "Groups")?, gid)?
         || parse_hex(required(&fields, "CapInh")?)? != 0
         || parse_hex(required(&fields, "CapPrm")?)? != 0
         || parse_hex(required(&fields, "CapEff")?)? != 0
@@ -158,6 +158,21 @@ fn verify_peer_process_status_text(
         return Err(LinuxObservationError::ProcessStatusMismatch);
     }
     Ok(VerifiedPeerProcessStatus { pid, uid, gid })
+}
+
+fn supplementary_groups_limited_to_primary(
+    value: &str,
+    primary_gid: u32,
+) -> Result<bool, LinuxObservationError> {
+    let groups = value
+        .split_whitespace()
+        .map(|group| {
+            group
+                .parse::<u32>()
+                .map_err(|_| LinuxObservationError::ProcessStatusMalformed)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(groups.iter().all(|group| *group == primary_gid))
 }
 
 fn socket_peer_pidfd(stream: &UnixStream) -> Result<OwnedFd, LinuxObservationError> {
@@ -283,9 +298,23 @@ mod tests {
                 gid: 1001,
             })
         );
+        assert_eq!(
+            verify_peer_process_status_text(
+                41,
+                1001,
+                1001,
+                &status.replace("Groups:\t", "Groups:\t1001 ")
+            ),
+            Ok(VerifiedPeerProcessStatus {
+                pid: 41,
+                uid: 1001,
+                gid: 1001,
+            })
+        );
 
         for replacement in [
             status.replace("Groups:\t", "Groups:\t27"),
+            status.replace("Groups:\t", "Groups:\t1001 27"),
             status.replace("CapEff:\t0000000000000000", "CapEff:\t0000000000000001"),
             status.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0"),
             status.replace("Uid:\t1001", "Uid:\t1002"),

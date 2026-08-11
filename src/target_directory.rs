@@ -35,6 +35,8 @@ use crate::config::{RunAs, SystemdLauncherServiceConfigV1};
 
 const HELPER_DESCRIPTOR: RawFd = 3;
 const CONTROL_BYTES: usize = 64;
+const CAP_SETGID: i32 = 6;
+const CAP_SETUID: i32 = 7;
 
 #[repr(align(8))]
 struct ControlBuffer([u8; CONTROL_BYTES]);
@@ -53,6 +55,12 @@ pub(crate) enum TargetDirectoryError {
     HelperWaitFailed,
     #[error("the target-principal privilege transition failed")]
     PrivilegeTransitionFailed,
+    #[error("the target-principal helper lacks effective CAP_SETGID")]
+    GroupTransitionCapabilityUnavailable,
+    #[error("the target-principal helper lacks effective CAP_SETUID")]
+    UserTransitionCapabilityUnavailable,
+    #[error("the target-principal helper lost effective CAP_SETUID after changing group identity")]
+    UserTransitionCapabilityLost,
     #[error("the helper descriptor sanitization failed")]
     DescriptorSanitizationFailed,
     #[error("the helper parent binding failed")]
@@ -220,13 +228,45 @@ fn run_helper(
     {
         return 15;
     }
-    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+    if !effective_capability_enabled(CAP_SETGID) {
+        return 21;
+    }
+    if !effective_capability_enabled(CAP_SETUID) {
+        return 22;
+    }
+    if unsafe {
+        libc::syscall(
+            libc::SYS_setgroups,
+            0_usize,
+            std::ptr::null::<libc::gid_t>(),
+        )
+    } != 0
+    {
         return 16;
     }
-    if unsafe { libc::setresgid(execution.gid, execution.gid, execution.gid) } != 0 {
+    if unsafe {
+        libc::syscall(
+            libc::SYS_setresgid,
+            execution.gid,
+            execution.gid,
+            execution.gid,
+        )
+    } != 0
+    {
         return 17;
     }
-    if unsafe { libc::setresuid(execution.uid, execution.uid, execution.uid) } != 0 {
+    if !effective_capability_enabled(CAP_SETUID) {
+        return 23;
+    }
+    if unsafe {
+        libc::syscall(
+            libc::SYS_setresuid,
+            execution.uid,
+            execution.uid,
+            execution.uid,
+        )
+    } != 0
+    {
         return 18;
     }
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
@@ -262,21 +302,69 @@ fn run_helper(
     if root_descriptor < 0 {
         return 11;
     }
-    let repository_descriptor = open_directory(
-        root_descriptor,
-        relative,
-        libc::RESOLVE_BENEATH
-            | libc::RESOLVE_NO_MAGICLINKS
-            | libc::RESOLVE_NO_SYMLINKS
-            | libc::RESOLVE_NO_XDEV,
-    );
-    unsafe { libc::close(root_descriptor) };
+    let repository_descriptor = if unsafe { libc::strcmp(relative, c".".as_ptr()) } == 0 {
+        root_descriptor
+    } else {
+        let descriptor = open_directory(
+            root_descriptor,
+            relative,
+            libc::RESOLVE_BENEATH
+                | libc::RESOLVE_NO_MAGICLINKS
+                | libc::RESOLVE_NO_SYMLINKS
+                | libc::RESOLVE_NO_XDEV,
+        );
+        unsafe { libc::close(root_descriptor) };
+        descriptor
+    };
     if repository_descriptor < 0 {
         return 12;
     }
     let sent = send_descriptor(HELPER_DESCRIPTOR, repository_descriptor);
     unsafe { libc::close(repository_descriptor) };
     if sent { 0 } else { 13 }
+}
+
+#[repr(C)]
+struct CapabilityHeader {
+    version: u32,
+    pid: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CapabilityData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+fn effective_capability_enabled(capability: i32) -> bool {
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    if !(0..64).contains(&capability) {
+        return false;
+    }
+    let mut header = CapabilityHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapabilityData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    if unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            (&mut header as *mut CapabilityHeader).cast::<libc::c_void>(),
+            data.as_mut_ptr().cast::<libc::c_void>(),
+        )
+    } != 0
+    {
+        return false;
+    }
+    let word = capability as usize / 32;
+    let bit = capability as u32 % 32;
+    data[word].effective & (1_u32 << bit) != 0
 }
 
 fn close_helper_descriptors() -> bool {
@@ -453,6 +541,9 @@ fn helper_status_error(status: i32) -> TargetDirectoryError {
         18 => TargetDirectoryError::UserTransitionFailed,
         19 => TargetDirectoryError::PrivilegeTransitionFailed,
         20 => TargetDirectoryError::PrincipalVerificationFailed,
+        21 => TargetDirectoryError::GroupTransitionCapabilityUnavailable,
+        22 => TargetDirectoryError::UserTransitionCapabilityUnavailable,
+        23 => TargetDirectoryError::UserTransitionCapabilityLost,
         11 => TargetDirectoryError::RootUnavailableToExecutionPrincipal,
         12 => TargetDirectoryError::UnavailableToExecutionPrincipal,
         13 => TargetDirectoryError::DescriptorTransferFailed,
@@ -502,15 +593,16 @@ mod tests {
                     uid: 65_534,
                     gid: 65_534,
                 },
+                closed_profile: None,
             }],
             broker_proxy_socket: "/run/ota/broker-proxy.sock".into(),
             broker_proxy_peer: SessionPeer { uid: 0, gid: 0 },
-            attestor_credential_name: "authority-attestor".into(),
             service_unit_identity: identity('1'),
             socket_unit_identity: identity('2'),
             ota_binary_identity: identity('3'),
             broker_proxy_identity: identity('4'),
             attestor_key_set_identity: identity('5'),
+            attestation_claims: None,
             maximum_request_bytes: 4096,
             maximum_active_sessions: 1,
             maximum_startup_seconds: 5,
@@ -535,6 +627,15 @@ mod tests {
             (original.dev(), original.ino()),
             (observed.st_dev, observed.st_ino)
         );
+    }
+
+    #[test]
+    fn root_helper_observes_required_effective_transition_capabilities() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        assert!(effective_capability_enabled(CAP_SETGID));
+        assert!(effective_capability_enabled(CAP_SETUID));
     }
 
     #[test]
@@ -635,10 +736,10 @@ mod tests {
         );
         unsafe { libc::close(root_descriptor) };
 
-        let config = config(allowed.clone());
+        let selected_config = config(allowed.clone());
         let opened = open_repository_directory(
-            &config,
-            &config.mappings[0].execution,
+            &selected_config,
+            &selected_config.mappings[0].execution,
             repository.to_str().expect("repository path"),
         )
         .unwrap_or_else(|error| {
@@ -647,6 +748,17 @@ mod tests {
                 allowed.display()
             )
         });
+        let exact_root_config = config(repository.clone());
+        let exact_root = open_repository_directory(
+            &exact_root_config,
+            &exact_root_config.mappings[0].execution,
+            repository.to_str().expect("repository path"),
+        )
+        .expect("exact configured root opens without a redundant relative traversal");
+        assert_eq!(
+            (opened.device, opened.inode),
+            (exact_root.device, exact_root.inode)
+        );
         let metadata = fs::metadata(&repository).expect("repository metadata");
         assert_eq!(
             (opened.device, opened.inode),
@@ -672,8 +784,8 @@ mod tests {
         symlink(&outside, &escape).expect("escape symlink");
         assert!(matches!(
             open_repository_directory(
-                &config,
-                &config.mappings[0].execution,
+                &selected_config,
+                &selected_config.mappings[0].execution,
                 escape.to_str().expect("escape path"),
             ),
             Err(TargetDirectoryError::UnavailableToExecutionPrincipal)
@@ -681,8 +793,8 @@ mod tests {
         ));
         assert!(matches!(
             open_repository_directory(
-                &config,
-                &config.mappings[0].execution,
+                &selected_config,
+                &selected_config.mappings[0].execution,
                 outside.to_str().expect("outside path"),
             ),
             Err(TargetDirectoryError::OutsideAllowedRoots)

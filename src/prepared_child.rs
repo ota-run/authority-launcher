@@ -127,11 +127,26 @@ impl PreparedChild {
         self.receive_process_posture_after_resume(expected_principal_mapping_identity, timeout)
     }
 
+    #[cfg(test)]
     pub(crate) fn continue_and_bridge_v3_attestation(
         &mut self,
         posture: &OtaProcessPostureV1,
         broker_proxy: &mut UnixStream,
         timeout: Duration,
+    ) -> Result<(), PreparedChildError> {
+        self.continue_with_v3_attestation(posture, timeout, |challenge| {
+            write_json_frame(broker_proxy, challenge, timeout)?;
+            read_json_frame(broker_proxy, timeout)
+        })
+    }
+
+    pub(crate) fn continue_with_v3_attestation(
+        &mut self,
+        posture: &OtaProcessPostureV1,
+        timeout: Duration,
+        produce: impl FnOnce(
+            &BrokerChallenge,
+        ) -> Result<SignedLauncherAttestationV3, PreparedChildError>,
     ) -> Result<(), PreparedChildError> {
         let mut continuation = LauncherStartupContinuationV1 {
             schema_version: 1,
@@ -146,15 +161,18 @@ impl PreparedChild {
         continuation.identity = launcher_startup_continuation_identity(&continuation)
             .map_err(|_| PreparedChildError::AttestationBridgeUnavailable)?;
         write_json_frame(&mut self.launcher_session, &continuation, timeout)?;
+        pressure_v3_stage("startup_continuation_sent");
 
         let challenge: BrokerChallenge = read_json_frame(&mut self.launcher_session, timeout)?;
+        pressure_v3_stage("challenge_received");
         if challenge.message_kind != ota_authority_protocol::CHALLENGE_REQUEST
             || challenge.protocol_version != ota_authority_protocol::PROTOCOL_VERSION_V1
         {
             return Err(PreparedChildError::AttestationBridgeUnavailable);
         }
-        write_json_frame(broker_proxy, &challenge, timeout)?;
-        let attestation: SignedLauncherAttestationV3 = read_json_frame(broker_proxy, timeout)?;
+        pressure_v3_stage("challenge_validated");
+        let attestation = produce(&challenge)?;
+        pressure_v3_stage("attestation_produced");
         let attestation_identity = launcher_attestation_identity_v3(&attestation)
             .map_err(|_| PreparedChildError::AttestationBridgeUnavailable)?;
         if attestation.payload.message_kind != ATTESTATION_RESPONSE
@@ -196,9 +214,11 @@ impl PreparedChild {
             return Err(PreparedChildError::AttestationBridgeUnavailable);
         }
         write_json_frame(&mut self.launcher_session, &attestation, timeout)?;
+        pressure_v3_stage("attestation_sent");
 
         let authorization: AuthorizationRequest =
             read_json_frame(&mut self.launcher_session, timeout)?;
+        pressure_v3_stage("authorization_received");
         if authorization.message_kind != AUTHORIZATION_REQUEST
             || authorization.binding_identity != challenge.binding_identity
             || authorization.attestation_identity != attestation_identity
@@ -256,6 +276,13 @@ impl PreparedChild {
     pub(crate) fn abandon_for_recovery(mut self) {
         self.pid = 0;
     }
+}
+
+fn pressure_v3_stage(stage: &'static str) {
+    #[cfg(feature = "systemd-pressure-faults")]
+    eprintln!("ota-authority-launcher: bounded pressure v3 stage={stage}");
+    #[cfg(not(feature = "systemd-pressure-faults"))]
+    let _ = stage;
 }
 
 impl Drop for PreparedChild {
@@ -563,9 +590,29 @@ fn run_child(
         return 13;
     }
 
-    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0
-        || unsafe { libc::setresgid(execution.gid, execution.gid, execution.gid) } != 0
-        || unsafe { libc::setresuid(execution.uid, execution.uid, execution.uid) } != 0
+    if unsafe {
+        libc::syscall(
+            libc::SYS_setgroups,
+            0_usize,
+            std::ptr::null::<libc::gid_t>(),
+        )
+    } != 0
+        || unsafe {
+            libc::syscall(
+                libc::SYS_setresgid,
+                execution.gid,
+                execution.gid,
+                execution.gid,
+            )
+        } != 0
+        || unsafe {
+            libc::syscall(
+                libc::SYS_setresuid,
+                execution.uid,
+                execution.uid,
+                execution.uid,
+            )
+        } != 0
         || unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
         || unsafe { libc::fchdir(repository) } != 0
     {
@@ -870,9 +917,9 @@ mod tests {
         SystemdProtectedLauncherInstanceEvidenceV1, SystemdProtectedLauncherInstanceEvidenceV2,
         UnixPrincipalIdentity, encode_frame, launcher_principal_mapping_identity,
         launcher_working_directory_identity, systemd_job_principal_profile_identity,
-        systemd_job_principal_profile_v1, systemd_launcher_profile_identity,
-        systemd_launcher_profile_v1, systemd_protected_launcher_instance_identity,
-        systemd_protected_launcher_instance_v2_identity,
+        systemd_job_principal_profile_v2, systemd_launcher_profile_identity,
+        systemd_launcher_profile_v3, systemd_protected_launcher_instance_v2_identity,
+        systemd_protected_launcher_instance_v3_foundation_identity,
     };
     use tempfile::tempdir;
 
@@ -914,8 +961,8 @@ mod tests {
             saved_gid: gid,
             filesystem_gid: gid,
         };
-        let launcher_profile = systemd_launcher_profile_v1();
-        let job_profile = systemd_job_principal_profile_v1();
+        let launcher_profile = systemd_launcher_profile_v3();
+        let job_profile = systemd_job_principal_profile_v2();
         let launcher_profile_identity = systemd_launcher_profile_identity(&launcher_profile)
             .expect("launcher profile identity");
         let job_profile_identity =
@@ -944,9 +991,10 @@ mod tests {
             child_process_identity: child.identity.clone(),
         };
         instance_v1.identity =
-            systemd_protected_launcher_instance_identity(&instance_v1).expect("instance identity");
+            systemd_protected_launcher_instance_v3_foundation_identity(&instance_v1)
+                .expect("instance identity");
         let mut instance = SystemdProtectedLauncherInstanceEvidenceV2 {
-            schema_version: 2,
+            schema_version: 3,
             identity: String::new(),
             instance_v1,
             launcher_observations: launcher_profile
@@ -956,6 +1004,7 @@ mod tests {
                     source: *source,
                     state: RuntimeBoundaryObservationState::Verified,
                     reason_code: String::from("verified_by_test_launcher"),
+                    evidence_identity: Some(identity('7')),
                 })
                 .collect(),
             job_principal_observations: job_profile
@@ -966,6 +1015,7 @@ mod tests {
                     evidence_methods: required.evidence_methods.clone(),
                     state: RuntimeBoundaryObservationState::Verified,
                     reason_code: String::from("verified_by_test_launcher"),
+                    evidence_identity: Some(identity('8')),
                 })
                 .collect(),
         };
@@ -1000,7 +1050,7 @@ mod tests {
     #[test]
     fn v3_bridge_stops_after_exact_authorization_admission() {
         let job_profile_identity =
-            systemd_job_principal_profile_identity(&systemd_job_principal_profile_v1())
+            systemd_job_principal_profile_identity(&systemd_job_principal_profile_v2())
                 .expect("job profile identity");
         let mut mapping = LauncherPrincipalMappingV1 {
             schema_version: 1,
@@ -1118,7 +1168,7 @@ mod tests {
             .payload
             .systemd_protected_launcher
             .instance_v1
-            .identity = systemd_protected_launcher_instance_identity(
+            .identity = systemd_protected_launcher_instance_v3_foundation_identity(
             &wrong_attestation
                 .payload
                 .systemd_protected_launcher
@@ -1278,12 +1328,12 @@ mod tests {
             mappings: Vec::new(),
             broker_proxy_socket: PathBuf::from("/run/ota/broker-proxy.sock"),
             broker_proxy_peer: crate::config::SessionPeer { uid: 0, gid: 0 },
-            attestor_credential_name: String::from("authority-attestor"),
             service_unit_identity: identity('b'),
             socket_unit_identity: identity('c'),
             ota_binary_identity: identity('d'),
             broker_proxy_identity: identity('e'),
             attestor_key_set_identity: identity('f'),
+            attestation_claims: None,
             maximum_request_bytes: 4096,
             maximum_active_sessions: 1,
             maximum_startup_seconds: 5,

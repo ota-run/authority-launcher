@@ -177,24 +177,12 @@ impl SystemdScopeManager {
         expected: &LauncherSystemdScopeV1,
         child: &LauncherChildProcessV1,
     ) -> Result<(), SystemdScopeError> {
-        if launcher_systemd_scope_identity(expected).ok().as_deref()
-            != Some(expected.identity.as_str())
-        {
-            return Err(SystemdScopeError::ScopeMismatch);
-        }
-        if child.identity != expected.child_identity || child.pid != expected.child_pid {
-            return Err(SystemdScopeError::ScopeMismatch);
-        }
+        verify_recorded_scope_binding(expected, child)?;
         let observed = self.observe_existing_scope(expected.unit_name.as_str())?;
         if !recorded_child_is_live_exact(child).map_err(|_| SystemdScopeError::ScopeMismatch)? {
             return Err(SystemdScopeError::ScopeMismatch);
         }
-        if observed.unit_object_path != expected.unit_object_path
-            || observed.slice != expected.slice
-            || observed.control_group != expected.control_group
-            || observed.delegate != expected.delegate
-            || observed.kill_mode != expected.kill_mode
-            || observed.collect_mode != expected.collect_mode
+        if !observed_scope_matches(expected, &observed)
             || !cgroup_contains_exact_pid(observed.control_group.as_str(), expected.child_pid)
         {
             return Err(SystemdScopeError::ScopeMismatch);
@@ -244,7 +232,22 @@ impl SystemdScopeManager {
         child: &LauncherChildProcessV1,
         timeout: Duration,
     ) -> Result<(), SystemdScopeError> {
-        self.verify_scope(expected, child)?;
+        verify_recorded_scope_binding(expected, child)?;
+        if self.scope_is_terminal(expected.unit_name.as_str(), expected.control_group.as_str()) {
+            return Ok(());
+        }
+        let child_is_live =
+            recorded_child_is_live_exact(child).map_err(|_| SystemdScopeError::ScopeMismatch)?;
+        if child_is_live {
+            self.verify_scope(expected, child)?;
+        } else {
+            let observed = self.observe_existing_scope(expected.unit_name.as_str())?;
+            if !observed_scope_matches(expected, &observed)
+                || !cgroup_is_empty_or_absent(observed.control_group.as_str())
+            {
+                return Err(SystemdScopeError::ScopeMismatch);
+            }
+        }
         self.stop_unit_by_name(
             expected.unit_name.as_str(),
             expected.control_group.as_str(),
@@ -463,6 +466,28 @@ struct ObservedScope {
     delegate: bool,
     kill_mode: String,
     collect_mode: String,
+}
+
+fn verify_recorded_scope_binding(
+    expected: &LauncherSystemdScopeV1,
+    child: &LauncherChildProcessV1,
+) -> Result<(), SystemdScopeError> {
+    if launcher_systemd_scope_identity(expected).ok().as_deref() != Some(expected.identity.as_str())
+        || child.identity != expected.child_identity
+        || child.pid != expected.child_pid
+    {
+        return Err(SystemdScopeError::ScopeMismatch);
+    }
+    Ok(())
+}
+
+fn observed_scope_matches(expected: &LauncherSystemdScopeV1, observed: &ObservedScope) -> bool {
+    observed.unit_object_path == expected.unit_object_path
+        && observed.slice == expected.slice
+        && observed.control_group == expected.control_group
+        && observed.delegate == expected.delegate
+        && observed.kill_mode == expected.kill_mode
+        && observed.collect_mode == expected.collect_mode
 }
 
 fn scope_unit_name(request_identity: &str) -> Result<String, SystemdScopeError> {

@@ -498,23 +498,64 @@ fn serve_linux_once(_issuer: &AttestationIssuer) -> Result<(), AttestorError> {
 
 #[cfg(target_os = "linux")]
 fn serve_seqpacket_once(issuer: &AttestationIssuer) -> Result<(), AttestorError> {
-    let listener = take_listener(issuer.binding.socket_path.as_str())?;
-    let connection = accept_connection(&listener, issuer.binding.read_write_timeout_seconds)?;
-    let peer = observe_peer(&connection, &issuer.binding)?;
-    let request_bytes = receive_packet(&connection, issuer.binding.maximum_request_bytes)?;
+    let listener = pressure_attestor_stage(
+        "listener",
+        take_listener(issuer.binding.socket_path.as_str()),
+    )?;
+    let connection = pressure_attestor_stage(
+        "accept",
+        accept_connection(&listener, issuer.binding.read_write_timeout_seconds),
+    )?;
+    let peer = pressure_attestor_stage("peer", observe_peer(&connection, &issuer.binding))?;
+    let request_bytes = pressure_attestor_stage(
+        "request_packet",
+        receive_packet(&connection, issuer.binding.maximum_request_bytes),
+    )?;
     let request: LauncherAttestationSigningRequestV1 =
         serde_json::from_slice(&request_bytes).map_err(|_| AttestorError::InvalidRequest)?;
     validate_launcher_attestation_signing_request_v1(&request)
         .map_err(|_| AttestorError::InvalidRequest)?;
-    reject_queued_packet(&connection)?;
-    revalidate_peer(&connection, &peer, &issuer.binding)?;
-    reject_queued_packet(&connection)?;
-    let response = issuer.issue_durable(&request, OffsetDateTime::now_utc(), || {
-        revalidate_peer(&connection, &peer, &issuer.binding)
-    })?;
-    revalidate_peer(&connection, &peer, &issuer.binding)?;
-    send_packet(&connection, &response)?;
+    pressure_attestor_stage(
+        "queued_packet_before_issue",
+        reject_queued_packet(&connection),
+    )?;
+    pressure_attestor_stage(
+        "peer_before_issue",
+        revalidate_peer(&connection, &peer, &issuer.binding),
+    )?;
+    pressure_attestor_stage("queued_packet_at_issue", reject_queued_packet(&connection))?;
+    let response = pressure_attestor_stage(
+        "durable_issue",
+        issuer.issue_durable(&request, OffsetDateTime::now_utc(), || {
+            revalidate_peer(&connection, &peer, &issuer.binding)
+        }),
+    )?;
+    pressure_attestor_stage(
+        "peer_before_response",
+        revalidate_peer(&connection, &peer, &issuer.binding),
+    )?;
+    pressure_attestor_stage("response_packet", send_packet(&connection, &response))?;
+    pressure_attestor_stage("client_close", require_peer_close(&connection))?;
     Ok(())
+}
+
+#[cfg(feature = "systemd-pressure-faults")]
+fn pressure_attestor_stage<T>(
+    name: &str,
+    result: Result<T, AttestorError>,
+) -> Result<T, AttestorError> {
+    if result.is_err() {
+        eprintln!("ota-authority-attestor: bounded pressure stage={name}");
+    }
+    result
+}
+
+#[cfg(not(feature = "systemd-pressure-faults"))]
+fn pressure_attestor_stage<T>(
+    _name: &str,
+    result: Result<T, AttestorError>,
+) -> Result<T, AttestorError> {
+    result
 }
 
 #[cfg(target_os = "linux")]
@@ -724,6 +765,23 @@ fn send_packet(connection: &OwnedFd, bytes: &[u8]) -> Result<(), AttestorError> 
 }
 
 #[cfg(target_os = "linux")]
+fn require_peer_close(connection: &OwnedFd) -> Result<(), AttestorError> {
+    let mut byte = 0_u8;
+    let observed = unsafe {
+        libc::recv(
+            connection.as_raw_fd(),
+            std::ptr::addr_of_mut!(byte).cast(),
+            1,
+            libc::MSG_TRUNC,
+        )
+    };
+    if observed != 0 {
+        return Err(AttestorError::TransportUnavailable);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn observe_peer(
     connection: &OwnedFd,
     binding: &LauncherAttestationProducerBindingV1,
@@ -743,16 +801,29 @@ fn observe_peer(
         || credentials.gid != 0
         || credentials.pid <= 0
     {
+        #[cfg(feature = "systemd-pressure-faults")]
+        eprintln!("ota-authority-attestor: bounded pressure peer stage=credentials");
         return Err(AttestorError::TransportUnavailable);
     }
-    let pidfd = socket_peer_pidfd(connection)?;
-    require_live_pidfd(&pidfd)?;
-    let process_start_identity = process_start_identity(credentials.pid)?;
-    let executable_identity = process_executable_identity(credentials.pid)?;
+    let pidfd = pressure_attestor_stage("peer_pidfd", socket_peer_pidfd(connection))?;
+    pressure_attestor_stage("peer_live", require_live_pidfd(&pidfd))?;
+    let process_start_identity = pressure_attestor_stage(
+        "peer_process_start",
+        process_start_identity(credentials.pid),
+    )?;
+    let executable_identity = pressure_attestor_stage(
+        "peer_executable",
+        process_executable_identity(credentials.pid),
+    )?;
     if executable_identity != binding.launcher_executable_identity {
+        #[cfg(feature = "systemd-pressure-faults")]
+        eprintln!("ota-authority-attestor: bounded pressure peer stage=executable_mismatch");
         return Err(AttestorError::TransportUnavailable);
     }
-    let (unit_object_path, control_group) = systemd_unit_for_pid(credentials.pid, binding)?;
+    let (unit_object_path, control_group) = pressure_attestor_stage(
+        "peer_systemd_unit",
+        systemd_unit_for_pid(credentials.pid, binding),
+    )?;
     Ok(ObservedPeer {
         pidfd,
         pid: credentials.pid,
@@ -838,6 +909,11 @@ fn require_live_pidfd(pidfd: &OwnedFd) -> Result<(), AttestorError> {
         )
     } < 0
     {
+        #[cfg(feature = "systemd-pressure-faults")]
+        eprintln!(
+            "ota-authority-attestor: bounded pressure pidfd liveness errno={:?}",
+            std::io::Error::last_os_error().raw_os_error()
+        );
         return Err(AttestorError::TransportUnavailable);
     }
     Ok(())
@@ -878,48 +954,88 @@ fn systemd_unit_for_pid(
     const SYSTEMD_MANAGER_INTERFACE: &str = "org.freedesktop.systemd1.Manager";
     const SYSTEMD_UNIT_INTERFACE: &str = "org.freedesktop.systemd1.Unit";
     let bus = std::fs::symlink_metadata("/run/dbus/system_bus_socket")
-        .map_err(|_| AttestorError::TransportUnavailable)?;
-    if !bus.file_type().is_socket() || bus.uid() != 0 || bus.mode() & 0o022 != 0 {
+        .map_err(|_| pressure_attestor_peer_detail("system_bus_metadata"))?;
+    let bus_parent = std::fs::symlink_metadata("/run/dbus")
+        .map_err(|_| pressure_attestor_peer_detail("system_bus_parent"))?;
+    if !bus.file_type().is_socket() {
+        pressure_attestor_peer_detail("system_bus_not_socket");
+        return Err(AttestorError::TransportUnavailable);
+    }
+    if bus.uid() != 0 {
+        pressure_attestor_peer_detail("system_bus_not_root_owned");
+        return Err(AttestorError::TransportUnavailable);
+    }
+    if !bus_parent.is_dir() {
+        pressure_attestor_peer_detail("system_bus_parent_not_directory");
+        return Err(AttestorError::TransportUnavailable);
+    }
+    if bus_parent.uid() != 0 {
+        pressure_attestor_peer_detail("system_bus_parent_not_root_owned");
+        return Err(AttestorError::TransportUnavailable);
+    }
+    if bus_parent.mode() & 0o022 != 0 {
+        pressure_attestor_peer_detail("system_bus_parent_writable");
         return Err(AttestorError::TransportUnavailable);
     }
     let connection = Builder::address(SYSTEM_BUS_ADDRESS)
         .and_then(Builder::build)
-        .map_err(|_| AttestorError::TransportUnavailable)?;
+        .map_err(|_| pressure_attestor_peer_detail("system_bus_connect"))?;
     let manager = Proxy::new(
         &connection,
         SYSTEMD_SERVICE,
         SYSTEMD_MANAGER_PATH,
         SYSTEMD_MANAGER_INTERFACE,
     )
-    .map_err(|_| AttestorError::TransportUnavailable)?;
+    .map_err(|_| pressure_attestor_peer_detail("systemd_manager"))?;
     let unit_path: OwnedObjectPath = manager
         .call("GetUnitByPID", &(pid as u32,))
-        .map_err(|_| AttestorError::TransportUnavailable)?;
+        .map_err(|_| pressure_attestor_peer_detail("systemd_get_unit_by_pid"))?;
     let unit = Proxy::new(
         &connection,
         SYSTEMD_SERVICE,
         unit_path.as_str(),
         SYSTEMD_UNIT_INTERFACE,
     )
-    .map_err(|_| AttestorError::TransportUnavailable)?;
+    .map_err(|_| pressure_attestor_peer_detail("systemd_unit_proxy"))?;
     let id: String = unit
         .get_property("Id")
-        .map_err(|_| AttestorError::TransportUnavailable)?;
-    let control_group: String = unit
-        .get_property("ControlGroup")
-        .map_err(|_| AttestorError::TransportUnavailable)?;
-    if id != binding.launcher_service_unit || control_group.is_empty() {
+        .map_err(|_| pressure_attestor_peer_detail("systemd_unit_id"))?;
+    if id != binding.launcher_service_unit {
+        pressure_attestor_peer_detail("systemd_unit_mismatch");
         return Err(AttestorError::TransportUnavailable);
     }
-    let proc_cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
-        .map_err(|_| AttestorError::TransportUnavailable)?;
-    if !proc_cgroup
-        .lines()
-        .any(|line| line.strip_prefix("0::") == Some(control_group.as_str()))
-    {
-        return Err(AttestorError::TransportUnavailable);
-    }
+    let control_group = process_control_group(pid, binding.launcher_service_unit.as_str())?;
     Ok((unit_path.to_string(), control_group))
+}
+
+#[cfg(target_os = "linux")]
+fn process_control_group(pid: libc::pid_t, unit: &str) -> Result<String, AttestorError> {
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .map_err(|_| pressure_attestor_peer_detail("proc_cgroup"))?;
+    let mut paths = cgroup.lines().filter_map(|line| line.strip_prefix("0::"));
+    let path = paths
+        .next()
+        .ok_or_else(|| pressure_attestor_peer_detail("proc_cgroup_missing"))?;
+    if paths.next().is_some()
+        || !path.starts_with('/')
+        || path.split('/').any(|part| part == "..")
+        || !path.ends_with(format!("/{unit}").as_str())
+    {
+        pressure_attestor_peer_detail("proc_cgroup_mismatch");
+        return Err(AttestorError::TransportUnavailable);
+    }
+    Ok(path.to_owned())
+}
+
+#[cfg(all(target_os = "linux", feature = "systemd-pressure-faults"))]
+fn pressure_attestor_peer_detail(name: &str) -> AttestorError {
+    eprintln!("ota-authority-attestor: bounded pressure peer detail={name}");
+    AttestorError::TransportUnavailable
+}
+
+#[cfg(all(target_os = "linux", not(feature = "systemd-pressure-faults")))]
+fn pressure_attestor_peer_detail(_name: &str) -> AttestorError {
+    AttestorError::TransportUnavailable
 }
 
 #[cfg(test)]
@@ -945,9 +1061,9 @@ mod tests {
         launcher_attestation_claims_v3_identity, launcher_attestation_producer_binding_v1_identity,
         launcher_attestation_signing_request_v1_identity, launcher_principal_mapping_identity,
         ota_process_posture_identity, sha256_identity, systemd_job_principal_profile_identity,
-        systemd_job_principal_profile_v1, systemd_launcher_profile_identity,
-        systemd_launcher_profile_v1, systemd_protected_launcher_instance_identity,
-        systemd_protected_launcher_instance_v2_identity,
+        systemd_job_principal_profile_v2, systemd_launcher_profile_identity,
+        systemd_launcher_profile_v3, systemd_protected_launcher_instance_v2_identity,
+        systemd_protected_launcher_instance_v3_foundation_identity,
     };
     #[test]
     fn unsupported_host_never_claims_a_protected_service() {
@@ -1084,6 +1200,20 @@ mod tests {
             reject_queued_packet(&receiver),
             Err(AttestorError::TransportUnavailable)
         );
+
+        let (sender, receiver) = seqpacket_pair();
+        assert_eq!(
+            unsafe { libc::shutdown(sender.as_raw_fd(), libc::SHUT_RDWR) },
+            0
+        );
+        require_peer_close(&receiver).expect("peer close completes one-request exchange");
+
+        let (sender, receiver) = seqpacket_pair();
+        send_packet(&sender, b"late").expect("send late packet");
+        assert_eq!(
+            require_peer_close(&receiver),
+            Err(AttestorError::TransportUnavailable)
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1193,7 +1323,7 @@ mod tests {
             job_peer: uniform(1001, 1001),
             execution: uniform(1002, 1002),
             job_principal_profile_identity: systemd_job_principal_profile_identity(
-                &systemd_job_principal_profile_v1(),
+                &systemd_job_principal_profile_v2(),
             )
             .expect("job profile identity"),
             launcher_session_binding_identity: binding.launcher_service_binding_identity.clone(),
@@ -1219,11 +1349,11 @@ mod tests {
             principal_mapping: mapping,
             process_posture: posture,
             systemd_launcher_profile_identity: systemd_launcher_profile_identity(
-                &systemd_launcher_profile_v1(),
+                &systemd_launcher_profile_v3(),
             )
             .expect("launcher profile identity"),
             systemd_job_principal_profile_identity: systemd_job_principal_profile_identity(
-                &systemd_job_principal_profile_v1(),
+                &systemd_job_principal_profile_v2(),
             )
             .expect("job profile identity"),
             launcher_session_binding_identity: binding.launcher_service_binding_identity.clone(),
@@ -1231,22 +1361,23 @@ mod tests {
             working_directory_identity: identity('a'),
             child_process_identity: identity('b'),
         };
-        instance.identity =
-            systemd_protected_launcher_instance_identity(&instance).expect("instance identity");
+        instance.identity = systemd_protected_launcher_instance_v3_foundation_identity(&instance)
+            .expect("instance identity");
         let mut complete = SystemdProtectedLauncherInstanceEvidenceV2 {
-            schema_version: 2,
+            schema_version: 3,
             identity: String::new(),
             instance_v1: instance,
-            launcher_observations: systemd_launcher_profile_v1()
+            launcher_observations: systemd_launcher_profile_v3()
                 .evidence_sources
                 .into_iter()
                 .map(|source| SystemdLauncherObservation {
                     source,
                     state: RuntimeBoundaryObservationState::Verified,
                     reason_code: String::from("verified_by_systemd_protected_launcher"),
+                    evidence_identity: Some(identity('c')),
                 })
                 .collect(),
-            job_principal_observations: systemd_job_principal_profile_v1()
+            job_principal_observations: systemd_job_principal_profile_v2()
                 .requirements
                 .into_iter()
                 .map(|required| SystemdJobPrincipalObservation {
@@ -1254,6 +1385,7 @@ mod tests {
                     evidence_methods: required.evidence_methods,
                     state: RuntimeBoundaryObservationState::Verified,
                     reason_code: String::from("verified_by_systemd_protected_launcher"),
+                    evidence_identity: Some(identity('d')),
                 })
                 .collect(),
         };

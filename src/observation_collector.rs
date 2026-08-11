@@ -30,17 +30,14 @@ use ota_authority_protocol::{
     RuntimeBoundaryObservationState, SystemdJobPrincipalObservation,
     SystemdJobPrincipalRequirementDefinition, SystemdLauncherEvidenceSource,
     SystemdLauncherObservation, SystemdProtectedLauncherInstanceEvidenceV1,
-    SystemdProtectedLauncherInstanceEvidenceV2, systemd_job_principal_profile_v1,
-    systemd_launcher_profile_identity, systemd_launcher_profile_v2,
-    systemd_protected_launcher_instance_identity, systemd_protected_launcher_instance_v2_identity,
+    SystemdProtectedLauncherInstanceEvidenceV2, systemd_job_principal_profile_v2,
+    systemd_launcher_profile_identity, systemd_launcher_profile_v3,
+    systemd_protected_launcher_instance_v2_identity,
+    systemd_protected_launcher_instance_v3_foundation_identity,
 };
 use thiserror::Error;
 
 const VERIFIED_REASON_CODE: &str = "verified_by_systemd_protected_launcher_v2";
-
-mod sealed {
-    pub trait Sealed {}
-}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ObservationCollectionError {
@@ -54,53 +51,55 @@ pub enum ObservationCollectionError {
 
 /// Canonical probe boundary. Implementations return success only after checking the named source;
 /// they do not return caller-authored status or reason text.
-pub trait ClosedProfileProbe: sealed::Sealed {
+pub trait ClosedProfileProbe {
     fn verify_launcher_source(
         &mut self,
         source: SystemdLauncherEvidenceSource,
-    ) -> Result<(), ObservationCollectionError>;
+    ) -> Result<String, ObservationCollectionError>;
 
     fn verify_job_principal_requirement(
         &mut self,
         requirement: &SystemdJobPrincipalRequirementDefinition,
-    ) -> Result<(), ObservationCollectionError>;
+    ) -> Result<String, ObservationCollectionError>;
 }
 
 pub fn collect_closed_profile(
     mut instance_v1: SystemdProtectedLauncherInstanceEvidenceV1,
     probe: &mut impl ClosedProfileProbe,
 ) -> Result<SystemdProtectedLauncherInstanceEvidenceV2, ObservationCollectionError> {
-    let launcher_profile = systemd_launcher_profile_v2();
+    let launcher_profile = systemd_launcher_profile_v3();
     instance_v1.systemd_launcher_profile_identity =
         systemd_launcher_profile_identity(&launcher_profile)
             .map_err(|_| ObservationCollectionError::InvalidInstance)?;
-    instance_v1.identity = systemd_protected_launcher_instance_identity(&instance_v1)
+    instance_v1.identity = systemd_protected_launcher_instance_v3_foundation_identity(&instance_v1)
         .map_err(|_| ObservationCollectionError::InvalidInstance)?;
 
     let mut launcher_observations = Vec::with_capacity(launcher_profile.evidence_sources.len());
     for source in launcher_profile.evidence_sources {
-        probe.verify_launcher_source(source)?;
+        let evidence_identity = probe.verify_launcher_source(source)?;
         launcher_observations.push(SystemdLauncherObservation {
             source,
             state: RuntimeBoundaryObservationState::Verified,
             reason_code: VERIFIED_REASON_CODE.into(),
+            evidence_identity: Some(evidence_identity),
         });
     }
 
-    let principal_profile = systemd_job_principal_profile_v1();
+    let principal_profile = systemd_job_principal_profile_v2();
     let mut job_principal_observations = Vec::with_capacity(principal_profile.requirements.len());
     for requirement in principal_profile.requirements {
-        probe.verify_job_principal_requirement(&requirement)?;
+        let evidence_identity = probe.verify_job_principal_requirement(&requirement)?;
         job_principal_observations.push(SystemdJobPrincipalObservation {
             requirement: requirement.requirement,
             evidence_methods: requirement.evidence_methods,
             state: RuntimeBoundaryObservationState::Verified,
             reason_code: VERIFIED_REASON_CODE.into(),
+            evidence_identity: Some(evidence_identity),
         });
     }
 
     let mut complete = SystemdProtectedLauncherInstanceEvidenceV2 {
-        schema_version: 2,
+        schema_version: 3,
         identity: String::new(),
         instance_v1,
         launcher_observations,
@@ -117,8 +116,8 @@ mod tests {
         LauncherPrincipalMappingV1, OtaProcessPostureV1, SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1,
         SystemdJobPrincipalRequirement, SystemdProtectedLauncherInstanceEvidenceV1,
         UnixPrincipalIdentity, launcher_principal_mapping_identity, ota_process_posture_identity,
-        systemd_job_principal_profile_identity, systemd_job_principal_profile_v1,
-        systemd_launcher_profile_identity, systemd_launcher_profile_v2,
+        systemd_job_principal_profile_identity, systemd_job_principal_profile_v2,
+        systemd_launcher_profile_identity, systemd_launcher_profile_v3,
     };
 
     use super::*;
@@ -130,29 +129,27 @@ mod tests {
         fail_job_at: Option<usize>,
     }
 
-    impl sealed::Sealed for RecordingProbe {}
-
     impl ClosedProfileProbe for RecordingProbe {
         fn verify_launcher_source(
             &mut self,
             source: SystemdLauncherEvidenceSource,
-        ) -> Result<(), ObservationCollectionError> {
+        ) -> Result<String, ObservationCollectionError> {
             self.launcher_calls.push(source);
             if self.fail_launcher_at == Some(self.launcher_calls.len() - 1) {
                 return Err(ObservationCollectionError::LauncherObservationUnavailable);
             }
-            Ok(())
+            Ok(format!("sha256:{}", "8".repeat(64)))
         }
 
         fn verify_job_principal_requirement(
             &mut self,
             requirement: &SystemdJobPrincipalRequirementDefinition,
-        ) -> Result<(), ObservationCollectionError> {
+        ) -> Result<String, ObservationCollectionError> {
             self.job_calls.push(requirement.requirement);
             if self.fail_job_at == Some(self.job_calls.len() - 1) {
                 return Err(ObservationCollectionError::JobPrincipalObservationUnavailable);
             }
-            Ok(())
+            Ok(format!("sha256:{}", "9".repeat(64)))
         }
     }
 
@@ -167,11 +164,11 @@ mod tests {
         let collected = collect_closed_profile(instance(), &mut probe).expect("complete profile");
         assert_eq!(
             probe.launcher_calls,
-            systemd_launcher_profile_v2().evidence_sources
+            systemd_launcher_profile_v3().evidence_sources
         );
         assert_eq!(
             probe.job_calls,
-            systemd_job_principal_profile_v1()
+            systemd_job_principal_profile_v2()
                 .requirements
                 .into_iter()
                 .map(|value| value.requirement)
@@ -179,7 +176,7 @@ mod tests {
         );
         assert_eq!(
             collected.instance_v1.systemd_launcher_profile_identity,
-            systemd_launcher_profile_identity(&systemd_launcher_profile_v2())
+            systemd_launcher_profile_identity(&systemd_launcher_profile_v3())
                 .expect("profile identity")
         );
     }
@@ -228,7 +225,7 @@ mod tests {
             job_peer: principal(1001, 1001),
             execution: principal(2001, 2001),
             job_principal_profile_identity: systemd_job_principal_profile_identity(
-                &systemd_job_principal_profile_v1(),
+                &systemd_job_principal_profile_v2(),
             )
             .expect("job profile identity"),
             launcher_session_binding_identity: identity('a'),
@@ -255,7 +252,7 @@ mod tests {
             process_posture: posture,
             systemd_launcher_profile_identity: identity('d'),
             systemd_job_principal_profile_identity: systemd_job_principal_profile_identity(
-                &systemd_job_principal_profile_v1(),
+                &systemd_job_principal_profile_v2(),
             )
             .expect("job profile identity"),
             launcher_session_binding_identity: identity('a'),

@@ -30,13 +30,14 @@
   service now retains a socket-bound close-on-exec pidfd, reconciles the protected UID/GID mapping,
   and requires exact live `/proc` UID/GID slots, empty supplementary groups and
   inheritable/permitted/effective/ambient capabilities, and `NoNewPrivs=1` before repository
-  opening or child creation. The remaining closed-profile sources are still required before V3
-  evidence can be emitted.
+  opening or child creation.
 
 - Add the fail-closed closed-profile collector foundation for
-  `ota.authority-launcher.systemd/v2`. It emits observations only in canonical Protocol order and
-  cannot represent a partial launcher or job-principal profile as verified. The remaining Linux
-  probes and producer invocation remain intentionally unwired.
+  `ota.authority-launcher.systemd/v3`. It reconciles protected installation files, exact systemd
+  unit/socket/scope runtime properties, process containment, account/sudo/Polkit posture,
+  protected-path and host-socket access, and Ota process-access denial. It emits observations only
+  in canonical Protocol order and cannot represent a partial launcher or job-principal profile as
+  verified.
 
 - Add the execution-disabled protected V3 attestation producer foundation. The separate
   `ota-authority-attestor` Linux service consumes only its fixed root-owned `SOCK_SEQPACKET`
@@ -47,9 +48,9 @@
   fail closed.
 - Add the launcher-side protected producer binding loader and response verifier. It independently
   checks canonical request/response and claims projection, the protected public key, signature,
-  audience, key interval, and the narrowest producer/verifier/request freshness bound. This is a
-  foundation only: production launcher collection of the complete closed observation profile and
-  producer invocation remain unwired, so no real V3 bridge or authority claim is enabled yet.
+  audience, key interval, and the narrowest producer/verifier/request freshness bound. The
+  execution-disabled systemd path now invokes that separately credentialed producer with the exact
+  complete observed profile and relays only the independently verified signed attestation to Core.
 - Advance the systemd protected-launcher boundary through one signed V3 attestation bridge. Core's
   exact posture admission now receives an identity-bound launcher continuation, freezes the real
   semantic scope, and sends its broker challenge over the same private descriptor. The launcher
@@ -63,6 +64,12 @@
   authorization admission, and continuation substitution fail closed through the same cleanup
   authority and emit `pre_authorization_protocol_refused_boundary_removed`, not a broker authority
   decision or provider-boundary failure.
+- Add an immutable Linux/x64 PID 1 systemd pressure workflow for the complete execution-disabled
+  V3 path. It binds the contract-selected Core source build and immutable Protocol dependency,
+  proves signed admission plus exact cleanup, and exercises protected-installation drift, runtime
+  property drift, missing producer credentials, and crash-after-scope recovery. The workflow is
+  prepared but has not yet produced hosted evidence; local ARM64 systemd results remain the only
+  complete V3 candidate pressure at this stage.
 
 - In the preceding posture-only slice, advance the execution-disabled systemd service through one
   child transition. After

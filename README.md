@@ -53,21 +53,14 @@ for an identical unexpired replay. The launcher-side verifier loads only the pro
 producer binding and independently checks the response projection, identity, signature, audience,
 key validity, and freshness.
 
-The production launcher does **not yet** collect the complete closed job-principal observation set
-or invoke that producer. It therefore still does not emit a real V3 attestation, connect to a
-remote broker, or make authorization decisions. The producer foundation is not a usable authority
-path until the protected configuration and observation collector are wired and pressure-proven.
-The current collector foundation targets the additive
-`ota.authority-launcher.systemd/v2` profile, which keeps signing credentials exclusively in the
-producer service. It assembles only the canonical complete ordered profile and refuses an
-unavailable observation; the remaining concrete Linux observation probes are the next
-implementation gate.
-The systemd request path now implements the first of those live sources: it obtains a socket-bound
-close-on-exec pidfd for the job peer, reconciles its protected UID/GID mapping, and requires the
-peer's exact `/proc` identity slots, empty supplementary groups and inheritable/permitted/effective/
-ambient capabilities, and `NoNewPrivs=1` before repository or child preparation. That preflight is
-necessary but not sufficient: protected files, systemd properties, process containment, account and
-policy posture, target-principal access, and Ota process-access observations remain outstanding.
+The execution-disabled systemd launcher now collects the complete ordered
+`ota.authority-launcher.systemd/v3` and `ota.authority-job-principal.systemd/v2` observation sets and
+invokes that producer. It verifies protected installation identities, exact systemd runtime
+properties, process containment, account/sudo/Polkit posture, protected-path and host-socket access,
+and Ota process-access denial before relaying the independently verified signed V3 attestation to
+Core. Any missing or mismatched observation refuses. This establishes a real local V3 attestation
+bridge, not a usable authority path: the launcher still does not forward Core's authorization
+request, connect to a remote broker, obtain or consume a lease, or execute selected work.
 
 The feature-gated `ota-authority-pressure-peer` binary is an exception for conformance testing
 only. It uses fixed public test keys and deterministic scenarios to exercise protocol v2 through a
@@ -235,12 +228,12 @@ as a stopped root child. Before fork it creates and fsyncs a root-owned active-s
 working-directory device/inode, principal mapping, PID/start time, binary identity, and complete
 child descriptor boundary.
 
-The execution-disabled Linux pressure unit needs root system-manager access and
-`CAP_SYS_PTRACE` so it can re-observe the exact stopped child's protected descriptor posture.
-It also reads the host `/proc/net/unix` table to reconcile the inherited socket inode, so a unit
-with `PrivateNetwork=yes` cannot establish that observation. These are bounded adapter
-requirements, not evidence of provider-attested isolation; the effective unit and capability
-posture must remain part of the later signed hardening profile.
+The execution-disabled Linux pressure unit needs root system-manager access and bounded
+`CAP_SYS_PTRACE` so it can re-observe protected process and stopped-child descriptor posture. It
+binds listening sockets through protected file metadata, descriptor type, socket options, and exact
+systemd unit relationships rather than treating `/proc/net/unix` path spelling as authority. These
+are bounded adapter requirements, not evidence of provider-attested isolation; the effective unit,
+capability, mount, process, and socket posture remain part of the signed hardening profile.
 
 The child receives only standard streams, the systemd profile's fixed private Ota session
 descriptor, the fixed binary descriptor, and the retained repository descriptor. Production code
@@ -251,9 +244,10 @@ scope. Only after that persistence does the launcher resume the exact PID throug
 bounded `ota_process_posture/v1` frame, and reconcile its identity, PID/start time, Ota binary, and
 principal mapping to the prepared child. It then sends one identity-bound local continuation that
 binds the exact invocation, child, working directory, posture, and principal mapping so Core can
-parse the command and freeze the real semantic scope. The launcher connects only to the
-protected root-owned proxy, relays Core's exact challenge and one structurally valid signed V3
-response, then observes Core's exact matching authorization request without forwarding it. It
+parse the command and freeze the real semantic scope. The launcher submits Core's exact challenge
+plus its complete observed profile to the separately credentialed protected attestor, independently
+verifies the returned signature and claims projection, then relays only that signed V3 response. It
+observes Core's exact matching authorization request without forwarding it, and
 finally kills the complete scope, confirms it absent and its cgroup empty or absent, kills/reaps the
 child, and removes the slot.
 
@@ -263,15 +257,14 @@ hard refusal because it cannot establish child absence. An exact pre-scope child
 through Linux `pidfd`; a scope-bearing journal additionally requires the exact unit and kernel
 cgroup to be stopped and observed empty. PID reuse, identity mismatch, unsupported cleanup, or any
 uncertain outcome retains the slot and fails closed.
-This foundation remains execution-disabled after signed V3 admission. It does **not** forward the
+This path remains execution-disabled after signed V3 admission. It does **not** forward the
 authorization request, obtain a decision, issue or consume a lease, execute repository work, or
-create crossing receipt/archive evidence. The protected proxy remains the attestation producer;
-the configured service credential is not consumed by this bridge slice. Missing, malformed,
+create crossing receipt/archive evidence. Only `ota-authority-attestor` receives the systemd-delivered
+signing credential; the launcher retains public verification truth only. Missing, malformed,
 oversized, self-inconsistent, or substituted posture, continuation, challenge, attestation, or
 authorization admission fails closed and enters the same exact cleanup path. OrbStack's systemd
-currently refuses the real pre-exec PID attachment with `ENOTTY`; the
-implementation remains fail-closed there, and positive posture-plus-scope proof requires the
-prepared hardened Linux runner.
+ARM64 VM now exercises this local candidate through real PID 1 systemd. That local evidence is not
+immutable hosted Linux/x64 pressure and does not establish provider-attested separation.
 
 The feature-gated `ota-authority-systemd-pressure-client` is the unprivileged side of that positive
 kernel proof. It connects only to `/run/ota/authority-launcher.sock`, submits one bounded
@@ -301,6 +294,19 @@ binary identities, unchanged repository state, zero terminal scopes, and the typ
 cleanup stage. The crash run records launcher exit `86` before fresh reconciliation. These runs do
 not prove V3 attestation, broker authorization, lease consumption, selected execution, receipt or
 archive evidence, or provider-attested separation.
+
+The current uncommitted V3 candidate additionally passed local ARM64 OrbStack PID 1 systemd
+pressure through the complete protected collector and attestor. Core admitted the signed V3
+profile and emitted the exact authorization request; the launcher withheld it, removed the exact
+scope/cgroup/child boundary, and finalized the active slot. Protected-installation drift, systemd
+runtime drift, and unavailable producer credentials refused with zero selected work. A forced exit
+after durable scope recording retained one recovery slot, and the next activation reconciled it to
+zero before accepting another request. The checkout sentinel, receipt store, broker decision/lease
+state, and terminal scope set remained empty. This is local candidate evidence only.
+The repository now also carries a dedicated immutable Linux/x64 workflow that repeats the
+positive, drift, unavailable-credential, and crash/recovery controls while binding the exact Core
+and Protocol revisions. That workflow is prepared but unrun and is not evidence until a retained
+green run exists.
 
 ## What belongs here
 

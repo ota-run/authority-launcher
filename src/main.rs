@@ -22,12 +22,20 @@
 
 #[cfg(target_os = "linux")]
 mod active_slot;
+#[cfg(target_os = "linux")]
+mod closed_profile_observations;
 #[cfg(unix)]
 mod config;
 #[cfg(target_os = "linux")]
+mod installation_manifest;
+#[cfg(target_os = "linux")]
 mod prepared_child;
+#[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
+mod pressure_provision;
 #[cfg(test)]
 mod reference_peer;
+#[cfg(target_os = "linux")]
+mod systemd_runtime_observations;
 #[cfg(target_os = "linux")]
 mod systemd_scope;
 #[cfg(target_os = "linux")]
@@ -68,6 +76,28 @@ enum Command {
     /// attestation admission; authorization and one-use lease consumption are not enabled.
     #[command(hide = true)]
     ServeSystemd,
+
+    /// Install the fixed, execution-disabled V3 local pressure boundary.
+    #[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
+    #[command(hide = true)]
+    ProvisionSystemdV3Pressure {
+        #[arg(long)]
+        authority_id: String,
+        #[arg(long)]
+        job_user: String,
+        #[arg(long)]
+        execution_user: String,
+        #[arg(long)]
+        repository_root: std::path::PathBuf,
+        #[arg(long)]
+        launcher_binary: std::path::PathBuf,
+        #[arg(long)]
+        attestor_binary: std::path::PathBuf,
+        #[arg(long)]
+        ota_binary: std::path::PathBuf,
+        #[arg(long)]
+        pressure_client_binary: std::path::PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -78,6 +108,26 @@ fn main() -> ExitCode {
             ota_args,
         } => run(authority_id.as_str(), ota_args.as_slice()),
         Command::ServeSystemd => serve_systemd(),
+        #[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
+        Command::ProvisionSystemdV3Pressure {
+            authority_id,
+            job_user,
+            execution_user,
+            repository_root,
+            launcher_binary,
+            attestor_binary,
+            ota_binary,
+            pressure_client_binary,
+        } => pressure_provision::provision(pressure_provision::ProvisionRequest {
+            authority_id,
+            job_user,
+            execution_user,
+            repository_root,
+            launcher_binary,
+            attestor_binary,
+            ota_binary,
+            pressure_client_binary,
+        }),
     };
     match result {
         Ok(code) => ExitCode::from(code),

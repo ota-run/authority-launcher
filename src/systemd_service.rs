@@ -38,15 +38,23 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(test)]
+use ota_authority_launcher::linux_observations::revalidate_connected_peer;
 use ota_authority_launcher::linux_observations::{
     ObservedSessionPeer, observe_connected_peer, reconcile_connected_peer,
-    revalidate_connected_peer, verify_peer_process_status,
+    verify_peer_process_status,
 };
 use ota_authority_protocol::{
-    LAUNCHER_TERMINAL, LauncherInvocationRequestV1, LauncherTerminalFrameV1,
+    ATTESTATION_RESPONSE, LAUNCHER_TERMINAL, LauncherAttestationClaimsV3,
+    LauncherAttestationSigningRequestV1, LauncherInvocationRequestV1, LauncherTerminalFrameV1,
     LauncherTerminalOutcomeV1, LauncherTerminalStageV1, LauncherWorkingDirectoryV1,
-    MAX_FRAME_BYTES, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, decode_frame, encode_frame,
-    launcher_invocation_request_identity, launcher_working_directory_identity,
+    MAX_FRAME_BYTES, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1,
+    SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3, SystemdProtectedLauncherInstanceEvidenceV1,
+    decode_frame, encode_frame, launcher_attestation_claims_v3_identity,
+    launcher_attestation_signing_request_v1_identity, launcher_invocation_request_identity,
+    launcher_working_directory_identity, systemd_job_principal_profile_identity,
+    systemd_job_principal_profile_v2, systemd_launcher_profile_identity,
+    systemd_launcher_profile_v3, systemd_protected_launcher_instance_v3_foundation_identity,
     validate_launcher_invocation_request_v1, validate_launcher_terminal_frame_v1,
 };
 use thiserror::Error;
@@ -58,10 +66,15 @@ use crate::config::{
     SYSTEMD_AUTHORITY_LAUNCHER_CONFIG_PATH, SystemdLauncherServiceConfigV1,
     load_systemd_launcher_service_config, systemd_principal_mapping, verify_protected_directory,
 };
+use crate::installation_manifest::{
+    ProtectedInstallationManifestV1, ProtectedInstallationRoleV1,
+    load_protected_installation_manifest,
+};
 use crate::prepared_child::{
     PreparedChildBinding, PreparedChildError, prepare_stopped_child, recorded_child_is_live_exact,
     terminate_recorded_child,
 };
+use crate::systemd_runtime_observations::verify_systemd_runtime;
 use crate::systemd_scope::{ScopeBoundary, SystemdScopeError, SystemdScopeManager};
 use crate::target_directory::{TargetDirectoryError, open_repository_directory};
 
@@ -88,8 +101,10 @@ pub(crate) enum SystemdServiceError {
     PeerPostureUnavailable,
     #[error("the systemd launcher repository path is outside protected allowed roots")]
     RepositoryOutsideAllowedRoots,
-    #[error("the systemd launcher repository is unavailable to the configured execution principal")]
-    RepositoryUnavailableToExecutionPrincipal,
+    #[error(
+        "the systemd launcher repository is unavailable to the configured execution principal: {0}"
+    )]
+    RepositoryUnavailableToExecutionPrincipal(#[source] TargetDirectoryError),
     #[error("the systemd launcher active-slot boundary is unavailable")]
     ActiveSlotUnavailable,
     #[error("the systemd launcher could not prepare the protected Ota child")]
@@ -98,8 +113,13 @@ pub(crate) enum SystemdServiceError {
     ChildCleanupFailed,
     #[error("the systemd launcher transient scope boundary is unavailable")]
     ScopeUnavailable,
+    #[cfg(test)]
     #[error("the systemd launcher protected broker proxy is unavailable")]
     BrokerProxyUnavailable,
+    #[error("the protected launcher installation identity is unavailable or mismatched")]
+    InstallationIdentityUnavailable,
+    #[error("the protected launcher effective runtime profile is unavailable or mismatched")]
+    RuntimeProfileUnavailable,
     #[error("the systemd launcher protocol bridge refused before authorization")]
     PreAuthorizationProtocolRefused,
     #[error("the systemd launcher could not confirm terminal scope cleanup")]
@@ -115,6 +135,10 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
     let loaded = load_systemd_launcher_service_config(SYSTEMD_AUTHORITY_LAUNCHER_CONFIG_PATH)
         .map_err(|_| SystemdServiceError::ListenerUnavailable)?;
     let config = &loaded.config;
+    let launcher_executable = std::env::current_exe()
+        .map_err(|_| SystemdServiceError::InstallationIdentityUnavailable)?;
+    let installation = load_protected_installation_manifest(config, &launcher_executable)
+        .map_err(|_| SystemdServiceError::InstallationIdentityUnavailable)?;
     let listener =
         inherited_systemd_listener(config.socket_path.as_path(), config.socket_group_gid)?;
     reconcile_active_slots(
@@ -166,11 +190,14 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
 
     let child_boundary = prepare_disabled_child_boundary(
         config,
+        &installation,
         &loaded.ota_binary,
         &repository,
         mapping,
         &request,
         invocation_id.as_str(),
+        &stream,
+        &peer,
         Path::new(ACTIVE_SLOT_DIRECTORY),
         0,
         Path::new("/"),
@@ -192,9 +219,20 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
             Err(SystemdServiceError::ExecutionNotEnabled)
         }
         Err(
-            error @ (SystemdServiceError::BrokerProxyUnavailable
-            | SystemdServiceError::PreAuthorizationProtocolRefused),
+            error @ (SystemdServiceError::PreAuthorizationProtocolRefused
+            | SystemdServiceError::RuntimeProfileUnavailable),
         ) => {
+            write_terminal(
+                &mut stream,
+                invocation_id.as_str(),
+                LauncherTerminalOutcomeV1::Refused,
+                Some(2),
+                Some(LauncherTerminalStageV1::PreAuthorizationProtocolRefusedBoundaryRemoved),
+            )?;
+            Err(error)
+        }
+        #[cfg(test)]
+        Err(error @ SystemdServiceError::BrokerProxyUnavailable) => {
             write_terminal(
                 &mut stream,
                 invocation_id.as_str(),
@@ -220,11 +258,14 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
 #[allow(clippy::too_many_arguments)]
 fn prepare_disabled_child_boundary(
     config: &SystemdLauncherServiceConfigV1,
+    installation: &ProtectedInstallationManifestV1,
     ota_binary: &std::fs::File,
     repository: &crate::target_directory::OpenedRepositoryDirectory,
     mapping: &crate::config::SystemdPrincipalMappingV1,
     request: &LauncherInvocationRequestV1,
     invocation_id: &str,
+    client_stream: &UnixStream,
+    peer: &ObservedSessionPeer,
     active_slot_directory: &Path,
     active_slot_owner_uid: u32,
     active_slot_trusted_root: &Path,
@@ -241,32 +282,175 @@ fn prepare_disabled_child_boundary(
         active_slot_owner_uid,
         active_slot_trusted_root,
         &scope_manager,
-        |child, principal_mapping| {
+        |child, principal_mapping, scope| {
             let posture = child
                 .resume_and_receive_process_posture(
                     principal_mapping.identity.as_str(),
                     Duration::from_secs(config.maximum_startup_seconds),
                 )
-                .map_err(map_prepared_child_error)?;
-            let mut proxy = connect_protected_broker_proxy(config)?;
-            proxy.run_revalidated(|stream| {
-                child
-                    .continue_and_bridge_v3_attestation(
-                        &posture,
-                        stream,
-                        Duration::from_secs(config.maximum_startup_seconds),
-                    )
-                    .map_err(map_prepared_child_error)
-            })
+                .map_err(|error| pressure_prepared_child_failure("process_posture", error))?;
+            let child_record = child.record.clone();
+            child
+                .continue_with_v3_attestation(
+                    &posture,
+                    Duration::from_secs(config.maximum_startup_seconds),
+                    |challenge| {
+                        let runtime_identity = verify_systemd_runtime(config, installation, scope)
+                            .map_err(|_| pressure_bridge_failure("systemd_runtime"))?;
+                        let mut evidence =
+                            crate::closed_profile_observations::collect_live_closed_profile_evidence(
+                                config,
+                                installation,
+                                mapping,
+                                client_stream,
+                                peer,
+                                &child_record,
+                                scope,
+                                &posture,
+                                runtime_identity.as_str(),
+                            )
+                            .map_err(|_| pressure_bridge_failure("closed_profile"))?;
+                        produce_attestation(
+                            config,
+                            installation,
+                            principal_mapping,
+                            &child_record,
+                            scope,
+                            &posture,
+                            challenge,
+                            &mut evidence,
+                        )
+                        .map_err(|_| pressure_bridge_failure("attestation_producer"))
+                    },
+                )
+                .map_err(|error| pressure_prepared_child_failure("v3_session", error))
         },
     )
 }
 
+fn pressure_bridge_failure(stage: &'static str) -> PreparedChildError {
+    #[cfg(feature = "systemd-pressure-faults")]
+    eprintln!("ota-authority-launcher: bounded pressure bridge failure stage={stage}");
+    #[cfg(not(feature = "systemd-pressure-faults"))]
+    let _ = stage;
+    PreparedChildError::AttestationBridgeUnavailable
+}
+
+fn pressure_prepared_child_failure(
+    stage: &'static str,
+    error: PreparedChildError,
+) -> SystemdServiceError {
+    #[cfg(feature = "systemd-pressure-faults")]
+    eprintln!("ota-authority-launcher: bounded pressure child failure stage={stage} error={error}");
+    #[cfg(not(feature = "systemd-pressure-faults"))]
+    let _ = stage;
+    map_prepared_child_error(error)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn produce_attestation(
+    config: &SystemdLauncherServiceConfigV1,
+    installation: &ProtectedInstallationManifestV1,
+    principal_mapping: &ota_authority_protocol::LauncherPrincipalMappingV1,
+    child: &ota_authority_protocol::LauncherChildProcessV1,
+    scope: &ota_authority_protocol::LauncherSystemdScopeV1,
+    posture: &ota_authority_protocol::OtaProcessPostureV1,
+    challenge: &ota_authority_protocol::BrokerChallenge,
+    evidence: &mut crate::closed_profile_observations::LiveClosedProfileEvidence,
+) -> Result<ota_authority_protocol::SignedLauncherAttestationV3, SystemdServiceError> {
+    let claim_config = config
+        .attestation_claims
+        .as_ref()
+        .ok_or(SystemdServiceError::RuntimeProfileUnavailable)?;
+    let producer = ota_authority_launcher::attestation_client::load_producer_binding()
+        .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    let launcher_profile_identity =
+        systemd_launcher_profile_identity(&systemd_launcher_profile_v3())
+            .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    let launcher_executable_identity = installation
+        .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
+        .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    if producer.launcher_service_binding_identity != config.service_unit_identity
+        || producer.launcher_configuration_identity != config.identity
+        || producer.launcher_profile_identity != launcher_profile_identity
+        || producer.launcher_executable_identity != launcher_executable_identity
+        || producer.verifier_key_set_identity != config.attestor_key_set_identity
+    {
+        return Err(SystemdServiceError::RuntimeProfileUnavailable);
+    }
+
+    let job_profile_identity =
+        systemd_job_principal_profile_identity(&systemd_job_principal_profile_v2())
+            .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    let mut instance = SystemdProtectedLauncherInstanceEvidenceV1 {
+        schema_version: 1,
+        identity: String::new(),
+        adapter: SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1.into(),
+        principal_mapping: principal_mapping.clone(),
+        process_posture: posture.clone(),
+        systemd_launcher_profile_identity: launcher_profile_identity.clone(),
+        systemd_job_principal_profile_identity: job_profile_identity,
+        launcher_session_binding_identity: config.identity.clone(),
+        systemd_invocation_identity: scope.identity.clone(),
+        working_directory_identity: child.working_directory_identity.clone(),
+        child_process_identity: child.identity.clone(),
+    };
+    instance.identity = systemd_protected_launcher_instance_v3_foundation_identity(&instance)
+        .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    let complete =
+        ota_authority_launcher::observation_collector::collect_closed_profile(instance, evidence)
+            .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    let claims = LauncherAttestationClaimsV3 {
+        message_kind: ATTESTATION_RESPONSE.into(),
+        attestation_protocol_version: SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3.into(),
+        binding_identity: challenge.binding_identity.clone(),
+        challenge_nonce_commitment: challenge.nonce_commitment.clone(),
+        invocation_id: child.invocation_id.clone(),
+        work_unit_identity: challenge.work_unit_identity.clone(),
+        semantic_scope_identity: challenge.semantic_scope_identity.clone(),
+        runner_principal: principal_mapping.identity.clone(),
+        channel_delivery: String::from("launcher_session_fd"),
+        authenticated_origin: claim_config.authenticated_origin.clone(),
+        authority_mounts: claim_config.authority_mounts.clone(),
+        systemd_protected_launcher: complete,
+        issuer: producer.issuer.clone(),
+        audience: producer.audience.clone(),
+    };
+    let claims_identity = launcher_attestation_claims_v3_identity(&claims)
+        .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    let mut request = LauncherAttestationSigningRequestV1 {
+        schema_version: 1,
+        message_kind: ota_authority_protocol::LAUNCHER_ATTESTATION_SIGNING_REQUEST.into(),
+        request_identity: String::new(),
+        challenge: challenge.clone(),
+        claims_identity,
+        claims,
+        launcher_service_binding_identity: config.service_unit_identity.clone(),
+        launcher_configuration_identity: config.identity.clone(),
+        launcher_executable_identity: launcher_executable_identity.to_owned(),
+        launcher_profile_identity,
+        producer_binding_identity: producer.identity.clone(),
+        producer_audience: producer.audience.clone(),
+        requested_maximum_validity_seconds: claim_config.requested_maximum_validity_seconds,
+    };
+    request.request_identity = launcher_attestation_signing_request_v1_identity(&request)
+        .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    let response = ota_authority_launcher::attestation_client::request_attestation(
+        &producer,
+        &request,
+        time::OffsetDateTime::now_utc(),
+    )
+    .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    Ok(response.attestation)
+}
+
+#[cfg(test)]
 struct ProtectedBrokerProxy {
     stream: UnixStream,
     peer: ObservedSessionPeer,
 }
 
+#[cfg(test)]
 impl ProtectedBrokerProxy {
     fn revalidate(&self) -> Result<(), SystemdServiceError> {
         revalidate_connected_peer(&self.stream, &self.peer)
@@ -282,57 +466,6 @@ impl ProtectedBrokerProxy {
         self.revalidate()?;
         result
     }
-}
-
-fn connect_protected_broker_proxy(
-    config: &SystemdLauncherServiceConfigV1,
-) -> Result<ProtectedBrokerProxy, SystemdServiceError> {
-    let path = config.broker_proxy_socket.as_path();
-    let parent = path
-        .parent()
-        .ok_or(SystemdServiceError::BrokerProxyUnavailable)?;
-    verify_protected_directory(parent, 0, Path::new("/"))
-        .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
-    let parent_metadata = std::fs::symlink_metadata(parent)
-        .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
-    let socket_metadata =
-        std::fs::symlink_metadata(path).map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
-    if !parent_metadata.is_dir()
-        || parent_metadata.uid() != 0
-        || parent_metadata.mode() & 0o022 != 0
-        || !socket_metadata.file_type().is_socket()
-        || socket_metadata.uid() != 0
-        || socket_metadata.mode() & 0o007 != 0
-    {
-        return Err(SystemdServiceError::BrokerProxyUnavailable);
-    }
-    let proxy =
-        UnixStream::connect(path).map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
-    let peer = observe_connected_peer(&proxy)
-        .and_then(|peer| {
-            reconcile_connected_peer(
-                &peer,
-                config.broker_proxy_peer.uid,
-                config.broker_proxy_peer.gid,
-            )?;
-            Ok(peer)
-        })
-        .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
-    if peer.uid != 0 || peer.gid != 0 {
-        return Err(SystemdServiceError::BrokerProxyUnavailable);
-    }
-    proxy
-        .set_read_timeout(Some(Duration::from_secs(config.maximum_startup_seconds)))
-        .and_then(|()| {
-            proxy.set_write_timeout(Some(Duration::from_secs(config.maximum_startup_seconds)))
-        })
-        .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
-    let guarded = ProtectedBrokerProxy {
-        stream: proxy,
-        peer,
-    };
-    guarded.revalidate()?;
-    Ok(guarded)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -353,6 +486,7 @@ where
     F: FnOnce(
         &mut crate::prepared_child::PreparedChild,
         &ota_authority_protocol::LauncherPrincipalMappingV1,
+        &ota_authority_protocol::LauncherSystemdScopeV1,
     ) -> Result<(), SystemdServiceError>,
 {
     let request_identity = launcher_invocation_request_identity(request)
@@ -455,7 +589,7 @@ where
             .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
         return Err(error);
     }
-    let posture_result = posture_gate(&mut child, &principal_mapping);
+    let posture_result = posture_gate(&mut child, &principal_mapping, &scope);
     let child_record = child.record.clone();
     scope_manager
         .stop_and_confirm_empty(
@@ -652,7 +786,7 @@ fn map_target_directory_error(error: TargetDirectoryError) -> SystemdServiceErro
         TargetDirectoryError::OutsideAllowedRoots => {
             SystemdServiceError::RepositoryOutsideAllowedRoots
         }
-        _ => SystemdServiceError::RepositoryUnavailableToExecutionPrincipal,
+        _ => SystemdServiceError::RepositoryUnavailableToExecutionPrincipal(error),
     }
 }
 
@@ -688,6 +822,14 @@ fn verify_listener_path(
     expected_path: &Path,
     expected_group_gid: u32,
 ) -> Result<(), SystemdServiceError> {
+    verify_protected_directory(
+        expected_path
+            .parent()
+            .ok_or(SystemdServiceError::ListenerUnavailable)?,
+        0,
+        Path::new("/"),
+    )
+    .map_err(|_| SystemdServiceError::ListenerUnavailable)?;
     let metadata = std::fs::symlink_metadata(expected_path)
         .map_err(|_| SystemdServiceError::ListenerUnavailable)?;
     let mut opened: libc::stat = unsafe { std::mem::zeroed() };
@@ -700,41 +842,10 @@ fn verify_listener_path(
         || metadata.mode() & 0o7777 != 0o660
         || opened.st_mode & libc::S_IFMT != libc::S_IFSOCK
         || opened.st_uid != 0
-        || !proc_unix_socket_matches_path(opened.st_ino, expected_path)
     {
         return Err(SystemdServiceError::ListenerUnavailable);
     }
     Ok(())
-}
-
-fn proc_unix_socket_matches_path(socket_inode: libc::ino_t, expected_path: &Path) -> bool {
-    let Some(expected_path) = expected_path.to_str() else {
-        return false;
-    };
-    let Ok(table) = std::fs::read_to_string("/proc/net/unix") else {
-        return false;
-    };
-    proc_unix_table_has_unique_listener(&table, socket_inode, expected_path)
-}
-
-fn proc_unix_table_has_unique_listener(
-    table: &str,
-    socket_inode: libc::ino_t,
-    expected_path: &str,
-) -> bool {
-    let mut matching_listeners = table.lines().skip(1).filter_map(|line| {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() != 8
-            || fields[3] != "00010000"
-            || fields[4] != "0001"
-            || fields[5] != "01"
-            || fields[7] != expected_path
-        {
-            return None;
-        }
-        fields[6].parse::<libc::ino_t>().ok()
-    });
-    matching_listeners.next() == Some(socket_inode) && matching_listeners.next().is_none()
 }
 
 fn receive_request(
@@ -1154,59 +1265,34 @@ mod tests {
     }
 
     #[test]
-    fn listener_path_must_reference_the_inherited_socket_inode() {
+    fn listener_path_requires_exact_metadata_and_protected_parent_chain() {
         if unsafe { libc::geteuid() } != 0 {
             return;
         }
-        let temporary = tempdir().expect("temporary directory");
-        let path = temporary.path().join("launcher.sock");
+        let directory = PathBuf::from(format!("/run/ota-listener-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir(&directory).expect("protected listener directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))
+            .expect("directory permissions");
+        let path = directory.join("launcher.sock");
         let listener = UnixListener::bind(&path).expect("listener");
         let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path");
         assert_eq!(unsafe { libc::chown(path_c.as_ptr(), 0, 1001) }, 0);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).expect("permissions");
         assert!(verify_listener_path(&listener, &path, 1001).is_ok());
 
-        fs::remove_file(&path).expect("unlink original listener");
-        let replacement = UnixListener::bind(&path).expect("replacement listener");
-        assert_eq!(unsafe { libc::chown(path_c.as_ptr(), 0, 1001) }, 0);
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).expect("permissions");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777))
+            .expect("writable directory permissions");
         assert!(verify_listener_path(&listener, &path, 1001).is_err());
-        drop(replacement);
-    }
-
-    #[test]
-    fn listener_table_ignores_connected_rows_for_the_protected_path() {
-        let table = "Num RefCount Protocol Flags Type St Inode Path\n\
-                     0000: 00000003 00000000 00000000 0001 02 0 /run/ota/authority-launcher.sock\n\
-                     0000: 00000002 00000000 00010000 0001 01 46556936 /run/ota/authority-launcher.sock\n";
-        assert!(proc_unix_table_has_unique_listener(
-            table,
-            46_556_936,
-            "/run/ota/authority-launcher.sock",
-        ));
+        drop(listener);
+        fs::remove_file(&path).expect("remove listener socket");
+        fs::remove_dir(&directory).expect("remove listener directory");
     }
 
     #[test]
     fn listener_verification_rejects_a_connected_unix_stream() {
         let (stream, _peer) = UnixStream::pair().expect("socket pair");
         assert!(verify_listener_socket(stream.as_raw_fd()).is_err());
-    }
-
-    #[test]
-    fn listener_table_rejects_missing_or_ambiguous_listener_identity() {
-        let table = "Num RefCount Protocol Flags Type St Inode Path\n\
-                     0000: 00000002 00000000 00010000 0001 01 41 /run/ota/authority-launcher.sock\n\
-                     0000: 00000002 00000000 00010000 0001 01 42 /run/ota/authority-launcher.sock\n";
-        assert!(!proc_unix_table_has_unique_listener(
-            table,
-            41,
-            "/run/ota/authority-launcher.sock",
-        ));
-        assert!(!proc_unix_table_has_unique_listener(
-            "Num RefCount Protocol Flags Type St Inode Path\n",
-            41,
-            "/run/ota/authority-launcher.sock",
-        ));
     }
 
     #[test]
@@ -1248,15 +1334,16 @@ mod tests {
                     uid: 65_534,
                     gid: 65_534,
                 },
+                closed_profile: None,
             }],
             broker_proxy_socket: PathBuf::from("/run/ota/broker-proxy.sock"),
             broker_proxy_peer: SessionPeer { uid: 0, gid: 0 },
-            attestor_credential_name: String::from("authority-attestor"),
             service_unit_identity: identity('b'),
             socket_unit_identity: identity('c'),
             ota_binary_identity: identity('d'),
             broker_proxy_identity: identity('e'),
             attestor_key_set_identity: identity('f'),
+            attestation_claims: None,
             maximum_request_bytes: 4096,
             maximum_active_sessions: 1,
             maximum_startup_seconds: 5,
@@ -1283,7 +1370,7 @@ mod tests {
             0,
             temporary.path(),
             &scope_boundary,
-            |_child, _principal_mapping| {
+            |_child, _principal_mapping, _scope| {
                 let journal_path = fs::read_dir(&active)
                     .expect("active directory")
                     .next()
@@ -1323,7 +1410,7 @@ mod tests {
                 0,
                 temporary.path(),
                 &refused_scope,
-                |child, _principal_mapping| {
+                |child, _principal_mapping, _scope| {
                     refused_pid.set(child.record.pid);
                     Err(SystemdServiceError::PreAuthorizationProtocolRefused)
                 },
@@ -1347,7 +1434,7 @@ mod tests {
                 0,
                 temporary.path(),
                 &UncertainScopeBoundary,
-                |_child, _principal_mapping| Ok(()),
+                |_child, _principal_mapping, _scope| Ok(()),
             ),
             Err(SystemdServiceError::ScopeCleanupFailed)
         ));

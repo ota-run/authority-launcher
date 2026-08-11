@@ -96,14 +96,20 @@ pub fn request_attestation(
     if request.producer_binding_identity != binding.identity {
         return Err(AttestationClientError::InvalidResponse);
     }
-    let (connection, peer) = connect_seqpacket(binding)?;
-    revalidate_peer(&connection, &peer, binding)?;
+    let connection = pressure_client_stage("connect", connect_seqpacket(binding))?;
     let request_bytes =
         serde_jcs::to_vec(request).map_err(|_| AttestationClientError::InvalidResponse)?;
-    send_packet(&connection, &request_bytes)?;
-    let response_bytes = receive_packet(&connection, binding.maximum_request_bytes)?;
-    revalidate_peer(&connection, &peer, binding)?;
-    reject_queued_packet(&connection)?;
+    pressure_client_stage("request_packet", send_packet(&connection, &request_bytes))?;
+    let response_bytes = pressure_client_stage(
+        "response_packet",
+        receive_packet(&connection, binding.maximum_request_bytes),
+    )?;
+    let producer = pressure_client_stage("producer", observe_producer(binding))?;
+    pressure_client_stage(
+        "producer_before_verify",
+        revalidate_producer(&producer, binding),
+    )?;
+    pressure_client_stage("queued_response", reject_queued_packet(&connection))?;
     let response: LauncherAttestationSigningResponseV1 = serde_json::from_slice(&response_bytes)
         .map_err(|_| AttestationClientError::InvalidResponse)?;
     if serde_jcs::to_vec(&response).map_err(|_| AttestationClientError::InvalidResponse)?
@@ -111,8 +117,37 @@ pub fn request_attestation(
     {
         return Err(AttestationClientError::InvalidResponse);
     }
-    verify_response(binding, request, &response, now)?;
+    pressure_client_stage(
+        "response_verify",
+        verify_response(binding, request, &response, now),
+    )?;
+    pressure_client_stage(
+        "producer_after_verify",
+        revalidate_producer(&producer, binding),
+    )?;
+    if unsafe { libc::shutdown(connection.as_raw_fd(), libc::SHUT_RDWR) } != 0 {
+        return Err(AttestationClientError::TransportUnavailable);
+    }
     Ok(response)
+}
+
+#[cfg(feature = "systemd-pressure-faults")]
+fn pressure_client_stage<T>(
+    name: &str,
+    result: Result<T, AttestationClientError>,
+) -> Result<T, AttestationClientError> {
+    if result.is_err() {
+        eprintln!("ota-authority-launcher: bounded pressure attestor-client stage={name}");
+    }
+    result
+}
+
+#[cfg(not(feature = "systemd-pressure-faults"))]
+fn pressure_client_stage<T>(
+    _name: &str,
+    result: Result<T, AttestationClientError>,
+) -> Result<T, AttestationClientError> {
+    result
 }
 
 pub fn verify_response(
@@ -194,7 +229,7 @@ fn decode_verifying_key(
 
 fn connect_seqpacket(
     binding: &LauncherAttestationProducerBindingV1,
-) -> Result<(OwnedFd, ObservedPeer), AttestationClientError> {
+) -> Result<OwnedFd, AttestationClientError> {
     let path = Path::new(&binding.socket_path);
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|_| AttestationClientError::TransportUnavailable)?;
@@ -220,8 +255,7 @@ fn connect_seqpacket(
         return Err(AttestationClientError::TransportUnavailable);
     }
     set_timeouts(&connection, binding.read_write_timeout_seconds)?;
-    let peer = observe_peer(&connection, binding)?;
-    Ok((connection, peer))
+    Ok(connection)
 }
 
 fn unix_address(
@@ -263,51 +297,35 @@ fn set_timeouts(connection: &OwnedFd, seconds: u64) -> Result<(), AttestationCli
 }
 
 #[derive(Debug)]
-struct ObservedPeer {
+struct ObservedProducer {
     pidfd: OwnedFd,
     pid: libc::pid_t,
-    uid: u32,
-    gid: u32,
     process_start_identity: String,
     executable_identity: String,
     unit_object_path: String,
     control_group: String,
 }
 
-fn observe_peer(
-    connection: &OwnedFd,
+fn observe_producer(
     binding: &LauncherAttestationProducerBindingV1,
-) -> Result<ObservedPeer, AttestationClientError> {
-    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    if unsafe {
-        libc::getsockopt(
-            connection.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            std::ptr::addr_of_mut!(credentials).cast(),
-            &mut length,
-        )
-    } != 0
-        || credentials.uid != 0
-        || credentials.gid != 0
-        || credentials.pid <= 0
-    {
+) -> Result<ObservedProducer, AttestationClientError> {
+    let (pid, unit_object_path, control_group) = systemd_service_main_pid(binding)?;
+    let pidfd = open_pidfd(pid)?;
+    require_live_pidfd(&pidfd)?;
+    if process_ids(pid)? != ([0; 4], [0; 4]) {
         return Err(AttestationClientError::TransportUnavailable);
     }
-    let pidfd = socket_peer_pidfd(connection)?;
-    require_live_pidfd(&pidfd)?;
-    let process_start_identity = process_start_identity(credentials.pid)?;
-    let executable_identity = process_executable_identity(credentials.pid)?;
+    let process_start_identity = process_start_identity(pid)?;
+    let executable_identity = process_executable_identity(pid)?;
     if executable_identity != binding.producer_executable_identity {
         return Err(AttestationClientError::TransportUnavailable);
     }
-    let (unit_object_path, control_group) = systemd_unit_for_pid(credentials.pid, binding)?;
-    Ok(ObservedPeer {
+    if systemd_unit_for_pid(pid, binding)? != (unit_object_path.clone(), control_group.clone()) {
+        return Err(AttestationClientError::TransportUnavailable);
+    }
+    Ok(ObservedProducer {
         pidfd,
-        pid: credentials.pid,
-        uid: credentials.uid,
-        gid: credentials.gid,
+        pid,
         process_start_identity,
         executable_identity,
         unit_object_path,
@@ -315,26 +333,12 @@ fn observe_peer(
     })
 }
 
-fn revalidate_peer(
-    connection: &OwnedFd,
-    expected: &ObservedPeer,
+fn revalidate_producer(
+    expected: &ObservedProducer,
     binding: &LauncherAttestationProducerBindingV1,
 ) -> Result<(), AttestationClientError> {
     require_live_pidfd(&expected.pidfd)?;
-    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    if unsafe {
-        libc::getsockopt(
-            connection.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            std::ptr::addr_of_mut!(credentials).cast(),
-            &mut length,
-        )
-    } != 0
-        || credentials.pid != expected.pid
-        || credentials.uid != expected.uid
-        || credentials.gid != expected.gid
+    if process_ids(expected.pid)? != ([0; 4], [0; 4])
         || process_start_identity(expected.pid)? != expected.process_start_identity
         || process_executable_identity(expected.pid)? != expected.executable_identity
         || systemd_unit_for_pid(expected.pid, binding)?
@@ -348,28 +352,15 @@ fn revalidate_peer(
     require_live_pidfd(&expected.pidfd)
 }
 
-fn socket_peer_pidfd(connection: &OwnedFd) -> Result<OwnedFd, AttestationClientError> {
-    const SO_PEERPIDFD: libc::c_int = 77;
-    let mut descriptor = -1_i32;
-    let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
-    if unsafe {
-        libc::getsockopt(
-            connection.as_raw_fd(),
-            libc::SOL_SOCKET,
-            SO_PEERPIDFD,
-            std::ptr::addr_of_mut!(descriptor).cast(),
-            &mut length,
-        )
-    } != 0
-        || descriptor < 0
-        || unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } != 0
-    {
+fn open_pidfd(pid: libc::pid_t) -> Result<OwnedFd, AttestationClientError> {
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) as libc::c_int };
+    if descriptor < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
         if descriptor >= 0 {
             unsafe { libc::close(descriptor) };
         }
         return Err(AttestationClientError::TransportUnavailable);
     }
-    // SAFETY: SO_PEERPIDFD returned a new descriptor owned by this process.
+    // SAFETY: pidfd_open returned a new descriptor owned by this process.
     Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
 }
 
@@ -427,6 +418,77 @@ fn process_executable_identity(pid: libc::pid_t) -> Result<String, AttestationCl
     Ok(format!("sha256:{:x}", digest.finalize()))
 }
 
+fn process_ids(pid: libc::pid_t) -> Result<([u32; 4], [u32; 4]), AttestationClientError> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .map_err(|_| AttestationClientError::TransportUnavailable)?;
+    let parse = |name: &str| {
+        let values = status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .ok_or(AttestationClientError::TransportUnavailable)?
+            .split_whitespace()
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| AttestationClientError::TransportUnavailable)?;
+        values
+            .try_into()
+            .map_err(|_| AttestationClientError::TransportUnavailable)
+    };
+    Ok((parse("Uid:")?, parse("Gid:")?))
+}
+
+fn systemd_service_main_pid(
+    binding: &LauncherAttestationProducerBindingV1,
+) -> Result<(libc::pid_t, String, String), AttestationClientError> {
+    const SYSTEM_BUS_ADDRESS: &str = "unix:path=/run/dbus/system_bus_socket";
+    const SYSTEMD_SERVICE: &str = "org.freedesktop.systemd1";
+    const SYSTEMD_MANAGER_PATH: &str = "/org/freedesktop/systemd1";
+    const SYSTEMD_MANAGER_INTERFACE: &str = "org.freedesktop.systemd1.Manager";
+    const SYSTEMD_UNIT_INTERFACE: &str = "org.freedesktop.systemd1.Unit";
+    const SYSTEMD_SERVICE_INTERFACE: &str = "org.freedesktop.systemd1.Service";
+    verify_system_bus_socket()?;
+    let connection = Builder::address(SYSTEM_BUS_ADDRESS)
+        .and_then(Builder::build)
+        .map_err(|_| AttestationClientError::TransportUnavailable)?;
+    let manager = Proxy::new(
+        &connection,
+        SYSTEMD_SERVICE,
+        SYSTEMD_MANAGER_PATH,
+        SYSTEMD_MANAGER_INTERFACE,
+    )
+    .map_err(|_| AttestationClientError::TransportUnavailable)?;
+    let unit_path: OwnedObjectPath = manager
+        .call("GetUnit", &(binding.service_unit.as_str(),))
+        .map_err(|_| AttestationClientError::TransportUnavailable)?;
+    let unit = Proxy::new(
+        &connection,
+        SYSTEMD_SERVICE,
+        unit_path.as_str(),
+        SYSTEMD_UNIT_INTERFACE,
+    )
+    .map_err(|_| AttestationClientError::TransportUnavailable)?;
+    let id: String = unit
+        .get_property("Id")
+        .map_err(|_| AttestationClientError::TransportUnavailable)?;
+    let service = Proxy::new(
+        &connection,
+        SYSTEMD_SERVICE,
+        unit_path.as_str(),
+        SYSTEMD_SERVICE_INTERFACE,
+    )
+    .map_err(|_| AttestationClientError::TransportUnavailable)?;
+    let pid: u32 = service
+        .get_property("MainPID")
+        .map_err(|_| AttestationClientError::TransportUnavailable)?;
+    if id != binding.service_unit || pid == 0 {
+        return Err(AttestationClientError::TransportUnavailable);
+    }
+    let pid =
+        libc::pid_t::try_from(pid).map_err(|_| AttestationClientError::TransportUnavailable)?;
+    let control_group = process_control_group(pid, binding.service_unit.as_str())?;
+    Ok((pid, unit_path.to_string(), control_group))
+}
+
 fn systemd_unit_for_pid(
     pid: libc::pid_t,
     binding: &LauncherAttestationProducerBindingV1,
@@ -436,6 +498,7 @@ fn systemd_unit_for_pid(
     const SYSTEMD_MANAGER_PATH: &str = "/org/freedesktop/systemd1";
     const SYSTEMD_MANAGER_INTERFACE: &str = "org.freedesktop.systemd1.Manager";
     const SYSTEMD_UNIT_INTERFACE: &str = "org.freedesktop.systemd1.Unit";
+    verify_system_bus_socket()?;
     let connection = Builder::address(SYSTEM_BUS_ADDRESS)
         .and_then(Builder::build)
         .map_err(|_| AttestationClientError::TransportUnavailable)?;
@@ -459,21 +522,44 @@ fn systemd_unit_for_pid(
     let id: String = unit
         .get_property("Id")
         .map_err(|_| AttestationClientError::TransportUnavailable)?;
-    let control_group: String = unit
-        .get_property("ControlGroup")
-        .map_err(|_| AttestationClientError::TransportUnavailable)?;
-    if id != binding.service_unit || control_group.is_empty() {
+    if id != binding.service_unit {
         return Err(AttestationClientError::TransportUnavailable);
     }
-    let proc_cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+    let control_group = process_control_group(pid, binding.service_unit.as_str())?;
+    Ok((unit_path.to_string(), control_group))
+}
+
+fn process_control_group(pid: libc::pid_t, unit: &str) -> Result<String, AttestationClientError> {
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
         .map_err(|_| AttestationClientError::TransportUnavailable)?;
-    if !proc_cgroup
-        .lines()
-        .any(|line| line.strip_prefix("0::") == Some(control_group.as_str()))
+    let mut paths = cgroup.lines().filter_map(|line| line.strip_prefix("0::"));
+    let path = paths
+        .next()
+        .ok_or(AttestationClientError::TransportUnavailable)?;
+    if paths.next().is_some()
+        || !path.starts_with('/')
+        || path.split('/').any(|part| part == "..")
+        || !path.ends_with(format!("/{unit}").as_str())
     {
         return Err(AttestationClientError::TransportUnavailable);
     }
-    Ok((unit_path.to_string(), control_group))
+    Ok(path.to_owned())
+}
+
+fn verify_system_bus_socket() -> Result<(), AttestationClientError> {
+    let socket = std::fs::symlink_metadata("/run/dbus/system_bus_socket")
+        .map_err(|_| AttestationClientError::TransportUnavailable)?;
+    let parent = std::fs::symlink_metadata("/run/dbus")
+        .map_err(|_| AttestationClientError::TransportUnavailable)?;
+    if !socket.file_type().is_socket()
+        || socket.uid() != 0
+        || !parent.is_dir()
+        || parent.uid() != 0
+        || parent.mode() & 0o022 != 0
+    {
+        return Err(AttestationClientError::TransportUnavailable);
+    }
+    Ok(())
 }
 
 fn send_packet(connection: &OwnedFd, bytes: &[u8]) -> Result<(), AttestationClientError> {
@@ -585,22 +671,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn producer_peer_pidfd_is_socket_bound_cloexec_and_fail_closed() {
-        let (client, producer) = seqpacket_pair();
-        let pidfd = socket_peer_pidfd(&client).expect("socket-bound producer pidfd");
-        require_live_pidfd(&pidfd).expect("producer remains live");
+    fn producer_pidfd_is_cloexec_and_fail_closed() {
+        let pidfd = open_pidfd(std::process::id() as libc::pid_t).expect("producer pidfd");
+        require_live_pidfd(&pidfd).expect("current process remains live");
         assert_ne!(
             unsafe { libc::fcntl(pidfd.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
             0
         );
-
-        let file = std::fs::File::open("/dev/null").expect("ordinary descriptor");
-        let file = OwnedFd::from(file);
         assert!(matches!(
-            socket_peer_pidfd(&file),
+            open_pidfd(i32::MAX),
             Err(AttestationClientError::TransportUnavailable)
         ));
-        drop(producer);
     }
 
     #[test]
@@ -616,54 +697,16 @@ mod tests {
     }
 
     #[test]
-    fn socket_bound_pidfd_reports_connected_peer_exit() {
-        let directory = tempfile::tempdir().expect("socket directory");
-        let socket_path = directory.path().join("producer.sock");
-        let listener =
-            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
-        assert!(listener >= 0);
-        let listener = unsafe { OwnedFd::from_raw_fd(listener) };
-        let (address, length) = unix_address(&socket_path).expect("socket address");
-        assert_eq!(
-            unsafe {
-                libc::bind(
-                    listener.as_raw_fd(),
-                    std::ptr::addr_of!(address).cast(),
-                    length,
-                )
-            },
-            0
-        );
-        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
-
+    fn producer_pidfd_reports_peer_exit() {
         let child = unsafe { libc::fork() };
         assert!(child >= 0);
         if child == 0 {
-            let client = unsafe {
-                libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0)
-            };
-            if client < 0
-                || unsafe { libc::connect(client, std::ptr::addr_of!(address).cast(), length) } != 0
-            {
-                unsafe { libc::_exit(2) };
-            }
             unsafe {
                 libc::pause();
                 libc::_exit(0);
             }
         }
-
-        let connection = unsafe {
-            libc::accept4(
-                listener.as_raw_fd(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                libc::SOCK_CLOEXEC,
-            )
-        };
-        assert!(connection >= 0);
-        let connection = unsafe { OwnedFd::from_raw_fd(connection) };
-        let pidfd = socket_peer_pidfd(&connection).expect("child peer pidfd");
+        let pidfd = open_pidfd(child).expect("child pidfd");
         require_live_pidfd(&pidfd).expect("child is live");
         assert_eq!(unsafe { libc::kill(child, libc::SIGKILL) }, 0);
         let mut status = 0;
