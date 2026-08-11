@@ -71,9 +71,14 @@
 - Add an immutable Linux/x64 PID 1 systemd pressure workflow for the complete execution-disabled
   V3 path. It binds the contract-selected Core source build and immutable Protocol dependency,
   proves signed admission plus exact cleanup, and exercises protected-installation drift, runtime
-  property drift, missing producer credentials, and crash-after-scope recovery. The workflow is
-  prepared but has not yet produced hosted evidence; local ARM64 systemd results remain the only
-  complete V3 candidate pressure at this stage.
+  property drift, missing producer credentials, and crash-after-scope recovery. Run
+  [31530832876](https://github.com/ota-run/authority-launcher/actions/runs/31530832876) binds exact
+  Protocol `574563d1f69a674960d0b3228c5a13b13bc42c19`, Launcher
+  `c69ad3afc6afef0e260a7eeaa4f7340971db50af`, and clean source-built Core
+  `31fa95b4d28a8a4971ee3fd65c841d40e54ac4d9`. Retained cursor-isolated evidence confirms exact
+  positive/recovery admission, pre-authorization refusal controls, terminal cleanup, a
+  byte-identical regular-file manifest, and no selected-work or `.ota` state. It does not claim
+  authorization, lease, execution, receipt/archive, or provider attestation.
 
 - In the preceding posture-only slice, advance the execution-disabled systemd service through one
   child transition. After

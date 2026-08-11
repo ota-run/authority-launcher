@@ -295,18 +295,28 @@ cleanup stage. The crash run records launcher exit `86` before fresh reconciliat
 not prove V3 attestation, broker authorization, lease consumption, selected execution, receipt or
 archive evidence, or provider-attested separation.
 
-The current uncommitted V3 candidate additionally passed local ARM64 OrbStack PID 1 systemd
-pressure through the complete protected collector and attestor. Core admitted the signed V3
+The committed V3 implementation additionally passed local ARM64 OrbStack PID 1 systemd pressure
+through the complete protected collector and attestor. Core admitted the signed V3
 profile and emitted the exact authorization request; the launcher withheld it, removed the exact
 scope/cgroup/child boundary, and finalized the active slot. Protected-installation drift, systemd
 runtime drift, and unavailable producer credentials refused with zero selected work. A forced exit
 after durable scope recording retained one recovery slot, and the next activation reconciled it to
 zero before accepting another request. The checkout sentinel, receipt store, broker decision/lease
-state, and terminal scope set remained empty. This is local candidate evidence only.
-The repository now also carries a dedicated immutable Linux/x64 workflow that repeats the
-positive, drift, unavailable-credential, and crash/recovery controls while binding the exact Core
-and Protocol revisions. That workflow is prepared but unrun and is not evidence until a retained
-green run exists.
+state, and terminal scope set remained empty.
+
+Immutable Linux/x64 PID 1 systemd run
+[31530832876](https://github.com/ota-run/authority-launcher/actions/runs/31530832876) repeats those
+controls against Protocol `574563d1f69a674960d0b3228c5a13b13bc42c19`, Launcher
+`c69ad3afc6afef0e260a7eeaa4f7340971db50af`, and clean source-built Core
+`31fa95b4d28a8a4971ee3fd65c841d40e54ac4d9`. Its cursor-isolated retained journals prove that
+installation drift, runtime-property drift, unavailable producer credentials, and the injected
+pre-session crash do not reach authorization. Positive and recovered invocations reach the exact
+authorization request, which remains withheld, then finish with the typed
+`attestation_admitted_before_authorization_boundary_removed` result. The artifact records one
+durable `scope_attached` crash slot, zero terminal slots/scopes, byte-identical repository
+manifests, no selected-work or `.ota` state, and only public verifier identity. This closes the
+hosted execution-disabled V3 admission gate only; it does not prove broker authorization, lease
+consumption, selected execution, crossing receipts/archives, or provider-attested separation.
 
 ## What belongs here
 
