@@ -252,7 +252,9 @@ jobs:
             exit 1
           fi
           capture_journal runtime-drift "$case_started"
-          grep -q 'effective runtime profile is unavailable or mismatched' \
+          grep -q 'bounded pressure systemd property mismatch name=ProtectSystem' \
+            "$EVIDENCE_DIR/runtime-drift.journal.txt"
+          grep -q 'bounded pressure bridge failure stage=systemd_runtime' \
             "$EVIDENCE_DIR/runtime-drift.journal.txt"
           assert_terminal_clean runtime-drift
           sudo rm /etc/systemd/system/ota-authority-launcher.service.d/zzzzzz-pressure-drift.conf
