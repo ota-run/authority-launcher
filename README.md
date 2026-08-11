@@ -60,7 +60,14 @@ path until the protected configuration and observation collector are wired and p
 The current collector foundation targets the additive
 `ota.authority-launcher.systemd/v2` profile, which keeps signing credentials exclusively in the
 producer service. It assembles only the canonical complete ordered profile and refuses an
-unavailable observation; concrete Linux observation probes are the next implementation gate.
+unavailable observation; the remaining concrete Linux observation probes are the next
+implementation gate.
+The systemd request path now implements the first of those live sources: it obtains a socket-bound
+close-on-exec pidfd for the job peer, reconciles its protected UID/GID mapping, and requires the
+peer's exact `/proc` identity slots, empty supplementary groups and inheritable/permitted/effective/
+ambient capabilities, and `NoNewPrivs=1` before repository or child preparation. That preflight is
+necessary but not sufficient: protected files, systemd properties, process containment, account and
+policy posture, target-principal access, and Ota process-access observations remain outstanding.
 
 The feature-gated `ota-authority-pressure-peer` binary is an exception for conformance testing
 only. It uses fixed public test keys and deterministic scenarios to exercise protocol v2 through a

@@ -25,4 +25,6 @@ pub mod attestation_client;
 #[cfg(feature = "protected-attestor")]
 pub mod attestor;
 #[cfg(target_os = "linux")]
+pub mod linux_observations;
+#[cfg(target_os = "linux")]
 pub mod observation_collector;

@@ -26,10 +26,17 @@
 
 ## Unreleased
 
+- Add the first live Linux job-peer observations for the separated producer path. The systemd
+  service now retains a socket-bound close-on-exec pidfd, reconciles the protected UID/GID mapping,
+  and requires exact live `/proc` UID/GID slots, empty supplementary groups and
+  inheritable/permitted/effective/ambient capabilities, and `NoNewPrivs=1` before repository
+  opening or child creation. The remaining closed-profile sources are still required before V3
+  evidence can be emitted.
+
 - Add the fail-closed closed-profile collector foundation for
   `ota.authority-launcher.systemd/v2`. It emits observations only in canonical Protocol order and
-  cannot represent a partial launcher or job-principal profile as verified. Concrete Linux probes
-  and producer invocation remain intentionally unwired.
+  cannot represent a partial launcher or job-principal profile as verified. The remaining Linux
+  probes and producer invocation remain intentionally unwired.
 
 - Add the execution-disabled protected V3 attestation producer foundation. The separate
   `ota-authority-attestor` Linux service consumes only its fixed root-owned `SOCK_SEQPACKET`

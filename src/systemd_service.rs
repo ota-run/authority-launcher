@@ -38,6 +38,10 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::time::Duration;
 
+use ota_authority_launcher::linux_observations::{
+    ObservedSessionPeer, observe_connected_peer, reconcile_connected_peer,
+    revalidate_connected_peer, verify_peer_process_status,
+};
 use ota_authority_protocol::{
     LAUNCHER_TERMINAL, LauncherInvocationRequestV1, LauncherTerminalFrameV1,
     LauncherTerminalOutcomeV1, LauncherTerminalStageV1, LauncherWorkingDirectoryV1,
@@ -48,8 +52,10 @@ use ota_authority_protocol::{
 use thiserror::Error;
 
 use crate::active_slot::{ActiveSlot, ActiveSlotError};
+#[cfg(test)]
+use crate::config::SessionPeer;
 use crate::config::{
-    SYSTEMD_AUTHORITY_LAUNCHER_CONFIG_PATH, SessionPeer, SystemdLauncherServiceConfigV1,
+    SYSTEMD_AUTHORITY_LAUNCHER_CONFIG_PATH, SystemdLauncherServiceConfigV1,
     load_systemd_launcher_service_config, systemd_principal_mapping, verify_protected_directory,
 };
 use crate::prepared_child::{
@@ -78,6 +84,8 @@ pub(crate) enum SystemdServiceError {
     InvalidRequest,
     #[error("the systemd launcher request peer is not mapped by protected configuration")]
     PeerUnmapped,
+    #[error("the systemd launcher request peer posture is unavailable")]
+    PeerPostureUnavailable,
     #[error("the systemd launcher repository path is outside protected allowed roots")]
     RepositoryOutsideAllowedRoots,
     #[error("the systemd launcher repository is unavailable to the configured execution principal")]
@@ -125,9 +133,13 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
         .set_write_timeout(Some(REQUEST_TIMEOUT))
         .map_err(|_| SystemdServiceError::ListenerUnavailable)?;
 
-    let peer = peer_credentials(&stream)?;
+    let peer =
+        observe_connected_peer(&stream).map_err(|_| SystemdServiceError::PeerPostureUnavailable)?;
     let request = receive_request(&mut stream, config.maximum_request_bytes)?;
-    let mapping = select_mapping(config, &request, peer)?;
+    let mapping = select_mapping(config, &request, &peer)?;
+    reconcile_connected_peer(&peer, mapping.job_peer.uid, mapping.job_peer.gid)
+        .map_err(|_| SystemdServiceError::PeerPostureUnavailable)?;
+    verify_peer_process_status(&peer).map_err(|_| SystemdServiceError::PeerPostureUnavailable)?;
     validate_requested_command(&request)?;
 
     // A random service-minted ID prevents the client from selecting a terminal carrier. The
@@ -237,20 +249,36 @@ fn prepare_disabled_child_boundary(
                 )
                 .map_err(map_prepared_child_error)?;
             let mut proxy = connect_protected_broker_proxy(config)?;
-            child
+            proxy.revalidate()?;
+            let bridge = child
                 .continue_and_bridge_v3_attestation(
                     &posture,
-                    &mut proxy,
+                    &mut proxy.stream,
                     Duration::from_secs(config.maximum_startup_seconds),
                 )
-                .map_err(map_prepared_child_error)
+                .map_err(map_prepared_child_error);
+            let peer = proxy.revalidate();
+            peer?;
+            bridge
         },
     )
 }
 
+struct ProtectedBrokerProxy {
+    stream: UnixStream,
+    peer: ObservedSessionPeer,
+}
+
+impl ProtectedBrokerProxy {
+    fn revalidate(&self) -> Result<(), SystemdServiceError> {
+        revalidate_connected_peer(&self.stream, &self.peer)
+            .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)
+    }
+}
+
 fn connect_protected_broker_proxy(
     config: &SystemdLauncherServiceConfigV1,
-) -> Result<UnixStream, SystemdServiceError> {
+) -> Result<ProtectedBrokerProxy, SystemdServiceError> {
     let path = config.broker_proxy_socket.as_path();
     let parent = path
         .parent()
@@ -272,9 +300,17 @@ fn connect_protected_broker_proxy(
     }
     let proxy =
         UnixStream::connect(path).map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
-    if peer_credentials(&proxy).map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?
-        != config.broker_proxy_peer
-    {
+    let peer = observe_connected_peer(&proxy)
+        .and_then(|peer| {
+            reconcile_connected_peer(
+                &peer,
+                config.broker_proxy_peer.uid,
+                config.broker_proxy_peer.gid,
+            )?;
+            Ok(peer)
+        })
+        .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
+    if peer.uid != 0 || peer.gid != 0 {
         return Err(SystemdServiceError::BrokerProxyUnavailable);
     }
     proxy
@@ -283,7 +319,12 @@ fn connect_protected_broker_proxy(
             proxy.set_write_timeout(Some(Duration::from_secs(config.maximum_startup_seconds)))
         })
         .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
-    Ok(proxy)
+    let guarded = ProtectedBrokerProxy {
+        stream: proxy,
+        peer,
+    };
+    guarded.revalidate()?;
+    Ok(guarded)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -717,39 +758,17 @@ fn receive_request(
 fn select_mapping<'a>(
     config: &'a SystemdLauncherServiceConfigV1,
     request: &LauncherInvocationRequestV1,
-    peer: SessionPeer,
+    peer: &ObservedSessionPeer,
 ) -> Result<&'a crate::config::SystemdPrincipalMappingV1, SystemdServiceError> {
     config
         .mappings
         .iter()
-        .find(|mapping| mapping.authority_id == request.authority_id && mapping.job_peer == peer)
+        .find(|mapping| {
+            mapping.authority_id == request.authority_id
+                && mapping.job_peer.uid == peer.uid
+                && mapping.job_peer.gid == peer.gid
+        })
         .ok_or(SystemdServiceError::PeerUnmapped)
-}
-
-fn peer_credentials(stream: &UnixStream) -> Result<SessionPeer, SystemdServiceError> {
-    let mut credentials = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: `credentials` is a valid writable buffer and the stream owns a connected socket.
-    let result = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut credentials as *mut libc::ucred).cast(),
-            &mut length,
-        )
-    };
-    if result != 0 || length != std::mem::size_of::<libc::ucred>() as libc::socklen_t {
-        return Err(SystemdServiceError::PeerUnmapped);
-    }
-    Ok(SessionPeer {
-        uid: credentials.uid,
-        gid: credentials.gid,
-    })
 }
 
 fn write_terminal(
