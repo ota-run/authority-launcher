@@ -185,13 +185,19 @@ jobs:
 
           capture_journal() {
             local case_name=$1
-            local since=$2
+            local cursor=$2
+            test -n "$cursor"
             sudo journalctl --no-pager \
-              --since "$since" \
+              --after-cursor "$cursor" \
               -u ota-authority-pressure-runner.service \
               -u ota-authority-launcher.service \
               -u ota-authority-attestor.service \
               | tee "$EVIDENCE_DIR/$case_name.journal.txt" >/dev/null
+          }
+
+          journal_cursor() {
+            sudo journalctl --no-pager -n 0 --show-cursor \
+              | sed -n 's/^-- cursor: //p'
           }
 
           reset_services() {
@@ -201,9 +207,9 @@ jobs:
 
           repository_manifest > "$EVIDENCE_DIR/repository.before.sha256"
 
-          case_started=$(date --utc '+%Y-%m-%dT%H:%M:%SZ')
+          case_cursor=$(journal_cursor)
           if ! sudo systemctl start ota-authority-pressure-runner.service; then
-            capture_journal positive-start-failure "$case_started"
+            capture_journal positive-start-failure "$case_cursor"
             systemctl show \
               ota-authority-pressure-runner.service \
               ota-authority-launcher.service \
@@ -211,13 +217,15 @@ jobs:
               > "$EVIDENCE_DIR/positive-start-failure.units.txt"
             exit 1
           fi
-          capture_journal positive "$case_started"
+          capture_journal positive "$case_cursor"
           grep -q 'bounded pressure v3 stage=startup_continuation_sent' "$EVIDENCE_DIR/positive.journal.txt"
           grep -q 'bounded pressure v3 stage=challenge_received' "$EVIDENCE_DIR/positive.journal.txt"
           grep -q 'bounded pressure v3 stage=challenge_validated' "$EVIDENCE_DIR/positive.journal.txt"
           grep -q 'bounded pressure v3 stage=attestation_produced' "$EVIDENCE_DIR/positive.journal.txt"
           grep -q 'bounded pressure v3 stage=attestation_sent' "$EVIDENCE_DIR/positive.journal.txt"
           grep -q 'bounded pressure v3 stage=authorization_received' "$EVIDENCE_DIR/positive.journal.txt"
+          grep -q '"stage": "attestation_admitted_before_authorization_boundary_removed"' \
+            "$EVIDENCE_DIR/positive.journal.txt"
           assert_terminal_clean positive
           test "$(systemctl show ota-authority-pressure-runner.service -p Result --value)" = success
           test "$(systemctl is-active ota-authority-attestor.service || true)" != active
@@ -225,14 +233,19 @@ jobs:
           reset_services
           sudo cp /usr/lib/ota-authority/bin/ota-authority-attestor "$RUNNER_TEMP/attestor.clean"
           printf drift | sudo tee -a /usr/lib/ota-authority/bin/ota-authority-attestor >/dev/null
-          case_started=$(date --utc '+%Y-%m-%dT%H:%M:%SZ')
+          case_cursor=$(journal_cursor)
           if sudo systemctl start ota-authority-pressure-runner.service; then
             echo 'installation drift unexpectedly passed' >&2
             exit 1
           fi
-          capture_journal installation-drift "$case_started"
+          capture_journal installation-drift "$case_cursor"
           grep -q 'installation identity is unavailable or mismatched' \
             "$EVIDENCE_DIR/installation-drift.journal.txt"
+          if grep -q 'bounded pressure v3 stage=authorization_received' \
+            "$EVIDENCE_DIR/installation-drift.journal.txt"; then
+            echo 'installation drift reached authorization unexpectedly' >&2
+            exit 1
+          fi
           assert_terminal_clean installation-drift
           sudo install -o root -g root -m 0755 "$RUNNER_TEMP/attestor.clean" \
             /usr/lib/ota-authority/bin/ota-authority-attestor
@@ -246,16 +259,21 @@ jobs:
           ProtectSystem=full
           UNIT
           sudo systemctl daemon-reload
-          case_started=$(date --utc '+%Y-%m-%dT%H:%M:%SZ')
+          case_cursor=$(journal_cursor)
           if sudo systemctl start ota-authority-pressure-runner.service; then
             echo 'systemd runtime drift unexpectedly passed' >&2
             exit 1
           fi
-          capture_journal runtime-drift "$case_started"
+          capture_journal runtime-drift "$case_cursor"
           grep -q 'bounded pressure systemd property mismatch name=ProtectSystem' \
             "$EVIDENCE_DIR/runtime-drift.journal.txt"
           grep -q 'bounded pressure bridge failure stage=systemd_runtime' \
             "$EVIDENCE_DIR/runtime-drift.journal.txt"
+          if grep -q 'bounded pressure v3 stage=authorization_received' \
+            "$EVIDENCE_DIR/runtime-drift.journal.txt"; then
+            echo 'systemd runtime drift reached authorization unexpectedly' >&2
+            exit 1
+          fi
           assert_terminal_clean runtime-drift
           sudo rm /etc/systemd/system/ota-authority-launcher.service.d/zzzzzz-pressure-drift.conf
           sudo systemctl daemon-reload
@@ -263,14 +281,19 @@ jobs:
           reset_services
           sudo mv /var/lib/ota/authority-attestor-signing-key \
             /var/lib/ota/authority-attestor-signing-key.unavailable
-          case_started=$(date --utc '+%Y-%m-%dT%H:%M:%SZ')
+          case_cursor=$(journal_cursor)
           if sudo systemctl start ota-authority-pressure-runner.service; then
             echo 'missing producer credential unexpectedly passed' >&2
             exit 1
           fi
-          capture_journal missing-credential "$case_started"
+          capture_journal missing-credential "$case_cursor"
           grep -Eq 'credential|Pre-authorization protocol|protocol bridge' \
             "$EVIDENCE_DIR/missing-credential.journal.txt"
+          if grep -q 'bounded pressure v3 stage=authorization_received' \
+            "$EVIDENCE_DIR/missing-credential.journal.txt"; then
+            echo 'missing producer credential reached authorization unexpectedly' >&2
+            exit 1
+          fi
           assert_terminal_clean missing-credential
           sudo mv /var/lib/ota/authority-attestor-signing-key.unavailable \
             /var/lib/ota/authority-attestor-signing-key
@@ -279,12 +302,17 @@ jobs:
           sudo install -d -o root -g root -m 0755 /run/ota
           sudo install -o root -g root -m 0600 /dev/null \
             /run/ota/authority-launcher-pressure-exit-after-scope
-          case_started=$(date --utc '+%Y-%m-%dT%H:%M:%SZ')
+          case_cursor=$(journal_cursor)
           if sudo systemctl start ota-authority-pressure-runner.service; then
             echo 'crash injection unexpectedly completed' >&2
             exit 1
           fi
-          capture_journal crash-first "$case_started"
+          capture_journal crash-first "$case_cursor"
+          if grep -q 'bounded pressure v3 stage=authorization_received' \
+            "$EVIDENCE_DIR/crash-first.journal.txt"; then
+            echo 'crash injection reached authorization unexpectedly' >&2
+            exit 1
+          fi
           test "$(systemctl show ota-authority-launcher.service -p ExecMainStatus --value)" = 86
           crash_slots=$(sudo find /var/lib/ota/authority-launcher/active -mindepth 1 -maxdepth 1 -type f | wc -l)
           printf 'active_slots=%s\n' "$crash_slots" > "$EVIDENCE_DIR/crash-first.boundary.txt"
@@ -297,9 +325,9 @@ jobs:
           test ! -e "$PRESSURE_REPOSITORY/selected-work-must-not-exist"
 
           sudo systemctl reset-failed
-          case_started=$(date --utc '+%Y-%m-%dT%H:%M:%SZ')
+          case_cursor=$(journal_cursor)
           if ! sudo systemctl start ota-authority-pressure-runner.service; then
-            capture_journal crash-recovery-start-failure "$case_started"
+            capture_journal crash-recovery-start-failure "$case_cursor"
             systemctl show \
               ota-authority-pressure-runner.service \
               ota-authority-launcher.service \
@@ -307,7 +335,7 @@ jobs:
               > "$EVIDENCE_DIR/crash-recovery-start-failure.units.txt"
             exit 1
           fi
-          capture_journal crash-recovery "$case_started"
+          capture_journal crash-recovery "$case_cursor"
           grep -q 'bounded pressure v3 stage=authorization_received' \
             "$EVIDENCE_DIR/crash-recovery.journal.txt"
           assert_terminal_clean crash-recovery
