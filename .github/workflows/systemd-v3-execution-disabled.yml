@@ -196,10 +196,7 @@ jobs:
 
           reset_services() {
             sudo systemctl stop ota-authority-launcher.service ota-authority-attestor.service || true
-            sudo systemctl reset-failed \
-              ota-authority-pressure-runner.service \
-              ota-authority-launcher.service \
-              ota-authority-attestor.service
+            sudo systemctl reset-failed
           }
 
           repository_manifest > "$EVIDENCE_DIR/repository.before.sha256"
@@ -289,9 +286,7 @@ jobs:
             "$EVIDENCE_DIR/crash-first.active-slot.json"
           test ! -e "$PRESSURE_REPOSITORY/selected-work-must-not-exist"
 
-          sudo systemctl reset-failed \
-            ota-authority-pressure-runner.service \
-            ota-authority-launcher.service
+          sudo systemctl reset-failed
           case_started=$(date --utc '+%Y-%m-%dT%H:%M:%SZ')
           sudo systemctl start ota-authority-pressure-runner.service
           capture_journal crash-recovery "$case_started"
