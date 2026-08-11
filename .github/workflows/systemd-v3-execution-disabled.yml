@@ -204,7 +204,7 @@ jobs:
 
           repository_manifest > "$EVIDENCE_DIR/repository.before.sha256"
 
-          case_started=$(date --iso-8601=ns)
+          case_started=$(date --utc '+%Y-%m-%dT%H:%M:%SZ')
           sudo systemctl start ota-authority-pressure-runner.service
           capture_journal positive "$case_started"
           grep -q 'bounded pressure v3 stage=startup_continuation_sent' "$EVIDENCE_DIR/positive.journal.txt"
@@ -220,7 +220,7 @@ jobs:
           reset_services
           sudo cp /usr/lib/ota-authority/bin/ota-authority-attestor "$RUNNER_TEMP/attestor.clean"
           printf drift | sudo tee -a /usr/lib/ota-authority/bin/ota-authority-attestor >/dev/null
-          case_started=$(date --iso-8601=ns)
+          case_started=$(date --utc '+%Y-%m-%dT%H:%M:%SZ')
           if sudo systemctl start ota-authority-pressure-runner.service; then
             echo 'installation drift unexpectedly passed' >&2
             exit 1
@@ -241,7 +241,7 @@ jobs:
           ProtectSystem=full
           UNIT
           sudo systemctl daemon-reload
-          case_started=$(date --iso-8601=ns)
+          case_started=$(date --utc '+%Y-%m-%dT%H:%M:%SZ')
           if sudo systemctl start ota-authority-pressure-runner.service; then
             echo 'systemd runtime drift unexpectedly passed' >&2
             exit 1
@@ -256,7 +256,7 @@ jobs:
           reset_services
           sudo mv /var/lib/ota/authority-attestor-signing-key \
             /var/lib/ota/authority-attestor-signing-key.unavailable
-          case_started=$(date --iso-8601=ns)
+          case_started=$(date --utc '+%Y-%m-%dT%H:%M:%SZ')
           if sudo systemctl start ota-authority-pressure-runner.service; then
             echo 'missing producer credential unexpectedly passed' >&2
             exit 1
@@ -272,7 +272,7 @@ jobs:
           sudo install -d -o root -g root -m 0755 /run/ota
           sudo install -o root -g root -m 0600 /dev/null \
             /run/ota/authority-launcher-pressure-exit-after-scope
-          case_started=$(date --iso-8601=ns)
+          case_started=$(date --utc '+%Y-%m-%dT%H:%M:%SZ')
           if sudo systemctl start ota-authority-pressure-runner.service; then
             echo 'crash injection unexpectedly completed' >&2
             exit 1
@@ -292,7 +292,7 @@ jobs:
           sudo systemctl reset-failed \
             ota-authority-pressure-runner.service \
             ota-authority-launcher.service
-          case_started=$(date --iso-8601=ns)
+          case_started=$(date --utc '+%Y-%m-%dT%H:%M:%SZ')
           sudo systemctl start ota-authority-pressure-runner.service
           capture_journal crash-recovery "$case_started"
           grep -q 'bounded pressure v3 stage=authorization_received' \
