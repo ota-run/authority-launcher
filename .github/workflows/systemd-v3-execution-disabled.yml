@@ -202,7 +202,15 @@ jobs:
           repository_manifest > "$EVIDENCE_DIR/repository.before.sha256"
 
           case_started=$(date --utc '+%Y-%m-%dT%H:%M:%SZ')
-          sudo systemctl start ota-authority-pressure-runner.service
+          if ! sudo systemctl start ota-authority-pressure-runner.service; then
+            capture_journal positive-start-failure "$case_started"
+            systemctl show \
+              ota-authority-pressure-runner.service \
+              ota-authority-launcher.service \
+              ota-authority-attestor.service \
+              > "$EVIDENCE_DIR/positive-start-failure.units.txt"
+            exit 1
+          fi
           capture_journal positive "$case_started"
           grep -q 'bounded pressure v3 stage=startup_continuation_sent' "$EVIDENCE_DIR/positive.journal.txt"
           grep -q 'bounded pressure v3 stage=challenge_received' "$EVIDENCE_DIR/positive.journal.txt"
@@ -288,7 +296,15 @@ jobs:
 
           sudo systemctl reset-failed
           case_started=$(date --utc '+%Y-%m-%dT%H:%M:%SZ')
-          sudo systemctl start ota-authority-pressure-runner.service
+          if ! sudo systemctl start ota-authority-pressure-runner.service; then
+            capture_journal crash-recovery-start-failure "$case_started"
+            systemctl show \
+              ota-authority-pressure-runner.service \
+              ota-authority-launcher.service \
+              ota-authority-attestor.service \
+              > "$EVIDENCE_DIR/crash-recovery-start-failure.units.txt"
+            exit 1
+          fi
           capture_journal crash-recovery "$case_started"
           grep -q 'bounded pressure v3 stage=authorization_received' \
             "$EVIDENCE_DIR/crash-recovery.journal.txt"
