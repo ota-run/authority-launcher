@@ -57,6 +57,10 @@ The production launcher does **not yet** collect the complete closed job-princip
 or invoke that producer. It therefore still does not emit a real V3 attestation, connect to a
 remote broker, or make authorization decisions. The producer foundation is not a usable authority
 path until the protected configuration and observation collector are wired and pressure-proven.
+The current collector foundation targets the additive
+`ota.authority-launcher.systemd/v2` profile, which keeps signing credentials exclusively in the
+producer service. It assembles only the canonical complete ordered profile and refuses an
+unavailable observation; concrete Linux observation probes are the next implementation gate.
 
 The feature-gated `ota-authority-pressure-peer` binary is an exception for conformance testing
 only. It uses fixed public test keys and deterministic scenarios to exercise protocol v2 through a

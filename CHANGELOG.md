@@ -26,6 +26,11 @@
 
 ## Unreleased
 
+- Add the fail-closed closed-profile collector foundation for
+  `ota.authority-launcher.systemd/v2`. It emits observations only in canonical Protocol order and
+  cannot represent a partial launcher or job-principal profile as verified. Concrete Linux probes
+  and producer invocation remain intentionally unwired.
+
 - Add the execution-disabled protected V3 attestation producer foundation. The separate
   `ota-authority-attestor` Linux service consumes only its fixed root-owned `SOCK_SEQPACKET`
   listener, verifies the live root launcher peer and protected binding, owns the signing credential
