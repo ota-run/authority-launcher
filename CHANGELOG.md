@@ -26,6 +26,10 @@
 
 ## Unreleased
 
+- Verify protected producer freshness at response receipt rather than before transport. A signed
+  response issued across a whole-second boundary can no longer be rejected against a stale
+  pre-request clock sample during crash recovery.
+
 - Add the first live Linux job-peer observations for the separated producer path. The systemd
   service now retains a socket-bound close-on-exec pidfd, reconciles the protected UID/GID mapping,
   and requires exact live `/proc` UID/GID slots, empty supplementary groups and

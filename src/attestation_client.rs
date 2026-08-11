@@ -89,7 +89,6 @@ pub fn load_producer_binding()
 pub fn request_attestation(
     binding: &LauncherAttestationProducerBindingV1,
     request: &LauncherAttestationSigningRequestV1,
-    now: OffsetDateTime,
 ) -> Result<LauncherAttestationSigningResponseV1, AttestationClientError> {
     validate_launcher_attestation_signing_request_v1(request)
         .map_err(|_| AttestationClientError::InvalidResponse)?;
@@ -119,7 +118,7 @@ pub fn request_attestation(
     }
     pressure_client_stage(
         "response_verify",
-        verify_response(binding, request, &response, now),
+        verify_response(binding, request, &response, OffsetDateTime::now_utc()),
     )?;
     pressure_client_stage(
         "producer_after_verify",

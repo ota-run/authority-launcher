@@ -1133,6 +1133,15 @@ mod tests {
             .expect("signature verifies");
         #[cfg(feature = "protected-attestor-client")]
         {
+            assert_eq!(
+                crate::attestation_client::verify_response(
+                    &binding,
+                    &request,
+                    &first,
+                    now - time::Duration::seconds(1),
+                ),
+                Err(crate::attestation_client::AttestationClientError::InvalidResponse)
+            );
             crate::attestation_client::verify_response(
                 &binding,
                 &request,

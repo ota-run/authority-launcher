@@ -435,12 +435,9 @@ fn produce_attestation(
     };
     request.request_identity = launcher_attestation_signing_request_v1_identity(&request)
         .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
-    let response = ota_authority_launcher::attestation_client::request_attestation(
-        &producer,
-        &request,
-        time::OffsetDateTime::now_utc(),
-    )
-    .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    let response =
+        ota_authority_launcher::attestation_client::request_attestation(&producer, &request)
+            .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
     Ok(response.attestation)
 }
 
