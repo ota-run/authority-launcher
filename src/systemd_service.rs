@@ -249,17 +249,15 @@ fn prepare_disabled_child_boundary(
                 )
                 .map_err(map_prepared_child_error)?;
             let mut proxy = connect_protected_broker_proxy(config)?;
-            proxy.revalidate()?;
-            let bridge = child
-                .continue_and_bridge_v3_attestation(
-                    &posture,
-                    &mut proxy.stream,
-                    Duration::from_secs(config.maximum_startup_seconds),
-                )
-                .map_err(map_prepared_child_error);
-            let peer = proxy.revalidate();
-            peer?;
-            bridge
+            proxy.run_revalidated(|stream| {
+                child
+                    .continue_and_bridge_v3_attestation(
+                        &posture,
+                        stream,
+                        Duration::from_secs(config.maximum_startup_seconds),
+                    )
+                    .map_err(map_prepared_child_error)
+            })
         },
     )
 }
@@ -273,6 +271,16 @@ impl ProtectedBrokerProxy {
     fn revalidate(&self) -> Result<(), SystemdServiceError> {
         revalidate_connected_peer(&self.stream, &self.peer)
             .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)
+    }
+
+    fn run_revalidated<T>(
+        &mut self,
+        operation: impl FnOnce(&mut UnixStream) -> Result<T, SystemdServiceError>,
+    ) -> Result<T, SystemdServiceError> {
+        self.revalidate()?;
+        let result = operation(&mut self.stream);
+        self.revalidate()?;
+        result
     }
 }
 
@@ -882,6 +890,45 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn protected_broker_proxy_refuses_peer_exit_during_bridge() {
+        let temporary = tempdir().expect("temporary broker socket directory");
+        let socket_path = temporary.path().join("broker.sock");
+        let listener = UnixListener::bind(&socket_path).expect("broker listener");
+
+        let peer_pid = unsafe { libc::fork() };
+        assert!(peer_pid >= 0, "fork must succeed");
+        if peer_pid == 0 {
+            drop(listener);
+            let result = UnixStream::connect(&socket_path).and_then(|mut stream| {
+                stream.write_all(b"ready")?;
+                unsafe { libc::pause() };
+                Ok(())
+            });
+            unsafe { libc::_exit(if result.is_ok() { 0 } else { 90 }) };
+        }
+
+        let (mut stream, _) = listener.accept().expect("accepted broker peer");
+        let mut ready = [0_u8; 5];
+        stream.read_exact(&mut ready).expect("broker peer ready");
+        assert_eq!(&ready, b"ready");
+        let peer = observe_connected_peer(&stream).expect("guarded broker peer");
+        let mut proxy = ProtectedBrokerProxy { stream, peer };
+
+        let result = proxy.run_revalidated(|_| {
+            unsafe {
+                libc::kill(peer_pid, libc::SIGKILL);
+                libc::waitpid(peer_pid, std::ptr::null_mut(), 0);
+            }
+            Ok(())
+        });
+
+        assert!(matches!(
+            result,
+            Err(SystemdServiceError::BrokerProxyUnavailable)
+        ));
+    }
 
     #[cfg(feature = "systemd-pressure-faults")]
     #[test]
