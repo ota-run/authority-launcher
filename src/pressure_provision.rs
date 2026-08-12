@@ -98,6 +98,8 @@ const ORBSTACK_GLOBAL_SERVICE_DROP_IN: &str = "/run/systemd/system/service.d/zzz
 const INVOCATION_SLICE: &str = "/etc/systemd/system/ota-authority-invocations.slice";
 const NON_LOGIN_SHELL: &str = "/usr/sbin/nologin";
 const PRESSURE_BROKER_ORIGIN: &str = "https://pressure.invalid";
+// Cover the one-second approval window, the 30-second lease ceiling, and scheduling margin.
+const ATTESTATION_VALIDITY_SECONDS: u64 = 60;
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const PKCHECK: &str = "/usr/bin/pkcheck";
 const POLKIT_RULE: &str = "/etc/polkit-1/rules.d/00-ota-authority-deny.rules";
@@ -350,7 +352,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         attestation_claims: Some(SystemdAttestationClaimsConfigV1 {
             authenticated_origin: String::from(PRESSURE_BROKER_ORIGIN),
             authority_mounts: vec![String::from("protected-system-authority-store")],
-            requested_maximum_validity_seconds: 30,
+            requested_maximum_validity_seconds: ATTESTATION_VALIDITY_SECONDS,
         }),
         maximum_request_bytes: 64 * 1024,
         maximum_active_sessions: 1,
@@ -384,8 +386,8 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         signing_key_not_after: format_time(now + time::Duration::days(7))?,
         issuer: String::from("systemd-launcher"),
         audience: String::from("ota-crossing-broker"),
-        maximum_attestation_age_seconds: 30,
-        verifier_maximum_age_seconds: 30,
+        maximum_attestation_age_seconds: ATTESTATION_VALIDITY_SECONDS,
+        verifier_maximum_age_seconds: ATTESTATION_VALIDITY_SECONDS,
         maximum_request_bytes: 64 * 1024,
         read_write_timeout_seconds: 10,
         issuance_state_directory: String::from(ISSUANCE_STATE),
@@ -446,7 +448,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
                 "algorithm": "ed25519",
                 "public_key": public_key
             }],
-            "maximum_age_seconds": 30,
+            "maximum_age_seconds": ATTESTATION_VALIDITY_SECONDS,
             "maximum_clock_skew_seconds": 5,
             "key_rotation_overlap_seconds": 60
         },
@@ -983,7 +985,7 @@ mod tests {
         let attestation_claims = SystemdAttestationClaimsConfigV1 {
             authenticated_origin: String::from(PRESSURE_BROKER_ORIGIN),
             authority_mounts: vec![String::from("protected-system-authority-store")],
-            requested_maximum_validity_seconds: 30,
+            requested_maximum_validity_seconds: ATTESTATION_VALIDITY_SECONDS,
         };
         let broker_binding = json!({ "origin": PRESSURE_BROKER_ORIGIN });
 

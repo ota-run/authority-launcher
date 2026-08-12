@@ -54,8 +54,7 @@ mod linux {
     const CREDENTIAL_NAME: &str = "ota-broker-ed25519";
     const KEY_ID: &str = "systemd-broker-pressure-v1";
     const SCENARIO_PATH: &str = "/run/ota/authority-broker-pressure-scenario";
-    // The launcher attestation is valid for 30 seconds. Leave a fixed margin because lease
-    // issuance follows attestation and Core correctly refuses a lease that outlives it.
+    // Keep the pressure lease below both the configured lease ceiling and attestation lifetime.
     const LEASE_VALIDITY_SECONDS: i64 = 20;
 
     pub(super) fn run() -> Result<(), String> {
