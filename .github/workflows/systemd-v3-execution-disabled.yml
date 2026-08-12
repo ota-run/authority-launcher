@@ -54,6 +54,7 @@ jobs:
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/systemd-v3-evidence
           EXPECTED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
+          EXPECTED_PROTOCOL_REVISION: 6a92d8db9d089e44d1980f1871bf6e90eccb9960
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR"
@@ -71,10 +72,8 @@ jobs:
             select(.name == "ota-authority-protocol") |
             .source
           ' "$EVIDENCE_DIR/cargo-metadata.json")
-          case "$protocol_source" in
-            git+https://github.com/ota-run/authority-protocol.git\?rev=*#*) ;;
-            *) echo "authority protocol is not pinned to an immutable git revision" >&2; exit 1 ;;
-          esac
+          test "$protocol_source" = \
+            "git+https://github.com/ota-run/authority-protocol?rev=${EXPECTED_PROTOCOL_REVISION}#${EXPECTED_PROTOCOL_REVISION}"
 
       - name: Build exact pressure binaries
         run: |
