@@ -625,16 +625,20 @@ jobs:
           sudo tee /etc/systemd/system/ota-authority-launcher.service.d/zzzzzz-pressure-drift.conf \
             >/dev/null <<'UNIT'
           [Service]
-          ProtectSystem=full
+          MemoryDenyWriteExecute=yes
           UNIT
           sudo systemctl daemon-reload
+          systemctl show ota-authority-launcher.service \
+            -p MemoryDenyWriteExecute --value \
+            | tee "$EVIDENCE_DIR/runtime-drift.effective.txt" >/dev/null
+          grep -qx 'yes' "$EVIDENCE_DIR/runtime-drift.effective.txt"
           case_cursor=$(journal_cursor)
           if sudo systemctl start ota-authority-pressure-runner.service; then
             echo 'systemd runtime drift unexpectedly passed' >&2
             exit 1
           fi
           capture_journal runtime-drift "$case_cursor"
-          grep -q 'bounded pressure systemd property mismatch name=ProtectSystem' \
+          grep -q 'bounded pressure systemd property mismatch name=MemoryDenyWriteExecute' \
             "$EVIDENCE_DIR/runtime-drift.journal.txt"
           grep -q 'bounded pressure bridge failure stage=systemd_runtime' \
             "$EVIDENCE_DIR/runtime-drift.journal.txt"
