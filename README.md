@@ -271,9 +271,9 @@ consume a lease, execute repository work, or create crossing receipt/archive evi
 `ota-authority-attestor` receives the systemd-delivered
 signing credential; the launcher retains public verification truth only. Missing, malformed,
 oversized, self-inconsistent, or substituted posture, continuation, challenge, attestation, or
-authorization decision/admission fails closed and enters the same exact cleanup path. The new
-decision path remains a candidate until immutable Linux/x64 PID 1 systemd pressure passes and does
-not establish provider-attested separation.
+authorization decision/admission fails closed and enters the same exact cleanup path. The decision
+path has passed immutable Linux/x64 PID 1 systemd pressure, but does not establish provider-attested
+separation.
 
 The feature-gated `ota-authority-systemd-pressure-client` is the unprivileged side of that positive
 kernel proof. It connects only to `/run/ota/authority-launcher.sock`, submits one bounded
@@ -329,12 +329,14 @@ manifests, no selected-work or `.ota` state, and only public verifier identity. 
 hosted execution-disabled V3 admission gate only; it does not prove broker authorization, lease
 consumption, selected execution, crossing receipts/archives, or provider-attested separation.
 
-The current uncommitted follow-on replaces the withheld-request endpoint with a feature-gated,
-root-owned signed-decision pressure peer. Its hosted matrix is prepared to distinguish allowed,
-denied, stale, wrong-scope, timed-out pending, ambiguous, and unavailable-proxy outcomes, while
-requiring zero selected-work, receipt, active-slot, or transient-scope residue. Until that matrix is
-green against immutable Protocol, Launcher, and Core revisions, signed decision relay remains local
-implementation evidence rather than completed pressure evidence.
+Immutable Linux/x64 PID 1 systemd run
+[31561247605](https://github.com/ota-run/authority-launcher/actions/runs/31561247605) proves the
+follow-on signed-decision boundary against exact Protocol
+`6a92d8db9d089e44d1980f1871bf6e90eccb9960`, Launcher
+`77ab20aa6ed5e3dd42cc6815ba2de7cd36d543bf`, and clean source-built Core
+`b71b78ca33ea2edd7bb03ceb66c5e1e104217cd9`. It distinguishes allowed, denied, stale, wrong-scope,
+timed-out pending, ambiguous, unavailable-proxy, protected-installation/runtime drift, and missing
+credential outcomes while requiring zero terminal active-slot or transient-scope residue.
 
 The pressure peer emits bounded scenario, ordinal, decision, and decision-identity checkpoints. The
 launcher verifies the live pidfd-bound broker executable before and after relay traffic, and emits
@@ -344,8 +346,14 @@ broker responses and broker verifier binding, allowing the signed decision and C
 identities to be re-verified after cleanup without retaining either signing key. Stale and
 wrong-scope controls require zero acknowledgements; timeout requires exactly one acknowledged
 pending decision; ambiguity requires two signed pending responses but exactly one acknowledgement.
-The prepared matrix also crashes after durable allowed-decision recording and requires startup
-reconciliation to remove that exact slot, child, cgroup, and scope before a fresh request proceeds.
+The matrix also crashes after durable scope and allowed-decision recording and requires startup
+reconciliation to remove each exact slot, child, cgroup, and scope before a fresh request proceeds.
+Artifact inspection independently re-verifies all eight public signed decisions and all five relay
+and admission identities. Fourteen complete before/after repository manifests are byte-identical,
+and no selected-work, `.ota`, lease, receipt, archive, private-key, or credential residue exists.
+This closes only execution-disabled signed-decision admission and cleanup pressure. One-use lease
+consumption, selected execution, crossing receipt/archive evidence, independently administered
+provider/launcher separation, and provider attestation remain open.
 
 ## What belongs here
 

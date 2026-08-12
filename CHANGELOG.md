@@ -36,16 +36,22 @@
   stale, wrong-scope, ambiguous, timed-out, or unavailable broker responses remain typed bounded
   refusals. No lease is issued or consumed, no selected work runs, and no receipt/archive is made.
 - Add the pressure-only signed decision peer and scenario-specific pressure-client terminal
-  expectations. The prepared immutable Linux/x64 workflow covers allowed, denied, stale,
+  expectations. Immutable Linux/x64 PID 1 systemd run
+  [31561247605](https://github.com/ota-run/authority-launcher/actions/runs/31561247605), against exact
+  Protocol `6a92d8db9d089e44d1980f1871bf6e90eccb9960`, Launcher
+  `77ab20aa6ed5e3dd42cc6815ba2de7cd36d543bf`, and clean source-built Core
+  `b71b78ca33ea2edd7bb03ceb66c5e1e104217cd9`, covers allowed, denied, stale,
   wrong-scope, pending-timeout, ambiguous, and unavailable-proxy cases with repository and cleanup
   controls. Each negative case requires its exact signed peer checkpoint and acknowledgement count
   rather than accepting a generic protocol refusal. Artifacts retain each public signed decision,
   the public broker verifier binding, and complete bounded relay envelopes for independent
   re-verification. A pressure-only crash after durable decision recording proves cleanup-only
   recovery before a fresh request, and every decision scenario compares its complete repository
-  manifest before and after. This is not
-  production broker implementation or hosted evidence until that workflow is committed and green
-  against immutable revisions.
+  manifest before and after. Retained evidence independently re-verifies the public signed
+  decisions and relay/admission identities, while every terminal case has zero active slots/scopes
+  and no selected-work, `.ota`, lease, receipt, archive, private-key, or credential residue. This is
+  execution-disabled hosted pressure, not production lease consumption, selected execution,
+  crossing evidence, or provider-attested separation.
 - Run every hosted decision scenario through the same manifest-bound, hardened systemd client
   unit. Its observed-outcome mode accepts only the three execution-disabled decision terminals;
   the workflow still requires each scenario's exact terminal, signed broker checkpoints, relay
