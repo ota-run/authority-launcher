@@ -54,6 +54,9 @@ mod linux {
     const CREDENTIAL_NAME: &str = "ota-broker-ed25519";
     const KEY_ID: &str = "systemd-broker-pressure-v1";
     const SCENARIO_PATH: &str = "/run/ota/authority-broker-pressure-scenario";
+    // The launcher attestation is valid for 30 seconds. Leave a fixed margin because lease
+    // issuance follows attestation and Core correctly refuses a lease that outlives it.
+    const LEASE_VALIDITY_SECONDS: i64 = 20;
 
     pub(super) fn run() -> Result<(), String> {
         let expected_pid = unsafe { libc::getpid() }.to_string();
@@ -268,7 +271,7 @@ mod linux {
                 broker_revision: 1,
                 lease_sequence: 1,
                 issued_at: decision.payload.issued_at.clone(),
-                expires_at: decision.payload.expires_at.clone(),
+                expires_at: lease_expiration(&decision.payload.issued_at)?,
             },
         )?;
         let lease_identity = message_identity(LEASE_ISSUANCE_DOMAIN_V1.as_bytes(), &lease)
@@ -304,6 +307,14 @@ mod linux {
         write_frame(stream, &response)?;
         eprintln!("ota-authority-systemd-decision-peer: bounded pressure lease_consumed_relayed");
         Ok(())
+    }
+
+    fn lease_expiration(issued_at: &str) -> Result<String, String> {
+        (OffsetDateTime::parse(issued_at, &Rfc3339)
+            .map_err(|_| String::from("decision peer lease clock is invalid"))?
+            + time::Duration::seconds(LEASE_VALIDITY_SECONDS))
+        .format(&Rfc3339)
+        .map_err(|_| String::from("decision peer lease clock format failed"))
     }
 
     fn read_frame<T: serde::de::DeserializeOwned>(stream: &mut impl Read) -> Result<T, String> {
@@ -345,6 +356,19 @@ mod linux {
             return Err(String::from("decision peer listener is invalid"));
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn pressure_lease_keeps_a_fixed_attestation_margin() {
+            assert_eq!(
+                lease_expiration("2026-08-12T12:00:00Z").expect("lease expiration"),
+                "2026-08-12T12:00:20Z"
+            );
+        }
     }
 }
 
