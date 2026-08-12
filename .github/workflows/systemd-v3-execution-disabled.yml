@@ -496,7 +496,17 @@ jobs:
           extract_relay_evidence ambiguous 1 pending
 
           reset_services
-          sudo systemctl stop ota-authority-broker-proxy.socket
+          sudo install -d -o root -g root -m 0755 \
+            /run/systemd/system/ota-authority-broker-proxy.service.d
+          sudo tee \
+            /run/systemd/system/ota-authority-broker-proxy.service.d/zzzz-pressure-unavailable.conf \
+            >/dev/null <<'UNIT'
+          [Service]
+          ExecStart=
+          ExecStart=/usr/bin/false
+          UNIT
+          sudo systemctl daemon-reload
+          sudo systemctl start ota-authority-broker-proxy.socket
           repository_manifest > "$EVIDENCE_DIR/missing-broker.repository.before.sha256"
           case_cursor=$(journal_cursor)
           if ! sudo systemctl start ota-authority-pressure-runner.service; then
@@ -528,11 +538,19 @@ jobs:
           assert_count 0 'bounded pressure v3 stage=authorization_decision_relayed' \
             "$EVIDENCE_DIR/missing-broker.journal.txt"
           extract_relay_evidence missing-broker 0
+          systemctl show ota-authority-broker-proxy.service \
+            > "$EVIDENCE_DIR/missing-broker.units.txt"
+          grep -q 'ExecStart={ path=/usr/bin/false ' \
+            "$EVIDENCE_DIR/missing-broker.units.txt"
+          grep -q '^ExecMainStatus=1$' "$EVIDENCE_DIR/missing-broker.units.txt"
           assert_terminal_clean missing-broker
           repository_manifest > "$EVIDENCE_DIR/missing-broker.repository.after.sha256"
           diff -u "$EVIDENCE_DIR/missing-broker.repository.before.sha256" \
             "$EVIDENCE_DIR/missing-broker.repository.after.sha256"
-          sudo systemctl start ota-authority-broker-proxy.socket
+          sudo rm \
+            /run/systemd/system/ota-authority-broker-proxy.service.d/zzzz-pressure-unavailable.conf
+          sudo systemctl daemon-reload
+          sudo systemctl reset-failed ota-authority-broker-proxy.service
           set_broker_scenario allowed
 
           reset_services
