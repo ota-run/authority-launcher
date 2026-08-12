@@ -37,6 +37,7 @@ mod linux {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ed25519_dalek::{Signer, SigningKey};
+    use ota_authority_launcher::linux_observations::BROKER_PROXY_IDENTITY_PREFACE;
     use ota_authority_protocol::{
         AUTHORIZATION_DECISION, AUTHORIZATION_DECISION_DOMAIN_V1, AUTHORIZATION_REQUEST_DOMAIN_V1,
         AuthorizationDecision, AuthorizationDecisionPayload, AuthorizationRequest, MAX_FRAME_BYTES,
@@ -67,6 +68,9 @@ mod linux {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .and_then(|()| stream.set_write_timeout(Some(Duration::from_secs(5))))
             .map_err(|_| String::from("decision peer timeout setup failed"))?;
+        stream
+            .write_all(BROKER_PROXY_IDENTITY_PREFACE)
+            .map_err(|_| String::from("decision peer identity preface failed"))?;
 
         let request: AuthorizationRequest = read_frame(&mut stream)?;
         let request_identity =

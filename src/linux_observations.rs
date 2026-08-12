@@ -37,6 +37,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const MAX_PROC_STATUS_BYTES: u64 = 64 * 1024;
+pub const BROKER_PROXY_IDENTITY_PREFACE: &[u8] = b"O";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LinuxObservationError {
@@ -81,6 +82,105 @@ pub fn observe_connected_peer(
         uid: credentials.uid,
         gid: credentials.gid,
     })
+}
+
+/// Authenticate the process that accepted a systemd-activated Unix stream. `SO_PEERCRED` on the
+/// client side identifies the process that created the listener, which is PID 1 for socket
+/// activation. The accepting service therefore sends one private preface; Linux attaches both its
+/// credentials and pidfd atomically as ancillary data.
+pub fn receive_authenticated_peer_preface(
+    stream: &UnixStream,
+) -> Result<ObservedSessionPeer, LinuxObservationError> {
+    const SO_PASSPIDFD: libc::c_int = 76;
+    const SCM_PIDFD: libc::c_int = 0x04;
+    let enabled: libc::c_int = 1;
+    for option in [libc::SO_PASSCRED, SO_PASSPIDFD] {
+        if unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                option,
+                (&enabled as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        } != 0
+        {
+            return Err(LinuxObservationError::PeerCredentialsUnavailable);
+        }
+    }
+
+    let mut preface = [0_u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: preface.as_mut_ptr().cast(),
+        iov_len: preface.len(),
+    };
+    // `usize` storage keeps the ancillary buffer aligned for `cmsghdr`.
+    let mut control = [0_usize; 16];
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = std::mem::size_of_val(&control);
+    let received =
+        unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
+    if received != 1
+        || preface.as_slice() != BROKER_PROXY_IDENTITY_PREFACE
+        || message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0
+    {
+        return Err(LinuxObservationError::PeerCredentialsUnavailable);
+    }
+
+    let mut credentials = None;
+    let mut pidfd = None;
+    let mut header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+    while !header.is_null() {
+        let level = unsafe { (*header).cmsg_level };
+        let kind = unsafe { (*header).cmsg_type };
+        let length = unsafe { (*header).cmsg_len } as usize;
+        if level == libc::SOL_SOCKET
+            && kind == libc::SCM_CREDENTIALS
+            && length == unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::ucred>() as _) } as usize
+            && credentials.is_none()
+        {
+            credentials = Some(unsafe {
+                std::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<libc::ucred>())
+            });
+        } else if level == libc::SOL_SOCKET
+            && kind == SCM_PIDFD
+            && length == unsafe { libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) } as usize
+            && pidfd.is_none()
+        {
+            let descriptor =
+                unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<libc::c_int>()) };
+            if descriptor < 0 {
+                return Err(LinuxObservationError::PeerCredentialsUnavailable);
+            }
+            // SAFETY: `SCM_PIDFD` transferred a new descriptor owned by this process.
+            pidfd = Some(unsafe { OwnedFd::from_raw_fd(descriptor) });
+        } else {
+            return Err(LinuxObservationError::PeerCredentialsUnavailable);
+        }
+        header = unsafe { libc::CMSG_NXTHDR(&message, header) };
+    }
+
+    let credentials = credentials.ok_or(LinuxObservationError::PeerCredentialsUnavailable)?;
+    let pidfd = pidfd.ok_or(LinuxObservationError::PeerCredentialsUnavailable)?;
+    if credentials.pid <= 0 {
+        return Err(LinuxObservationError::PeerCredentialsUnavailable);
+    }
+    require_live_pidfd(&pidfd)?;
+    Ok(ObservedSessionPeer {
+        pidfd,
+        pid: credentials.pid as u32,
+        uid: credentials.uid,
+        gid: credentials.gid,
+    })
+}
+
+pub fn revalidate_observed_peer(
+    expected: &ObservedSessionPeer,
+) -> Result<(), LinuxObservationError> {
+    require_live_pidfd(&expected.pidfd)
 }
 
 pub fn revalidate_connected_peer(

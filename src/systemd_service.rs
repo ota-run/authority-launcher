@@ -38,8 +38,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use ota_authority_launcher::linux_observations::{
-    ObservedSessionPeer, observe_connected_peer, reconcile_connected_peer,
-    revalidate_connected_peer, verify_peer_executable_identity, verify_peer_process_status,
+    ObservedSessionPeer, observe_connected_peer, receive_authenticated_peer_preface,
+    reconcile_connected_peer, revalidate_observed_peer, verify_peer_executable_identity,
+    verify_peer_process_status,
 };
 use ota_authority_protocol::{
     ATTESTATION_RESPONSE, AuthorizationDecision, LAUNCHER_TERMINAL, LauncherAttestationClaimsV3,
@@ -513,7 +514,7 @@ impl ProtectedBrokerProxy {
             .set_read_timeout(Some(timeout))
             .and_then(|()| stream.set_write_timeout(Some(timeout)))
             .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
-        let peer = observe_connected_peer(&stream)
+        let peer = receive_authenticated_peer_preface(&stream)
             .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
         reconcile_connected_peer(
             &peer,
@@ -533,7 +534,7 @@ impl ProtectedBrokerProxy {
     }
 
     fn revalidate(&self) -> Result<(), SystemdServiceError> {
-        revalidate_connected_peer(&self.stream, &self.peer)
+        revalidate_observed_peer(&self.peer)
             .and_then(|()| verify_peer_executable_identity(&self.peer, &self.executable_identity))
             .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)
     }
@@ -1124,18 +1125,17 @@ mod tests {
         if peer_pid == 0 {
             drop(listener);
             let result = UnixStream::connect(&socket_path).and_then(|mut stream| {
-                stream.write_all(b"ready")?;
+                stream.write_all(
+                    ota_authority_launcher::linux_observations::BROKER_PROXY_IDENTITY_PREFACE,
+                )?;
                 unsafe { libc::pause() };
                 Ok(())
             });
             unsafe { libc::_exit(if result.is_ok() { 0 } else { 90 }) };
         }
 
-        let (mut stream, _) = listener.accept().expect("accepted broker peer");
-        let mut ready = [0_u8; 5];
-        stream.read_exact(&mut ready).expect("broker peer ready");
-        assert_eq!(&ready, b"ready");
-        let peer = observe_connected_peer(&stream).expect("guarded broker peer");
+        let (stream, _) = listener.accept().expect("accepted broker peer");
+        let peer = receive_authenticated_peer_preface(&stream).expect("guarded broker peer");
         let mut executable = std::fs::File::open("/proc/self/exe").expect("test executable");
         let executable_identity =
             crate::config::sha256_file_identity(&mut executable).expect("executable identity");

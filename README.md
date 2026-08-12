@@ -251,7 +251,11 @@ parse the command and freeze the real semantic scope. The launcher submits Core'
 plus its complete observed profile to the separately credentialed protected attestor, independently
 verifies the returned signature and claims projection, then relays only that signed V3 response. It
 reconciles Core's exact matching authorization request, connects only to the protected broker proxy
-bound by the installation manifest, and relays signed decisions back to Core. Core returns one
+bound by the installation manifest, consumes one private preface carrying kernel-supplied
+`SCM_CREDENTIALS` and `SCM_PIDFD` for the accepting service, and retains that exact process identity
+across relay traffic. This distinction is required because PID 1 owns a systemd-activated listener;
+`SO_PEERCRED` alone does not identify the service process that accepted the connection. The
+launcher then relays signed decisions back to Core. Core returns one
 identity-bound verification acknowledgement; the launcher journals the exact signed decision plus
 that acknowledgement before it kills the complete scope, confirms it absent and its cgroup empty
 or absent, kills/reaps the child, and removes the slot.

@@ -46,6 +46,11 @@
   manifest before and after. This is not
   production broker implementation or hosted evidence until that workflow is committed and green
   against immutable revisions.
+- Authenticate the process that accepts the systemd-activated broker stream with one private
+  kernel-credential preface. Launcher now requires matching `SCM_CREDENTIALS` and `SCM_PIDFD`, then
+  retains and rechecks that pidfd and the manifest-bound executable around relay traffic. It does
+  not mistake PID 1, which owns the activated listener, for the service process that accepted the
+  connection.
 
 - Verify protected producer freshness at response receipt rather than before transport. A signed
   response issued across a whole-second boundary can no longer be rejected against a stale
