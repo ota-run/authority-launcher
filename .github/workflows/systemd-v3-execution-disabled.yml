@@ -499,14 +499,24 @@ jobs:
           sudo systemctl stop ota-authority-broker-proxy.socket
           repository_manifest > "$EVIDENCE_DIR/missing-broker.repository.before.sha256"
           case_cursor=$(journal_cursor)
-          sudo -u ota-authority-job \
-            /usr/lib/ota-authority/bin/ota-authority-systemd-pressure-client \
-            --authority-id platform-release-authority \
-            --repository "$PRESSURE_REPOSITORY" \
-            --expected-terminal protocol-refusal \
-            -- run governed --grant platform-release-authority \
-            | tee "$EVIDENCE_DIR/missing-broker.json" >/dev/null
+          if ! sudo systemctl start ota-authority-pressure-runner.service; then
+            capture_journal missing-broker-start-failure "$case_cursor"
+            systemctl show \
+              ota-authority-pressure-runner.service \
+              ota-authority-launcher.service \
+              ota-authority-attestor.service \
+              ota-authority-broker-proxy.service \
+              > "$EVIDENCE_DIR/missing-broker-start-failure.units.txt"
+            exit 1
+          fi
           capture_journal missing-broker "$case_cursor"
+          sudo journalctl --no-pager --output=cat \
+            --after-cursor "$case_cursor" \
+            -u ota-authority-pressure-runner.service \
+            | tee "$EVIDENCE_DIR/missing-broker.client-journal.txt" >/dev/null
+          sed -n '/^{/,/^}$/p' "$EVIDENCE_DIR/missing-broker.client-journal.txt" \
+            > "$EVIDENCE_DIR/missing-broker.json"
+          test -s "$EVIDENCE_DIR/missing-broker.json"
           jq -e '.terminal.stage == "pre_authorization_protocol_refused_boundary_removed"' \
             "$EVIDENCE_DIR/missing-broker.json"
           assert_count 0 'bounded pressure decision_sent' \
