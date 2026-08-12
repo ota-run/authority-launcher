@@ -499,11 +499,17 @@ jobs:
              and .terminal.finalization.completion.outcome == "completed"' \
             "$EVIDENCE_DIR/positive.json"
           assert_terminal_clean positive true
-          receipt_history=$(sudo sh -c \
+          sudo cp -a "$PRESSURE_REPOSITORY/.ota" "$EVIDENCE_DIR/positive-ota-evidence"
+          sudo chown -R "$(id -u):$(id -g)" "$EVIDENCE_DIR/positive-ota-evidence"
+          set +e
+          sudo sh -c \
             'cd "$1" && /usr/lib/ota-authority/bin/ota receipt --history --json' \
-            sh "$PRESSURE_REPOSITORY")
-          printf '%s\n' "$receipt_history" \
-            > "$EVIDENCE_DIR/positive.receipt-history.json"
+            sh "$PRESSURE_REPOSITORY" \
+            2> >(tee "$EVIDENCE_DIR/positive.receipt-history.stderr.txt" >&2) \
+            | tee "$EVIDENCE_DIR/positive.receipt-history.json"
+          receipt_history_status=${PIPESTATUS[0]}
+          set -e
+          test "$receipt_history_status" -eq 0
           jq -e \
             '.ok == true
              and .summary.archive_count == 1
@@ -511,8 +517,6 @@ jobs:
              and (.archives | length) == 1
              and (.invalid_archives | length) == 0' \
             "$EVIDENCE_DIR/positive.receipt-history.json"
-          sudo cp -a "$PRESSURE_REPOSITORY/.ota" "$EVIDENCE_DIR/positive-ota-evidence"
-          sudo chown -R "$(id -u):$(id -g)" "$EVIDENCE_DIR/positive-ota-evidence"
           repository_manifest > "$EVIDENCE_DIR/positive.repository.after.sha256"
           if cmp -s "$EVIDENCE_DIR/positive.repository.before.sha256" \
             "$EVIDENCE_DIR/positive.repository.after.sha256"; then
