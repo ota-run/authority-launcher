@@ -291,8 +291,10 @@ impl PreparedChild {
         pressure_v3_stage("prepared_lease_relayed");
 
         let consume_request: LeaseConsumeRequest =
-            read_json_frame(&mut self.launcher_session, timeout)
-                .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+            read_json_frame(&mut self.launcher_session, timeout).map_err(|_| {
+                pressure_v3_stage("lease_consume_unavailable");
+                PreparedChildError::AuthorizationDecisionBridgeUnavailable
+            })?;
         if consume_request.message_kind != LEASE_CONSUME
             || consume_request.lease_identity != prepared_lease_identity
             || consume_request.binding_identity != prepared_lease.payload.binding_identity
@@ -316,7 +318,10 @@ impl PreparedChild {
         };
         intent.identity = lease_consumption_intent_relay_evidence_v1_identity(&intent)
             .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
-        record_intent(&intent)?;
+        record_intent(&intent).map_err(|error| {
+            pressure_v3_stage("lease_consumption_intent_recording_failed");
+            error
+        })?;
         let mut intent_persistence = LeaseConsumptionIntentPersistenceV1 {
             schema_version: 1,
             identity: String::new(),
@@ -326,8 +331,12 @@ impl PreparedChild {
         intent_persistence.identity =
             lease_consumption_intent_persistence_v1_identity(&intent_persistence)
                 .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
-        write_json_frame(&mut self.launcher_session, &intent_persistence, timeout)
-            .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        write_json_frame(&mut self.launcher_session, &intent_persistence, timeout).map_err(
+            |_| {
+                pressure_v3_stage("lease_consumption_intent_acknowledgement_failed");
+                PreparedChildError::AuthorizationDecisionBridgeUnavailable
+            },
+        )?;
         pressure_v3_stage("lease_consumption_intent_persisted");
         crate::systemd_service::pressure_exit_after_intent_persistence_acknowledged()
             .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
