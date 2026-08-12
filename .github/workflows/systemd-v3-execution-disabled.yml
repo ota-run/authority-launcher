@@ -551,6 +551,8 @@ jobs:
             /run/systemd/system/ota-authority-broker-proxy.service.d/zzzz-pressure-unavailable.conf
           sudo systemctl daemon-reload
           sudo systemctl reset-failed ota-authority-broker-proxy.service
+          sudo systemctl restart ota-authority-broker-proxy.socket
+          test -S /run/ota/broker-proxy.sock
           set_broker_scenario allowed
 
           reset_services
