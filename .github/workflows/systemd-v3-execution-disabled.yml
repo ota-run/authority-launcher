@@ -73,7 +73,7 @@ jobs:
             .source
           ' "$EVIDENCE_DIR/cargo-metadata.json")
           test "$protocol_source" = \
-            "git+https://github.com/ota-run/authority-protocol?rev=${EXPECTED_PROTOCOL_REVISION}#${EXPECTED_PROTOCOL_REVISION}"
+            "git+https://github.com/ota-run/authority-protocol.git?rev=${EXPECTED_PROTOCOL_REVISION}#${EXPECTED_PROTOCOL_REVISION}"
 
       - name: Build exact pressure binaries
         run: |
