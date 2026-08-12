@@ -20,7 +20,7 @@
 //
 //   If you need additional information or have any questions, please email: os@ota.run
 
-//! Administrator-only provisioning for the execution-disabled local V3 pressure boundary.
+//! Administrator-only provisioning for the local V3 pressure boundary.
 
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
@@ -925,7 +925,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generated_units_preserve_the_execution_disabled_boundary() {
+    fn generated_units_preserve_the_protected_selected_execution_boundary() {
         let service = launcher_service_unit(
             Path::new("/usr/lib/ota-authority/bin/ota-authority-launcher"),
             Path::new("/srv/ota-pressure"),

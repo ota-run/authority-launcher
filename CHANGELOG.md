@@ -26,6 +26,16 @@
 
 ## Unreleased
 
+- Enable the first bounded selected-execution path for `systemd_protected_launcher/v1`. Core keeps
+  the private launcher session through terminal transaction finalization and sends one completion
+  binding the consumed lease, work unit, pending transaction, terminal transaction, outcome, and
+  receipt status. The launcher fsyncs that completion before acknowledgement, relays bounded
+  sequenced output, reconciles the actual child exit, and emits terminal evidence only after exact
+  scope removal, empty or absent cgroup confirmation, child reaping, and active-slot removal.
+  Refusal and uncertain-cleanup paths remain fail-closed. Immutable Linux/x64 PID 1 pressure and
+  portable archive binding of launcher finalization remain required before this boundary is
+  complete.
+
 - Extend the execution-disabled protected systemd foundation through one exact prepared-lease and
   consumed-response relay. The launcher durably journals the exact transaction-bound intent and
   consumed relay, while Core verifies that protected persistence in private in-memory transaction

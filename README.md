@@ -53,18 +53,21 @@ for an identical unexpired replay. The launcher-side verifier loads only the pro
 producer binding and independently checks the response projection, identity, signature, audience,
 key validity, and freshness.
 
-The execution-disabled systemd launcher now collects the complete ordered
+The protected systemd launcher collects the complete ordered
 `ota.authority-launcher.systemd/v3` and `ota.authority-job-principal.systemd/v2` observation sets and
 invokes that producer. It verifies protected installation identities, exact systemd runtime
 properties, process containment, account/sudo/Polkit posture, protected-path and host-socket access,
 and Ota process-access denial before relaying the independently verified signed V3 attestation to
 Core. Any missing or mismatched observation refuses. This establishes a real local V3 attestation
-bridge. The current execution-disabled decision slice additionally forwards Core's exact
+bridge. It additionally forwards Core's exact
 authorization request to one protected, installation-bound local broker proxy, relays only signed
 authorization decisions, then relays one exact prepared lease and consumption response. Core keeps
 the systemd transaction private and in memory while the launcher journals the full relay and
-acknowledges that journal back to Core. The launcher active-slot journal is the durable carrier
-record. The child is still cleaned up before selected work.
+acknowledges that journal back to Core. After one consumed lease, the launcher retains the exact
+child, transient scope, and active-slot journal while selected work runs. Core sends one terminal
+transaction-bound completion over the private session; the launcher persists it before
+acknowledgement, reconciles the observed child exit, removes the exact scope and empty cgroup,
+reaps the child, removes the slot, and only then emits terminal finalization evidence.
 
 The feature-gated `ota-authority-pressure-peer` binary is an exception for conformance testing
 only. It uses fixed public test keys and deterministic scenarios to exercise protocol v2 through a
@@ -224,7 +227,7 @@ usable key, grant, lease, credential, or trust path belongs in `ota.yaml`.
 
 ## Systemd service foundation
 
-The Linux `systemd_protected_launcher/v1` service path remains execution-disabled. It accepts only
+The Linux `systemd_protected_launcher/v1` service path accepts only
 the fixed socket-activated listener, derives the job peer through `SO_PEERCRED`, opens the allowed
 repository through the configured execution principal, and prepares the exact protected Ota binary
 as a stopped root child. Before fork it creates and fsyncs a root-owned active-slot intent under
@@ -232,7 +235,7 @@ as a stopped root child. Before fork it creates and fsyncs a root-owned active-s
 working-directory device/inode, principal mapping, PID/start time, binary identity, and complete
 child descriptor boundary.
 
-The execution-disabled Linux pressure unit needs root system-manager access and bounded
+The Linux pressure unit needs root system-manager access and bounded
 `CAP_SYS_PTRACE` so it can re-observe protected process and stopped-child descriptor posture. It
 binds listening sockets through protected file metadata, descriptor type, socket options, and exact
 systemd unit relationships rather than treating `/proc/net/unix` path spelling as authority. These
@@ -260,8 +263,11 @@ launcher then relays signed decisions, the exact prepared lease, and one consump
 to Core. Core returns an identity-bound decision acknowledgement and an identity-bound consumption
 admission after verifying the launcher's durable relay evidence. The launcher-owned active-slot
 journal is the durable authority record; Core's systemd transaction remains private in-memory state.
-The launcher returns a bounded persistence acknowledgement before it kills the complete scope, confirms it
-absent and its cgroup empty or absent, kills/reaps the child, and removes the slot.
+After consumption, Core may execute the exact selected lane and must return one completion binding
+the pending and terminal transaction identities. The launcher persists that completion before
+acknowledgement, reconciles the actual child exit, stops the complete scope, confirms it absent and
+its cgroup empty or absent, reaps the child, removes the slot, and only then emits terminal
+finalization.
 
 On startup, retained journals are reconciled before accepting a client. A valid child- or
 scope-bearing temporary journal is promoted rather than discarded. Intent-only state remains a
@@ -269,8 +275,11 @@ hard refusal because it cannot establish child absence. An exact pre-scope child
 through Linux `pidfd`; a scope-bearing journal additionally requires the exact unit and kernel
 cgroup to be stopped and observed empty. PID reuse, identity mismatch, unsupported cleanup, or any
 uncertain outcome retains the slot and fails closed.
-This path remains execution-disabled after signed V3 decision admission and one bounded consumed
-lease relay. It does **not** execute repository work or create crossing receipt/archive evidence. Only
+This path permits selected execution only after signed V3 admission and one bounded consumed
+lease. The selected Ota command creates its ordinary transaction-bound crossing receipt/archive;
+launcher terminal evidence separately binds Core's completion to exact child, scope, cgroup, and
+slot cleanup. Portable archive reconciliation of that post-process launcher finalization remains a
+separate open V11.7 boundary. Only
 `ota-authority-attestor` receives the systemd-delivered
 signing credential; the launcher retains public verification truth only. Missing, malformed,
 oversized, self-inconsistent, or substituted posture, continuation, challenge, attestation, or
@@ -280,17 +289,16 @@ separation.
 
 The feature-gated `ota-authority-systemd-pressure-client` is the unprivileged side of that positive
 kernel proof. It connects only to `/run/ota/authority-launcher.sock`, submits one bounded
-`LauncherInvocationRequestV1`, and accepts only the execution-disabled terminal refusal emitted
-with a caller-selected exact expected stage. Its default requires
-`lease_consumed_before_execution_disabled_boundary_removed` after Core and the launcher have
-durably reconciled one signed consumed lease and the service has confirmed exact scope and child
-cleanup. Pressure-only decision-only controls can instead require
+`LauncherInvocationRequestV1`, streams bounded sequenced output, and accepts only a validated
+terminal frame with its caller-selected exact expected stage. Selected-success and selected-failure
+controls require identity-bound terminal cleanup evidence. Decision-only compatibility controls can
+instead require
 `authorization_decision_verified_before_lease_boundary_removed`; negative cases can instead
 require exact denied-decision or pre-authorization-protocol refusal;
 a posture-only, repository-open, or generic boundary failure cannot satisfy it. Before sending
 the request it requires the fixed socket and parent to have the protected root-owned posture and
 requires the connected Unix peer to be root-owned. It cannot select another socket, install
-configuration, mutate systemd, provide authority, or enable execution. The binary is not installed
+configuration, mutate systemd, or provide authority. The binary is not installed
 as part of the production launcher.
 
 Immutable crash/recovery pressure may additionally build the launcher with the

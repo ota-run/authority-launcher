@@ -72,12 +72,11 @@ enum Command {
         ota_args: Vec<String>,
     },
 
-    /// Internal systemd socket-activation entrypoint. This remains execution-disabled after one
-    /// verified authorization decision and one bounded consumed lease relay.
+    /// Internal systemd socket-activation entrypoint for protected selected execution.
     #[command(hide = true)]
     ServeSystemd,
 
-    /// Install the fixed, execution-disabled V3 local pressure boundary.
+    /// Install the fixed V3 local pressure boundary.
     #[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
     #[command(hide = true)]
     ProvisionSystemdV3Pressure {

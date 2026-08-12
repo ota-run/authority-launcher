@@ -34,9 +34,10 @@ use std::path::{Path, PathBuf};
 
 use ota_authority_protocol::{
     AuthorizationDecision, AuthorizationDecisionRelayEvidenceV1, LauncherChildProcessV1,
-    LauncherSystemdScopeV1, LauncherWorkingDirectoryV1, LeaseConsumptionIntentRelayEvidenceV1,
-    LeaseConsumptionRelayEvidenceV1, authorization_decision_relay_evidence_v1_identity,
-    launcher_child_process_identity, launcher_systemd_scope_identity,
+    LauncherExecutionCompletionV1, LauncherSystemdScopeV1, LauncherWorkingDirectoryV1,
+    LeaseConsumptionIntentRelayEvidenceV1, LeaseConsumptionRelayEvidenceV1,
+    authorization_decision_relay_evidence_v1_identity, launcher_child_process_identity,
+    launcher_execution_completion_v1_identity, launcher_systemd_scope_identity,
     launcher_working_directory_identity, lease_consumption_intent_relay_evidence_v1_identity,
     lease_consumption_relay_evidence_v1_identity, message_identity,
 };
@@ -57,6 +58,7 @@ pub(crate) enum ActiveSlotStage {
     AuthorizationDecisionVerified,
     LeaseConsumptionIntentRecorded,
     LeaseConsumptionVerified,
+    ExecutionCompletionRecorded,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +81,8 @@ pub(crate) struct ActiveSlotJournalV1 {
     pub lease_consumption_intent: Option<LeaseConsumptionIntentRelayEvidenceV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_consumption: Option<LeaseConsumptionRelayEvidenceV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_completion: Option<LauncherExecutionCompletionV1>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -227,6 +231,7 @@ impl ActiveSlot {
             authorization_decision: None,
             lease_consumption_intent: None,
             lease_consumption: None,
+            execution_completion: None,
         };
         journal.identity = active_slot_identity(&journal)?;
         write_new(&path, &journal)?;
@@ -367,9 +372,49 @@ impl ActiveSlot {
         replace_atomically(&self.directory, &self.path, &self.journal)
     }
 
+    pub(crate) fn record_execution_completion(
+        &mut self,
+        completion: LauncherExecutionCompletionV1,
+    ) -> Result<(), ActiveSlotError> {
+        if launcher_execution_completion_v1_identity(&completion)
+            .ok()
+            .as_deref()
+            != Some(completion.identity.as_str())
+            || self.journal.stage != ActiveSlotStage::LeaseConsumptionVerified
+            || self.journal.execution_completion.is_some()
+            || self
+                .journal
+                .lease_consumption
+                .as_ref()
+                .is_none_or(|consumption| {
+                    completion.invocation_id != self.journal.invocation_id
+                        || completion.lease_consumption_admission_identity
+                            != consumption.admission.identity
+                        || completion.work_unit_identity != consumption.admission.work_unit_identity
+                        || completion.crossing_transaction_id
+                            != consumption.admission.crossing_transaction_id
+                        || completion.pending_crossing_transaction_identity
+                            != consumption.admission.crossing_transaction_identity
+                })
+        {
+            return Err(ActiveSlotError::InvalidJournal);
+        }
+        self.journal.stage = ActiveSlotStage::ExecutionCompletionRecorded;
+        self.journal.execution_completion = Some(completion);
+        self.journal.identity = active_slot_identity(&self.journal)?;
+        replace_atomically(&self.directory, &self.path, &self.journal)
+    }
+
+    pub(crate) fn execution_completion(&self) -> Option<&LauncherExecutionCompletionV1> {
+        self.journal.execution_completion.as_ref()
+    }
+
     pub(crate) fn has_lease_consumption(&self) -> bool {
-        self.journal.stage == ActiveSlotStage::LeaseConsumptionVerified
-            && self.journal.lease_consumption.is_some()
+        matches!(
+            self.journal.stage,
+            ActiveSlotStage::LeaseConsumptionVerified
+                | ActiveSlotStage::ExecutionCompletionRecorded
+        ) && self.journal.lease_consumption.is_some()
     }
 
     pub(crate) fn has_lease_consumption_intent(&self) -> bool {
@@ -377,6 +422,7 @@ impl ActiveSlot {
             self.journal.stage,
             ActiveSlotStage::LeaseConsumptionIntentRecorded
                 | ActiveSlotStage::LeaseConsumptionVerified
+                | ActiveSlotStage::ExecutionCompletionRecorded
         ) && self.journal.lease_consumption_intent.is_some()
     }
 
@@ -427,6 +473,18 @@ fn is_direct_successor(current: &ActiveSlotJournalV1, recovered: &ActiveSlotJour
                 && recovered.lease_consumption.is_some()
         }
         (
+            ActiveSlotStage::LeaseConsumptionVerified,
+            ActiveSlotStage::ExecutionCompletionRecorded,
+        ) => {
+            current.child == recovered.child
+                && current.scope == recovered.scope
+                && current.authorization_decision == recovered.authorization_decision
+                && current.lease_consumption_intent == recovered.lease_consumption_intent
+                && current.lease_consumption == recovered.lease_consumption
+                && current.execution_completion.is_none()
+                && recovered.execution_completion.is_some()
+        }
+        (
             ActiveSlotStage::AuthorizationDecisionVerified,
             ActiveSlotStage::AuthorizationDecisionVerified,
         ) => {
@@ -465,6 +523,7 @@ pub(crate) fn active_slot_identity(
                     || journal.authorization_decision.is_some()
                     || journal.lease_consumption_intent.is_some()
                     || journal.lease_consumption.is_some()
+                    || journal.execution_completion.is_some()
             }
             ActiveSlotStage::ChildPrepared => {
                 journal.child.as_ref().is_none_or(|child| {
@@ -478,6 +537,7 @@ pub(crate) fn active_slot_identity(
                     || journal.authorization_decision.is_some()
                     || journal.lease_consumption_intent.is_some()
                     || journal.lease_consumption.is_some()
+                    || journal.execution_completion.is_some()
             }
             ActiveSlotStage::ScopeAttached => {
                 journal.child.as_ref().is_none_or(|child| {
@@ -498,6 +558,7 @@ pub(crate) fn active_slot_identity(
                 }) || journal.authorization_decision.is_some()
                     || journal.lease_consumption_intent.is_some()
                     || journal.lease_consumption.is_some()
+                    || journal.execution_completion.is_some()
             }
             ActiveSlotStage::AuthorizationDecisionVerified => {
                 journal.child.as_ref().is_none_or(|child| {
@@ -526,6 +587,7 @@ pub(crate) fn active_slot_identity(
                     })
                     || journal.lease_consumption_intent.is_some()
                     || journal.lease_consumption.is_some()
+                    || journal.execution_completion.is_some()
             }
             ActiveSlotStage::LeaseConsumptionIntentRecorded => {
                 journal.child.is_none()
@@ -552,6 +614,7 @@ pub(crate) fn active_slot_identity(
                                         .map(|decision| decision.identity.as_str())
                         })
                     || journal.lease_consumption.is_some()
+                    || journal.execution_completion.is_some()
             }
             ActiveSlotStage::LeaseConsumptionVerified => {
                 journal.child.as_ref().is_none_or(|child| {
@@ -603,6 +666,39 @@ pub(crate) fn active_slot_identity(
                                     intent.consume_request_identity
                                         != evidence.consume_request_identity
                                 })
+                        })
+                    || journal.execution_completion.is_some()
+            }
+            ActiveSlotStage::ExecutionCompletionRecorded => {
+                journal.child.is_none()
+                    || journal.scope.is_none()
+                    || journal.authorization_decision.is_none()
+                    || journal.lease_consumption_intent.is_none()
+                    || journal.lease_consumption.is_none()
+                    || journal
+                        .execution_completion
+                        .as_ref()
+                        .is_none_or(|completion| {
+                            launcher_execution_completion_v1_identity(completion)
+                                .ok()
+                                .as_deref()
+                                != Some(completion.identity.as_str())
+                                || completion.invocation_id != journal.invocation_id
+                                || journal
+                                    .lease_consumption
+                                    .as_ref()
+                                    .is_none_or(|consumption| {
+                                        completion.lease_consumption_admission_identity
+                                            != consumption.admission.identity
+                                            || completion.work_unit_identity
+                                                != consumption.admission.work_unit_identity
+                                            || completion.crossing_transaction_id
+                                                != consumption.admission.crossing_transaction_id
+                                            || completion.pending_crossing_transaction_identity
+                                                != consumption
+                                                    .admission
+                                                    .crossing_transaction_identity
+                                    })
                         })
             }
         }
@@ -828,6 +924,7 @@ mod tests {
             authorization_decision: None,
             lease_consumption_intent: None,
             lease_consumption: None,
+            execution_completion: None,
         };
         journal.identity = active_slot_identity(&journal).expect("journal identity");
         journal
@@ -1131,6 +1228,7 @@ mod tests {
             authorization_decision: None,
             lease_consumption_intent: None,
             lease_consumption: None,
+            execution_completion: None,
         };
         let child = journal.child.as_mut().expect("child");
         child.identity = launcher_child_process_identity(child).expect("child identity");

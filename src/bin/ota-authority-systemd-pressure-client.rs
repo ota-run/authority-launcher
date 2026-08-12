@@ -20,7 +20,7 @@
 //
 //   If you need additional information or have any questions, please email: os@ota.run
 
-//! Feature-gated unprivileged client for the execution-disabled systemd pressure boundary.
+//! Feature-gated unprivileged client for the protected systemd pressure boundary.
 
 #[cfg(target_os = "linux")]
 use std::io::{Read, Write};
@@ -39,11 +39,11 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 #[cfg(target_os = "linux")]
 use ota_authority_protocol::{
-    LAUNCHER_INVOCATION_REQUEST, LauncherInvocationRequestV1, LauncherTerminalFrameV1,
-    LauncherTerminalOutcomeV1, LauncherTerminalStageV1, MAX_FRAME_BYTES,
-    SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, decode_frame, encode_frame,
-    launcher_invocation_request_identity, validate_launcher_invocation_request_v1,
-    validate_launcher_terminal_frame_v1,
+    LAUNCHER_INVOCATION_REQUEST, LAUNCHER_OUTPUT, LAUNCHER_TERMINAL, LauncherInvocationRequestV1,
+    LauncherOutputFrameV1, LauncherTerminalFrameV1, LauncherTerminalOutcomeV1,
+    LauncherTerminalStageV1, MAX_FRAME_BYTES, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, decode_frame,
+    encode_frame, launcher_invocation_request_identity, validate_launcher_invocation_request_v1,
+    validate_launcher_output_frame_v1, validate_launcher_terminal_frame_v1,
 };
 #[cfg(target_os = "linux")]
 use serde::Serialize;
@@ -52,6 +52,8 @@ use serde::Serialize;
 const SYSTEMD_LAUNCHER_SOCKET: &str = "/run/ota/authority-launcher.sock";
 #[cfg(target_os = "linux")]
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(target_os = "linux")]
+const MAX_CAPTURED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Parser)]
@@ -75,6 +77,8 @@ enum ExpectedTerminal {
     DeniedDecision,
     ObservedDecisionOutcome,
     ProtocolRefusal,
+    SelectedSuccess,
+    SelectedFailure,
 }
 
 #[cfg(target_os = "linux")]
@@ -83,6 +87,7 @@ struct PressureEvidence {
     ok: bool,
     kind: &'static str,
     request_identity: String,
+    output_frames: Vec<LauncherOutputFrameV1>,
     terminal: LauncherTerminalFrameV1,
 }
 
@@ -142,12 +147,13 @@ fn run(cli: Cli) -> Result<PressureEvidence, String> {
     stream
         .write_all(frame.as_slice())
         .map_err(|_| String::from("the pressure request could not be sent"))?;
-    let terminal = read_terminal(&mut stream)?;
+    let (output_frames, terminal) = read_session(&mut stream)?;
     validate_pressure_terminal(&terminal, cli.expected_terminal)?;
     Ok(PressureEvidence {
         ok: true,
         kind: "systemd_transient_scope_pressure",
         request_identity,
+        output_frames,
         terminal,
     })
 }
@@ -157,7 +163,7 @@ fn validate_pressure_terminal(
     terminal: &LauncherTerminalFrameV1,
     expected: ExpectedTerminal,
 ) -> Result<(), String> {
-    let stage_matches = matches!(
+    let refusal_stage_matches = matches!(
         (expected, terminal.stage),
         (
             ExpectedTerminal::AllowedDecision,
@@ -181,12 +187,50 @@ fn validate_pressure_terminal(
             ),
         )
     );
-    if terminal.outcome != LauncherTerminalOutcomeV1::Refused
-        || terminal.exit_code != Some(2)
-        || !stage_matches
-    {
+    let selected_matches = match (
+        expected,
+        terminal.outcome,
+        terminal.stage,
+        terminal.exit_code,
+    ) {
+        (
+            ExpectedTerminal::SelectedSuccess,
+            LauncherTerminalOutcomeV1::Completed,
+            Some(LauncherTerminalStageV1::SelectedExecutionCompletedBoundaryRemoved),
+            Some(0),
+        ) => true,
+        (
+            ExpectedTerminal::SelectedFailure,
+            LauncherTerminalOutcomeV1::Failed,
+            Some(LauncherTerminalStageV1::SelectedExecutionFailedBoundaryRemoved),
+            Some(code),
+        ) => code != 0,
+        (
+            ExpectedTerminal::ObservedDecisionOutcome,
+            LauncherTerminalOutcomeV1::Completed,
+            Some(LauncherTerminalStageV1::SelectedExecutionCompletedBoundaryRemoved),
+            Some(0),
+        ) => true,
+        (
+            ExpectedTerminal::ObservedDecisionOutcome,
+            LauncherTerminalOutcomeV1::Failed,
+            Some(LauncherTerminalStageV1::SelectedExecutionFailedBoundaryRemoved),
+            Some(code),
+        ) => code != 0,
+        (
+            ExpectedTerminal::ObservedDecisionOutcome,
+            LauncherTerminalOutcomeV1::Cancelled,
+            Some(LauncherTerminalStageV1::SelectedExecutionInterruptedBoundaryRemoved),
+            Some(code),
+        ) => matches!(code, 129 | 130 | 131 | 143),
+        _ => false,
+    };
+    let refusal_matches = terminal.outcome == LauncherTerminalOutcomeV1::Refused
+        && terminal.exit_code == Some(2)
+        && refusal_stage_matches;
+    if !refusal_matches && !selected_matches {
         return Err(String::from(
-            "the execution-disabled launcher did not confirm its bounded terminal refusal",
+            "the launcher did not confirm the expected bounded terminal outcome",
         ));
     }
     Ok(())
@@ -251,7 +295,57 @@ fn credentials_are_root_launcher(pid: i32, uid: u32, gid: u32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn read_terminal(stream: &mut UnixStream) -> Result<LauncherTerminalFrameV1, String> {
+fn read_session(
+    stream: &mut UnixStream,
+) -> Result<(Vec<LauncherOutputFrameV1>, LauncherTerminalFrameV1), String> {
+    let mut output_frames = Vec::new();
+    let mut next_sequence = 0_u64;
+    let mut captured_output_bytes = 0_usize;
+    loop {
+        let payload = read_frame_payload(stream)?;
+        let value: serde_json::Value = serde_json::from_slice(&payload)
+            .map_err(|_| String::from("the launcher session record is invalid"))?;
+        match value
+            .get("message_kind")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(LAUNCHER_OUTPUT) => {
+                let output: LauncherOutputFrameV1 = serde_json::from_value(value)
+                    .map_err(|_| String::from("the launcher output record is invalid"))?;
+                validate_launcher_output_frame_v1(&output)
+                    .map_err(|_| String::from("the launcher output record is invalid"))?;
+                if output.sequence != next_sequence {
+                    return Err(String::from("the launcher output sequence is invalid"));
+                }
+                captured_output_bytes = captured_output_bytes
+                    .checked_add(output.payload.len())
+                    .filter(|total| *total <= MAX_CAPTURED_OUTPUT_BYTES)
+                    .ok_or_else(|| {
+                        String::from("the launcher output exceeds the pressure bound")
+                    })?;
+                next_sequence = next_sequence.saturating_add(1);
+                output_frames.push(output);
+            }
+            Some(LAUNCHER_TERMINAL) => {
+                let terminal: LauncherTerminalFrameV1 = serde_json::from_value(value)
+                    .map_err(|_| String::from("the launcher terminal record is invalid"))?;
+                validate_launcher_terminal_frame_v1(&terminal)
+                    .map_err(|_| String::from("the launcher terminal record is invalid"))?;
+                if output_frames
+                    .iter()
+                    .any(|output| output.invocation_id != terminal.invocation_id)
+                {
+                    return Err(String::from("the launcher output invocation is invalid"));
+                }
+                return Ok((output_frames, terminal));
+            }
+            _ => return Err(String::from("the launcher session record is unsupported")),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_frame_payload(stream: &mut UnixStream) -> Result<Vec<u8>, String> {
     let mut header = [0_u8; 4];
     stream
         .read_exact(&mut header)
@@ -268,11 +362,7 @@ fn read_terminal(stream: &mut UnixStream) -> Result<LauncherTerminalFrameV1, Str
         .map_err(|_| String::from("the launcher terminal frame is incomplete"))?;
     let payload = decode_frame(frame.as_slice())
         .map_err(|_| String::from("the launcher terminal frame is invalid"))?;
-    let terminal: LauncherTerminalFrameV1 = serde_json::from_slice(payload)
-        .map_err(|_| String::from("the launcher terminal record is invalid"))?;
-    validate_launcher_terminal_frame_v1(&terminal)
-        .map_err(|_| String::from("the launcher terminal record is invalid"))?;
-    Ok(terminal)
+    Ok(payload.to_vec())
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -292,11 +382,51 @@ mod tests {
             outcome: LauncherTerminalOutcomeV1::Refused,
             exit_code: Some(2),
             stage: Some(LauncherTerminalStageV1::PostureAdmittedBoundaryRemoved),
+            finalization: None,
         };
         let payload = serde_json::to_vec(&terminal).expect("terminal payload");
         let frame = encode_frame(payload.as_slice()).expect("terminal frame");
         std::thread::spawn(move || server.write_all(frame.as_slice()).expect("write terminal"));
-        assert_eq!(read_terminal(&mut client).expect("read terminal"), terminal);
+        assert_eq!(
+            read_session(&mut client).expect("read terminal"),
+            (Vec::new(), terminal)
+        );
+    }
+
+    #[test]
+    fn session_reader_preserves_ordered_output_before_terminal() {
+        let (mut client, mut server) = UnixStream::pair().expect("socket pair");
+        let invocation_id = String::from("invocation-0123456789abcdef0123456789abcdef");
+        let output = LauncherOutputFrameV1 {
+            message_kind: LAUNCHER_OUTPUT.into(),
+            protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
+            invocation_id: invocation_id.clone(),
+            sequence: 0,
+            stream: ota_authority_protocol::LauncherOutputStreamV1::Stdout,
+            payload: b"selected output\n".to_vec(),
+        };
+        let terminal = LauncherTerminalFrameV1 {
+            message_kind: LAUNCHER_TERMINAL.into(),
+            protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
+            invocation_id,
+            outcome: LauncherTerminalOutcomeV1::Refused,
+            exit_code: Some(2),
+            stage: Some(LauncherTerminalStageV1::AuthorityRefusedBoundaryRemoved),
+            finalization: None,
+        };
+        let output_frame = encode_frame(&serde_json::to_vec(&output).expect("output payload"))
+            .expect("output frame");
+        let terminal_frame =
+            encode_frame(&serde_json::to_vec(&terminal).expect("terminal payload"))
+                .expect("terminal frame");
+        std::thread::spawn(move || {
+            server.write_all(&output_frame).expect("write output");
+            server.write_all(&terminal_frame).expect("write terminal");
+        });
+        assert_eq!(
+            read_session(&mut client).expect("read session"),
+            (vec![output], terminal)
+        );
     }
 
     #[test]
@@ -306,7 +436,7 @@ mod tests {
             .expect("protocol frame bound fits in u32")
             .to_be_bytes();
         std::thread::spawn(move || server.write_all(&oversized).expect("write header"));
-        assert!(read_terminal(&mut client).is_err());
+        assert!(read_session(&mut client).is_err());
     }
 
     #[test]
@@ -318,6 +448,7 @@ mod tests {
             outcome: LauncherTerminalOutcomeV1::Refused,
             exit_code: Some(2),
             stage: Some(LauncherTerminalStageV1::RequestRefusedBeforeBoundary),
+            finalization: None,
         };
 
         assert!(validate_pressure_terminal(&terminal, ExpectedTerminal::AllowedDecision).is_err());
@@ -334,6 +465,7 @@ mod tests {
             stage: Some(
                 LauncherTerminalStageV1::AuthorizationDecisionVerifiedBeforeLeaseBoundaryRemoved,
             ),
+            finalization: None,
         };
         assert!(validate_pressure_terminal(&terminal, ExpectedTerminal::AllowedDecision).is_ok());
         assert!(
@@ -357,6 +489,7 @@ mod tests {
                 outcome: LauncherTerminalOutcomeV1::Refused,
                 exit_code: Some(2),
                 stage: Some(stage),
+                finalization: None,
             };
             assert!(
                 validate_pressure_terminal(&terminal, ExpectedTerminal::ObservedDecisionOutcome)
@@ -371,6 +504,7 @@ mod tests {
             outcome: LauncherTerminalOutcomeV1::Refused,
             exit_code: Some(2),
             stage: Some(LauncherTerminalStageV1::RequestRefusedBeforeBoundary),
+            finalization: None,
         };
         assert!(
             validate_pressure_terminal(&unrelated, ExpectedTerminal::ObservedDecisionOutcome)

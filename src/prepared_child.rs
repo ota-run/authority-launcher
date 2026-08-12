@@ -25,7 +25,7 @@
 //! The child remains root and stopped until the launcher has durably recorded its identity and
 //! bound it to the exact systemd invocation scope. The resume path admits one bounded Ota
 //! process-posture preface, one signed V3 attestation bridge, and one bounded authorization-decision
-//! relay, then stops after one consumed lease and before selected execution.
+//! relay, then retains the exact child for selected execution after one consumed lease.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
@@ -34,27 +34,33 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use ota_authority_protocol::{
     ATTESTATION_RESPONSE, AUTHORIZATION_DECISION, AUTHORIZATION_DECISION_DOMAIN_V1,
     AUTHORIZATION_REQUEST, AUTHORIZATION_REQUEST_DOMAIN_V1, AuthorizationDecision,
     AuthorizationDecisionAdmissionV1, AuthorizationDecisionPayload,
-    AuthorizationDecisionRelayEvidenceV1, AuthorizationRequest, BrokerChallenge, LEASE_CONSUME,
+    AuthorizationDecisionRelayEvidenceV1, AuthorizationRequest, BrokerChallenge,
+    LAUNCHER_EXECUTION_COMPLETION_PERSISTENCE, LAUNCHER_OUTPUT, LEASE_CONSUME,
     LEASE_CONSUME_RESPONSE, LEASE_CONSUMPTION_INTENT_PERSISTENCE, LEASE_CONSUMPTION_PERSISTENCE,
-    LEASE_ISSUANCE, LauncherChildProcessV1, LauncherStartupContinuationV1, LeaseConsumeRequest,
-    LeaseConsumeResponsePayload, LeaseConsumptionAdmissionV1, LeaseConsumptionIntentPersistenceV1,
+    LEASE_ISSUANCE, LauncherChildProcessV1, LauncherExecutionCompletionPersistenceV1,
+    LauncherExecutionCompletionV1, LauncherOutputFrameV1, LauncherOutputStreamV1,
+    LauncherStartupContinuationV1, LeaseConsumeRequest, LeaseConsumeResponsePayload,
+    LeaseConsumptionAdmissionV1, LeaseConsumptionIntentPersistenceV1,
     LeaseConsumptionIntentRelayEvidenceV1, LeaseConsumptionPersistenceV1,
     LeaseConsumptionRelayEvidenceV1, MAX_FRAME_BYTES, OtaProcessPostureV1, PreparedLeasePayload,
-    SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3, SignedBrokerMessage,
-    SignedLauncherAttestationV3, authorization_decision_admission_v1_identity,
+    SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3,
+    SignedBrokerMessage, SignedLauncherAttestationV3, authorization_decision_admission_v1_identity,
     authorization_decision_relay_evidence_v1_identity, decode_frame, encode_frame,
     launcher_attestation_identity_v3, launcher_child_process_identity,
-    launcher_startup_continuation_identity, lease_consumption_admission_v1_identity,
-    lease_consumption_intent_persistence_v1_identity,
+    launcher_execution_completion_persistence_v1_identity,
+    launcher_execution_completion_v1_identity, launcher_startup_continuation_identity,
+    lease_consumption_admission_v1_identity, lease_consumption_intent_persistence_v1_identity,
     lease_consumption_intent_relay_evidence_v1_identity, lease_consumption_persistence_v1_identity,
     lease_consumption_relay_evidence_v1_identity, message_identity, ota_process_posture_identity,
-    sha256_identity,
+    sha256_identity, validate_launcher_output_frame_v1,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -91,12 +97,20 @@ pub(crate) enum PreparedChildError {
     AuthorizationAdmissionMismatch,
     #[error("the protected Ota child authorization decision bridge is unavailable")]
     AuthorizationDecisionBridgeUnavailable,
+    #[error("the protected Ota child execution completion is unavailable")]
+    ExecutionCompletionUnavailable,
+    #[error("the protected Ota child execution completion does not match the consumed lease")]
+    ExecutionCompletionMismatch,
+    #[error("the protected Ota child output bridge is unavailable")]
+    OutputBridgeUnavailable,
 }
 
 pub(crate) struct PreparedChild {
     pid: libc::pid_t,
     pub record: LauncherChildProcessV1,
     launcher_session: UnixStream,
+    stdout: Option<OwnedFd>,
+    stderr: Option<OwnedFd>,
 }
 
 pub(crate) struct PreparedChildBinding<'a> {
@@ -318,9 +332,8 @@ impl PreparedChild {
         };
         intent.identity = lease_consumption_intent_relay_evidence_v1_identity(&intent)
             .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
-        record_intent(&intent).map_err(|error| {
+        record_intent(&intent).inspect_err(|_| {
             pressure_v3_stage("lease_consumption_intent_recording_failed");
-            error
         })?;
         let mut intent_persistence = LeaseConsumptionIntentPersistenceV1 {
             schema_version: 1,
@@ -546,6 +559,103 @@ impl PreparedChild {
         }
     }
 
+    pub(crate) fn relay_selected_execution(
+        &mut self,
+        client: &UnixStream,
+        consumption: &LeaseConsumptionRelayEvidenceV1,
+        mut persist_completion: impl FnMut(
+            LauncherExecutionCompletionV1,
+        ) -> Result<(), PreparedChildError>,
+    ) -> Result<(LauncherExecutionCompletionV1, Option<i32>), PreparedChildError> {
+        let stdout = self
+            .stdout
+            .take()
+            .ok_or(PreparedChildError::OutputBridgeUnavailable)?;
+        let stderr = self
+            .stderr
+            .take()
+            .ok_or(PreparedChildError::OutputBridgeUnavailable)?;
+        let output = Arc::new(Mutex::new((
+            client
+                .try_clone()
+                .map_err(|_| PreparedChildError::OutputBridgeUnavailable)?,
+            0_u64,
+        )));
+        let stdout_thread = spawn_output_relay(
+            stdout,
+            LauncherOutputStreamV1::Stdout,
+            self.record.invocation_id.clone(),
+            Arc::clone(&output),
+        );
+        let stderr_thread = spawn_output_relay(
+            stderr,
+            LauncherOutputStreamV1::Stderr,
+            self.record.invocation_id.clone(),
+            output,
+        );
+
+        let completion: LauncherExecutionCompletionV1 =
+            read_json_frame_blocking(&mut self.launcher_session)
+                .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
+        if launcher_execution_completion_v1_identity(&completion)
+            .ok()
+            .as_deref()
+            != Some(completion.identity.as_str())
+            || completion.invocation_id != self.record.invocation_id
+            || completion.lease_consumption_admission_identity != consumption.admission.identity
+            || completion.work_unit_identity != consumption.admission.work_unit_identity
+            || completion.crossing_transaction_id != consumption.admission.crossing_transaction_id
+            || completion.pending_crossing_transaction_identity
+                != consumption.admission.crossing_transaction_identity
+        {
+            return Err(PreparedChildError::ExecutionCompletionMismatch);
+        }
+        persist_completion(completion.clone())?;
+        let mut persistence = LauncherExecutionCompletionPersistenceV1 {
+            schema_version: 1,
+            identity: String::new(),
+            message_kind: LAUNCHER_EXECUTION_COMPLETION_PERSISTENCE.into(),
+            completion_identity: completion.identity.clone(),
+        };
+        persistence.identity = launcher_execution_completion_persistence_v1_identity(&persistence)
+            .map_err(|_| PreparedChildError::ExecutionCompletionMismatch)?;
+        write_json_frame_blocking(&mut self.launcher_session, &persistence)
+            .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
+
+        let observed_exit_code = self.wait_and_reap_selected_child()?;
+        if stdout_thread.join().ok() != Some(Ok(())) || stderr_thread.join().ok() != Some(Ok(())) {
+            return Err(PreparedChildError::OutputBridgeUnavailable);
+        }
+        if observed_exit_code != completion.exit_code {
+            return Err(PreparedChildError::ExecutionCompletionMismatch);
+        }
+        Ok((completion, observed_exit_code))
+    }
+
+    fn wait_and_reap_selected_child(&mut self) -> Result<Option<i32>, PreparedChildError> {
+        if self.pid <= 0 {
+            return Err(PreparedChildError::CleanupFailed);
+        }
+        let mut status = 0;
+        loop {
+            let observed = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+            if observed == self.pid {
+                self.pid = 0;
+                return if libc::WIFEXITED(status) {
+                    Ok(Some(libc::WEXITSTATUS(status)))
+                } else if libc::WIFSIGNALED(status) {
+                    Ok(None)
+                } else {
+                    Err(PreparedChildError::CleanupFailed)
+                };
+            }
+            if observed < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(PreparedChildError::CleanupFailed);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn abandon_for_recovery(mut self) {
         self.pid = 0;
@@ -619,6 +729,8 @@ pub(crate) fn prepare_stopped_child(
     set_cloexec(launcher_session.as_raw_fd())?;
     set_cloexec(child_session.as_raw_fd())?;
     let null = open_null()?;
+    let (stdout, child_stdout) = pipe_cloexec()?;
+    let (stderr, child_stderr) = pipe_cloexec()?;
     let ota_binary = duplicate_high(ota_binary.as_raw_fd(), 1_000)?;
     let repository_descriptor = duplicate_high(repository.descriptor.as_raw_fd(), 1_000)?;
     let expected_descriptors = [
@@ -629,12 +741,12 @@ pub(crate) fn prepare_stopped_child(
         ),
         (
             libc::STDOUT_FILENO,
-            descriptor_object(null.as_raw_fd())?,
+            descriptor_object(child_stdout.as_raw_fd())?,
             false,
         ),
         (
             libc::STDERR_FILENO,
-            descriptor_object(null.as_raw_fd())?,
+            descriptor_object(child_stderr.as_raw_fd())?,
             false,
         ),
         (
@@ -668,6 +780,8 @@ pub(crate) fn prepare_stopped_child(
             ota_binary.as_raw_fd(),
             repository_descriptor.as_raw_fd(),
             null.as_raw_fd(),
+            child_stdout.as_raw_fd(),
+            child_stderr.as_raw_fd(),
             execution,
             argv_pointers.as_slice(),
             environment_pointers.as_slice(),
@@ -676,6 +790,8 @@ pub(crate) fn prepare_stopped_child(
         unsafe { libc::_exit(status) };
     }
     drop(child_session);
+    drop(child_stdout);
+    drop(child_stderr);
 
     if let Err(error) = wait_for_stop(
         child_pid,
@@ -722,6 +838,8 @@ pub(crate) fn prepare_stopped_child(
         pid: child_pid,
         record,
         launcher_session,
+        stdout: Some(stdout),
+        stderr: Some(stderr),
     })
 }
 
@@ -809,6 +927,83 @@ fn read_json_frame<T: DeserializeOwned>(
     serde_json::from_slice(payload).map_err(|_| PreparedChildError::AttestationBridgeUnavailable)
 }
 
+fn read_json_frame_blocking<T: DeserializeOwned>(
+    stream: &mut UnixStream,
+) -> Result<T, PreparedChildError> {
+    stream
+        .set_read_timeout(None)
+        .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
+    let mut header = [0_u8; 4];
+    stream
+        .read_exact(&mut header)
+        .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
+    let length = u32::from_be_bytes(header) as usize;
+    if length == 0 || length > MAX_FRAME_BYTES {
+        return Err(PreparedChildError::ExecutionCompletionUnavailable);
+    }
+    let mut payload = vec![0_u8; length];
+    stream
+        .read_exact(&mut payload)
+        .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
+    serde_json::from_slice(&payload).map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)
+}
+
+fn write_json_frame_blocking<T: Serialize>(
+    stream: &mut UnixStream,
+    value: &T,
+) -> Result<(), PreparedChildError> {
+    let payload = serde_json::to_vec(value)
+        .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
+    let frame =
+        encode_frame(&payload).map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
+    stream
+        .set_write_timeout(None)
+        .and_then(|()| stream.write_all(&frame))
+        .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)
+}
+
+fn spawn_output_relay(
+    descriptor: OwnedFd,
+    stream: LauncherOutputStreamV1,
+    invocation_id: String,
+    output: Arc<Mutex<(UnixStream, u64)>>,
+) -> thread::JoinHandle<Result<(), PreparedChildError>> {
+    thread::spawn(move || {
+        let mut source = File::from(descriptor);
+        let mut payload = vec![0_u8; ota_authority_protocol::MAX_LAUNCHER_OUTPUT_PAYLOAD_BYTES_V1];
+        loop {
+            let read = match source.read(&mut payload) {
+                Ok(0) => return Ok(()),
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(PreparedChildError::OutputBridgeUnavailable),
+            };
+            let mut output = output
+                .lock()
+                .map_err(|_| PreparedChildError::OutputBridgeUnavailable)?;
+            let frame = LauncherOutputFrameV1 {
+                message_kind: LAUNCHER_OUTPUT.into(),
+                protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
+                invocation_id: invocation_id.clone(),
+                sequence: output.1,
+                stream,
+                payload: payload[..read].to_vec(),
+            };
+            validate_launcher_output_frame_v1(&frame)
+                .map_err(|_| PreparedChildError::OutputBridgeUnavailable)?;
+            let encoded = serde_json::to_vec(&frame)
+                .map_err(|_| PreparedChildError::OutputBridgeUnavailable)?;
+            let encoded =
+                encode_frame(&encoded).map_err(|_| PreparedChildError::OutputBridgeUnavailable)?;
+            output
+                .0
+                .write_all(&encoded)
+                .map_err(|_| PreparedChildError::OutputBridgeUnavailable)?;
+            output.1 = output.1.saturating_add(1);
+        }
+    })
+}
+
 fn read_exact_until(
     stream: &mut UnixStream,
     buffer: &mut [u8],
@@ -860,6 +1055,19 @@ fn open_null() -> Result<OwnedFd, PreparedChildError> {
     Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
 }
 
+fn pipe_cloexec() -> Result<(OwnedFd, OwnedFd), PreparedChildError> {
+    let mut descriptors = [0; 2];
+    if unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(PreparedChildError::ForkFailed);
+    }
+    Ok(unsafe {
+        (
+            OwnedFd::from_raw_fd(descriptors[0]),
+            OwnedFd::from_raw_fd(descriptors[1]),
+        )
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_child(
     parent_pid: libc::pid_t,
@@ -868,6 +1076,8 @@ fn run_child(
     ota_binary: RawFd,
     repository: RawFd,
     null: RawFd,
+    stdout: RawFd,
+    stderr: RawFd,
     execution: &RunAs,
     argv: &[*const libc::c_char],
     environment: &[*const libc::c_char],
@@ -880,8 +1090,8 @@ fn run_child(
     }
     if !duplicate_descriptor(child_session, session_target, false)
         || !duplicate_descriptor(null, libc::STDIN_FILENO, false)
-        || !duplicate_descriptor(null, libc::STDOUT_FILENO, false)
-        || !duplicate_descriptor(null, libc::STDERR_FILENO, false)
+        || !duplicate_descriptor(stdout, libc::STDOUT_FILENO, false)
+        || !duplicate_descriptor(stderr, libc::STDERR_FILENO, false)
     {
         return 11;
     }
@@ -1511,6 +1721,8 @@ mod tests {
             pid: 0,
             record,
             launcher_session,
+            stdout: None,
+            stderr: None,
         };
         child
             .continue_and_bridge_v3_attestation(&posture, &mut proxy, Duration::from_secs(1))
@@ -1565,6 +1777,8 @@ mod tests {
             pid: 0,
             record: child_record,
             launcher_session,
+            stdout: None,
+            stderr: None,
         };
         assert_eq!(
             child.continue_and_bridge_v3_attestation(&posture, &mut proxy, Duration::from_secs(1),),
@@ -1632,6 +1846,8 @@ mod tests {
                 working_directory_identity: identity('d'),
             },
             launcher_session,
+            stdout: None,
+            stderr: None,
         };
         let mut recorded = Vec::new();
         let observed = child
@@ -1682,6 +1898,8 @@ mod tests {
             pid: 0,
             record: child.record.clone(),
             launcher_session,
+            stdout: None,
+            stderr: None,
         };
         assert_eq!(
             child.relay_v3_authorization_decisions(
@@ -1719,6 +1937,8 @@ mod tests {
             pid: 0,
             record: child.record.clone(),
             launcher_session,
+            stdout: None,
+            stderr: None,
         };
         assert_eq!(
             child.relay_v3_authorization_decisions(
@@ -1935,6 +2155,8 @@ mod tests {
                 working_directory_identity: identity('e'),
             },
             launcher_session,
+            stdout: None,
+            stderr: None,
         };
         let mut consumptions = Vec::new();
         let result = child
@@ -1960,6 +2182,95 @@ mod tests {
         );
         core_thread.join().expect("core thread");
         broker_thread.join().expect("broker thread");
+
+        let consumption = consumptions.pop().expect("consumption evidence");
+        let (stdout, child_stdout) = pipe_cloexec().expect("stdout pipe");
+        let (stderr, child_stderr) = pipe_cloexec().expect("stderr pipe");
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork selected child");
+        if pid == 0 {
+            drop(stdout);
+            drop(stderr);
+            let stdout_payload = b"selected stdout\n";
+            let stderr_payload = b"selected stderr\n";
+            unsafe {
+                libc::write(
+                    child_stdout.as_raw_fd(),
+                    stdout_payload.as_ptr().cast(),
+                    stdout_payload.len(),
+                );
+                libc::write(
+                    child_stderr.as_raw_fd(),
+                    stderr_payload.as_ptr().cast(),
+                    stderr_payload.len(),
+                );
+                libc::_exit(0);
+            }
+        }
+        drop(child_stdout);
+        drop(child_stderr);
+        let (launcher_session, mut core) = UnixStream::pair().expect("completion session");
+        let (client, mut pressure_client) = UnixStream::pair().expect("output session");
+        let mut completion = LauncherExecutionCompletionV1 {
+            schema_version: 1,
+            identity: String::new(),
+            message_kind: ota_authority_protocol::LAUNCHER_EXECUTION_COMPLETION.into(),
+            invocation_id: String::from("invocation"),
+            lease_consumption_admission_identity: consumption.admission.identity.clone(),
+            work_unit_identity: consumption.admission.work_unit_identity.clone(),
+            crossing_transaction_id: consumption.admission.crossing_transaction_id.clone(),
+            pending_crossing_transaction_identity: consumption
+                .admission
+                .crossing_transaction_identity
+                .clone(),
+            crossing_transaction_identity: identity('f'),
+            outcome: ota_authority_protocol::LauncherExecutionOutcomeV1::Completed,
+            exit_code: Some(0),
+            receipt_status: String::from("archived"),
+        };
+        completion.identity =
+            launcher_execution_completion_v1_identity(&completion).expect("completion identity");
+        let expected_completion = completion.clone();
+        let core_thread = std::thread::spawn(move || {
+            write_json_frame_blocking(&mut core, &completion).expect("send completion");
+            let persistence: LauncherExecutionCompletionPersistenceV1 =
+                read_json_frame_blocking(&mut core).expect("completion persistence");
+            assert_eq!(persistence.completion_identity, completion.identity);
+        });
+        let mut child = PreparedChild {
+            pid,
+            record: LauncherChildProcessV1 {
+                schema_version: 1,
+                identity: identity('9'),
+                invocation_id: String::from("invocation"),
+                request_identity: identity('a'),
+                pid: pid as u32,
+                process_start_time_identity: identity('b'),
+                ota_binary_identity: identity('c'),
+                principal_mapping_identity: identity('d'),
+                working_directory_identity: identity('e'),
+            },
+            launcher_session,
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+        };
+        let mut persisted = Vec::new();
+        let (observed_completion, observed_exit) = child
+            .relay_selected_execution(&client, &consumption, |completion| {
+                persisted.push(completion);
+                Ok(())
+            })
+            .expect("selected execution relay");
+        assert_eq!(observed_completion, expected_completion);
+        assert_eq!(observed_exit, Some(0));
+        assert_eq!(persisted, vec![expected_completion]);
+        core_thread.join().expect("completion core thread");
+        let first: LauncherOutputFrameV1 =
+            read_json_frame_blocking(&mut pressure_client).expect("first output");
+        let second: LauncherOutputFrameV1 =
+            read_json_frame_blocking(&mut pressure_client).expect("second output");
+        assert_eq!((first.sequence, second.sequence), (0, 1));
+        assert_ne!(first.stream, second.stream);
     }
 
     #[test]

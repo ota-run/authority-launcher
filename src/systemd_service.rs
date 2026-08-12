@@ -20,14 +20,14 @@
 //
 //   If you need additional information or have any questions, please email: os@ota.run
 
-//! Linux socket-activation admission for the planned protected launcher service.
+//! Linux socket-activation admission for the protected launcher service.
 //!
-//! This foundation deliberately stops after one consumed lease and before selected execution. It proves the
-//! service can consume only the fixed listener, derive the connecting job principal through
+//! The service consumes only the fixed listener, derives the connecting job principal through
 //! `SO_PEERCRED`, durably prepare an exact stopped Ota child, attach and verify its transient
 //! systemd scope, admit that child's exact bounded process-posture preface, and bridge one signed
 //! V3 attestation, one exact signed authorization decision, and one transaction-bound consumed
-//! lease relay. Exact cleanup is still mandatory.
+//! lease relay. Selected execution starts only after consumption; exact completion persistence,
+//! child reaping, and scope/cgroup/active-slot cleanup are mandatory before a successful terminal.
 
 use std::cell::RefCell;
 use std::env;
@@ -47,12 +47,14 @@ use ota_authority_launcher::linux_observations::{
 };
 use ota_authority_protocol::{
     ATTESTATION_RESPONSE, AuthorizationDecision, LAUNCHER_TERMINAL, LauncherAttestationClaimsV3,
-    LauncherAttestationSigningRequestV1, LauncherInvocationRequestV1, LauncherTerminalFrameV1,
+    LauncherAttestationSigningRequestV1, LauncherExecutionFinalizationV1,
+    LauncherExecutionOutcomeV1, LauncherInvocationRequestV1, LauncherTerminalFrameV1,
     LauncherTerminalOutcomeV1, LauncherTerminalStageV1, LauncherWorkingDirectoryV1,
-    MAX_FRAME_BYTES, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1,
-    SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3, SystemdProtectedLauncherInstanceEvidenceV1,
-    decode_frame, encode_frame, launcher_attestation_claims_v3_identity,
-    launcher_attestation_signing_request_v1_identity, launcher_invocation_request_identity,
+    LeaseConsumptionRelayEvidenceV1, MAX_FRAME_BYTES, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1,
+    SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1, SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3,
+    SystemdProtectedLauncherInstanceEvidenceV1, decode_frame, encode_frame,
+    launcher_attestation_claims_v3_identity, launcher_attestation_signing_request_v1_identity,
+    launcher_execution_finalization_v1_identity, launcher_invocation_request_identity,
     launcher_working_directory_identity, systemd_job_principal_profile_identity,
     systemd_job_principal_profile_v2, systemd_launcher_profile_identity,
     systemd_launcher_profile_v3, systemd_protected_launcher_instance_v3_foundation_identity,
@@ -72,8 +74,8 @@ use crate::installation_manifest::{
     load_protected_installation_manifest,
 };
 use crate::prepared_child::{
-    PreparedChildBinding, PreparedChildError, prepare_stopped_child, recorded_child_is_live_exact,
-    terminate_recorded_child,
+    PreparedChild, PreparedChildBinding, PreparedChildError, prepare_stopped_child,
+    recorded_child_is_live_exact, terminate_recorded_child,
 };
 use crate::systemd_runtime_observations::verify_systemd_runtime;
 use crate::systemd_scope::{ScopeBoundary, SystemdScopeError, SystemdScopeManager};
@@ -102,6 +104,11 @@ const PRESSURE_EXIT_AFTER_INTENT_ACK_MARKER: &str =
     "/run/ota/authority-launcher-pressure-exit-after-intent-ack";
 #[cfg(feature = "systemd-pressure-faults")]
 const PRESSURE_EXIT_AFTER_INTENT_ACK_CODE: i32 = 89;
+#[cfg(feature = "systemd-pressure-faults")]
+const PRESSURE_EXIT_AFTER_EXECUTION_COMPLETION_MARKER: &str =
+    "/run/ota/authority-launcher-pressure-exit-after-execution-completion";
+#[cfg(feature = "systemd-pressure-faults")]
+const PRESSURE_EXIT_AFTER_EXECUTION_COMPLETION_CODE: i32 = 90;
 
 #[derive(Debug, Error)]
 pub(crate) enum SystemdServiceError {
@@ -141,8 +148,24 @@ pub(crate) enum SystemdServiceError {
     AuthorizationDecisionRefused,
     #[error("the systemd launcher could not confirm terminal scope cleanup")]
     ScopeCleanupFailed,
-    #[error("the systemd launcher admission foundation does not yet execute governed work")]
-    ExecutionNotEnabled,
+    #[error("the systemd launcher selected execution failed")]
+    SelectedExecutionFailed,
+}
+
+struct SelectedBoundary {
+    child: PreparedChild,
+    scope: ota_authority_protocol::LauncherSystemdScopeV1,
+    active_slot: ActiveSlot,
+    consumption: LeaseConsumptionRelayEvidenceV1,
+}
+
+enum BoundaryAdmission {
+    Refused {
+        child: ota_authority_protocol::LauncherChildProcessV1,
+        decision: AuthorizationDecision,
+        consumed: bool,
+    },
+    Selected(Box<SelectedBoundary>),
 }
 
 pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
@@ -200,6 +223,7 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
                 LauncherTerminalOutcomeV1::Refused,
                 Some(2),
                 Some(LauncherTerminalStageV1::RequestRefusedBeforeBoundary),
+                None,
             )?;
             return Err(map_target_directory_error(error));
         }
@@ -221,9 +245,11 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
     );
 
     match child_boundary {
-        Ok((_prepared_child, decision, consumed)) => {
-            // Lease issuance and execution remain disabled. Refusal is emitted only after the
-            // prepared child was killed, reaped, and removed from the durable active-slot store.
+        Ok(BoundaryAdmission::Refused {
+            child: _prepared_child,
+            decision,
+            consumed,
+        }) => {
             write_terminal(
                 &mut stream,
                 invocation_id.as_str(),
@@ -240,8 +266,12 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
                         LauncherTerminalStageV1::AuthorityRefusedBoundaryRemoved
                     }
                 }),
+                None,
             )?;
-            Err(SystemdServiceError::ExecutionNotEnabled)
+            Err(SystemdServiceError::AuthorizationDecisionRefused)
+        }
+        Ok(BoundaryAdmission::Selected(boundary)) => {
+            execute_selected_boundary(config, &mut stream, invocation_id.as_str(), *boundary)
         }
         Err(
             error @ (SystemdServiceError::PreAuthorizationProtocolRefused
@@ -253,6 +283,7 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
                 LauncherTerminalOutcomeV1::Refused,
                 Some(2),
                 Some(LauncherTerminalStageV1::PreAuthorizationProtocolRefusedBoundaryRemoved),
+                None,
             )?;
             Err(error)
         }
@@ -266,6 +297,7 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
                 LauncherTerminalOutcomeV1::Refused,
                 Some(2),
                 Some(LauncherTerminalStageV1::PreAuthorizationProtocolRefusedBoundaryRemoved),
+                None,
             )?;
             Err(error)
         }
@@ -276,10 +308,158 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
                 LauncherTerminalOutcomeV1::Failed,
                 Some(1),
                 Some(LauncherTerminalStageV1::BoundaryFailed),
+                None,
             )?;
             Err(error)
         }
     }
+}
+
+fn execute_selected_boundary(
+    config: &SystemdLauncherServiceConfigV1,
+    stream: &mut UnixStream,
+    invocation_id: &str,
+    mut boundary: SelectedBoundary,
+) -> Result<u8, SystemdServiceError> {
+    let completion =
+        boundary
+            .child
+            .relay_selected_execution(stream, &boundary.consumption, |completion| {
+                boundary
+                    .active_slot
+                    .record_execution_completion(completion)
+                    .map_err(|_| PreparedChildError::ExecutionCompletionMismatch)?;
+                pressure_exit_after_execution_completion_recorded()
+                    .map_err(|_| PreparedChildError::ExecutionCompletionMismatch)
+            });
+    let (completion, observed_exit_code) = match completion {
+        Ok(completion) => completion,
+        Err(error) => {
+            return fail_selected_boundary(
+                config,
+                stream,
+                invocation_id,
+                boundary,
+                map_prepared_child_error(error),
+            );
+        }
+    };
+
+    let scope_manager = SystemdScopeManager::connect().map_err(map_systemd_scope_error)?;
+    if scope_manager
+        .stop_and_confirm_empty(
+            &boundary.scope,
+            &boundary.child.record,
+            Duration::from_secs(config.maximum_terminal_wait_seconds),
+        )
+        .is_err()
+    {
+        return fail_selected_boundary(
+            config,
+            stream,
+            invocation_id,
+            boundary,
+            SystemdServiceError::ScopeCleanupFailed,
+        );
+    }
+    let child_identity = boundary.child.record.identity.clone();
+    let scope_identity = boundary.scope.identity.clone();
+    if boundary.active_slot.execution_completion() != Some(&completion) {
+        return fail_selected_boundary(
+            config,
+            stream,
+            invocation_id,
+            boundary,
+            SystemdServiceError::SelectedExecutionFailed,
+        );
+    }
+    boundary
+        .active_slot
+        .finalize()
+        .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
+
+    let mut finalization = LauncherExecutionFinalizationV1 {
+        schema_version: 1,
+        identity: String::new(),
+        completion: completion.clone(),
+        child_identity,
+        scope_identity,
+        observed_exit_code,
+        child_reaped: true,
+        scope_removed: true,
+        cgroup_empty_or_absent: true,
+        active_slot_removed: true,
+    };
+    finalization.identity = launcher_execution_finalization_v1_identity(&finalization)
+        .map_err(|_| SystemdServiceError::SelectedExecutionFailed)?;
+    let (outcome, stage) = match completion.outcome {
+        LauncherExecutionOutcomeV1::Completed => (
+            LauncherTerminalOutcomeV1::Completed,
+            LauncherTerminalStageV1::SelectedExecutionCompletedBoundaryRemoved,
+        ),
+        LauncherExecutionOutcomeV1::Failed => (
+            LauncherTerminalOutcomeV1::Failed,
+            LauncherTerminalStageV1::SelectedExecutionFailedBoundaryRemoved,
+        ),
+        LauncherExecutionOutcomeV1::Interrupted => (
+            LauncherTerminalOutcomeV1::Cancelled,
+            LauncherTerminalStageV1::SelectedExecutionInterruptedBoundaryRemoved,
+        ),
+    };
+    write_terminal(
+        stream,
+        invocation_id,
+        outcome,
+        observed_exit_code,
+        Some(stage),
+        Some(finalization),
+    )?;
+    Ok(0)
+}
+
+fn fail_selected_boundary(
+    config: &SystemdLauncherServiceConfigV1,
+    stream: &mut UnixStream,
+    invocation_id: &str,
+    mut boundary: SelectedBoundary,
+    error: SystemdServiceError,
+) -> Result<u8, SystemdServiceError> {
+    let scope_cleanup = SystemdScopeManager::connect()
+        .map_err(map_systemd_scope_error)
+        .and_then(|manager| {
+            manager
+                .stop_and_confirm_empty(
+                    &boundary.scope,
+                    &boundary.child.record,
+                    Duration::from_secs(config.maximum_terminal_wait_seconds),
+                )
+                .map_err(map_systemd_scope_error)
+        });
+    let child_cleanup = boundary
+        .child
+        .terminate_and_reap()
+        .map_err(map_prepared_child_error);
+    if scope_cleanup.is_ok() && child_cleanup.is_ok() {
+        boundary
+            .active_slot
+            .finalize()
+            .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
+    }
+    write_terminal(
+        stream,
+        invocation_id,
+        LauncherTerminalOutcomeV1::Failed,
+        Some(1),
+        Some(LauncherTerminalStageV1::BoundaryFailed),
+        None,
+    )?;
+    Err(if scope_cleanup.is_err() {
+        SystemdServiceError::ScopeCleanupFailed
+    } else if child_cleanup.is_err() {
+        SystemdServiceError::ChildCleanupFailed
+    } else {
+        error
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -296,14 +476,7 @@ fn prepare_disabled_child_boundary(
     active_slot_directory: &Path,
     active_slot_owner_uid: u32,
     active_slot_trusted_root: &Path,
-) -> Result<
-    (
-        ota_authority_protocol::LauncherChildProcessV1,
-        AuthorizationDecision,
-        bool,
-    ),
-    SystemdServiceError,
-> {
+) -> Result<BoundaryAdmission, SystemdServiceError> {
     let scope_manager = SystemdScopeManager::connect().map_err(map_systemd_scope_error)?;
     prepare_disabled_child_boundary_with_scope(
         config,
@@ -406,7 +579,7 @@ fn prepare_disabled_child_boundary(
             if lease_consumption.is_some() != active_slot.borrow().has_lease_consumption() {
                 return Err(SystemdServiceError::AuthorizationDecisionRefused);
             }
-            Ok(decision)
+            Ok((decision, lease_consumption))
         },
     )
 }
@@ -605,21 +778,20 @@ fn prepare_disabled_child_boundary_with_scope<F>(
     active_slot_trusted_root: &Path,
     scope_manager: &impl ScopeBoundary,
     posture_gate: F,
-) -> Result<
-    (
-        ota_authority_protocol::LauncherChildProcessV1,
-        AuthorizationDecision,
-        bool,
-    ),
-    SystemdServiceError,
->
+) -> Result<BoundaryAdmission, SystemdServiceError>
 where
     F: FnOnce(
         &mut crate::prepared_child::PreparedChild,
         &ota_authority_protocol::LauncherPrincipalMappingV1,
         &ota_authority_protocol::LauncherSystemdScopeV1,
         &mut ActiveSlot,
-    ) -> Result<AuthorizationDecision, SystemdServiceError>,
+    ) -> Result<
+        (
+            AuthorizationDecision,
+            Option<LeaseConsumptionRelayEvidenceV1>,
+        ),
+        SystemdServiceError,
+    >,
 {
     let request_identity = launcher_invocation_request_identity(request)
         .map_err(|_| SystemdServiceError::InvalidRequest)?;
@@ -724,6 +896,17 @@ where
     let posture_result = posture_gate(&mut child, &principal_mapping, &scope, &mut active_slot);
     let retain_for_recovery = posture_result.is_err() && active_slot.has_lease_consumption_intent();
     let consumed = active_slot.has_lease_consumption();
+    if let Ok((AuthorizationDecision::Allowed, Some(consumption))) = &posture_result {
+        if !consumed {
+            return Err(SystemdServiceError::AuthorizationDecisionRefused);
+        }
+        return Ok(BoundaryAdmission::Selected(Box::new(SelectedBoundary {
+            child,
+            scope,
+            active_slot,
+            consumption: consumption.clone(),
+        })));
+    }
     let child_record = child.record.clone();
     scope_manager
         .stop_and_confirm_empty(
@@ -740,8 +923,12 @@ where
             .finalize()
             .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
     }
-    let decision = posture_result?;
-    Ok((child_record, decision, consumed))
+    let (decision, _) = posture_result?;
+    Ok(BoundaryAdmission::Refused {
+        child: child_record,
+        decision,
+        consumed,
+    })
 }
 
 #[cfg(feature = "systemd-pressure-faults")]
@@ -793,6 +980,21 @@ fn pressure_exit_after_lease_consumption_recorded() -> Result<(), SystemdService
 }
 
 #[cfg(feature = "systemd-pressure-faults")]
+fn pressure_exit_after_execution_completion_recorded() -> Result<(), SystemdServiceError> {
+    if !consume_pressure_exit_marker(
+        Path::new(PRESSURE_EXIT_AFTER_EXECUTION_COMPLETION_MARKER),
+        Path::new("/"),
+        0,
+    )? {
+        return Ok(());
+    }
+    // The exact Core completion is durable, but Core has not received its persistence
+    // acknowledgement. Restart recovery must clean this abandoned child and scope without
+    // resuming the completed work unit or turning the journal into a successful terminal.
+    unsafe { libc::_exit(PRESSURE_EXIT_AFTER_EXECUTION_COMPLETION_CODE) }
+}
+
+#[cfg(feature = "systemd-pressure-faults")]
 pub(crate) fn pressure_exit_after_intent_persistence_acknowledged()
 -> Result<(), SystemdServiceError> {
     if !consume_pressure_exit_marker(
@@ -814,6 +1016,11 @@ pub(crate) fn pressure_exit_after_intent_persistence_acknowledged()
 
 #[cfg(not(feature = "systemd-pressure-faults"))]
 fn pressure_exit_after_lease_consumption_recorded() -> Result<(), SystemdServiceError> {
+    Ok(())
+}
+
+#[cfg(not(feature = "systemd-pressure-faults"))]
+fn pressure_exit_after_execution_completion_recorded() -> Result<(), SystemdServiceError> {
     Ok(())
 }
 
@@ -1092,6 +1299,7 @@ fn write_terminal(
     outcome: LauncherTerminalOutcomeV1,
     exit_code: Option<i32>,
     stage: Option<LauncherTerminalStageV1>,
+    finalization: Option<LauncherExecutionFinalizationV1>,
 ) -> Result<(), SystemdServiceError> {
     let terminal = LauncherTerminalFrameV1 {
         message_kind: LAUNCHER_TERMINAL.into(),
@@ -1100,6 +1308,7 @@ fn write_terminal(
         outcome,
         exit_code,
         stage,
+        finalization,
     };
     validate_launcher_terminal_frame_v1(&terminal)
         .map_err(|_| SystemdServiceError::InvalidRequest)?;
@@ -1752,7 +1961,7 @@ mod tests {
         let executable = std::fs::File::open("/bin/true").expect("test executable");
         let scope_boundary = RecordingScopeBoundary::default();
         let posture_gate_ran_after_scope = Cell::new(false);
-        let (child, decision, consumed) = prepare_disabled_child_boundary_with_scope(
+        let admission = prepare_disabled_child_boundary_with_scope(
             &config,
             &executable,
             &repository,
@@ -1779,10 +1988,18 @@ mod tests {
                         && journal.get("stage").and_then(serde_json::Value::as_str)
                             == Some("scope_attached"),
                 );
-                Ok(AuthorizationDecision::Allowed)
+                Ok((AuthorizationDecision::Allowed, None))
             },
         )
         .expect("prepare and clean child boundary");
+        let BoundaryAdmission::Refused {
+            child,
+            decision,
+            consumed,
+        } = admission
+        else {
+            panic!("unconsumed decision must retain refusal behavior");
+        };
         assert_eq!(decision, AuthorizationDecision::Allowed);
         assert!(!consumed);
         assert!(posture_gate_ran_after_scope.get());
@@ -1865,7 +2082,7 @@ mod tests {
                 temporary.path(),
                 &UncertainScopeBoundary,
                 |_child, _principal_mapping, _scope, _active_slot| {
-                    Ok(AuthorizationDecision::Allowed)
+                    Ok((AuthorizationDecision::Allowed, None))
                 },
             ),
             Err(SystemdServiceError::ScopeCleanupFailed)
