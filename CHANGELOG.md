@@ -50,7 +50,8 @@
   kernel-credential preface. Launcher now requires matching `SCM_CREDENTIALS` and `SCM_PIDFD`, then
   retains and rechecks that pidfd and the manifest-bound executable around relay traffic. It does
   not mistake PID 1, which owns the activated listener, for the service process that accepted the
-  connection.
+  connection. The peer must retain the authenticated session until Launcher closes it after final
+  revalidation; an early peer exit remains a refusal.
 
 - Verify protected producer freshness at response receipt rather than before transport. A signed
   response issued across a whole-second boundary can no longer be rejected against a stale

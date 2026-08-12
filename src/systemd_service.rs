@@ -1136,7 +1136,8 @@ mod tests {
 
         let (stream, _) = listener.accept().expect("accepted broker peer");
         let peer = receive_authenticated_peer_preface(&stream).expect("guarded broker peer");
-        let mut executable = std::fs::File::open("/proc/self/exe").expect("test executable");
+        let mut executable = std::fs::File::open(format!("/proc/{}/exe", peer.pid))
+            .expect("observed broker executable");
         let executable_identity =
             crate::config::sha256_file_identity(&mut executable).expect("executable identity");
         let mut proxy = ProtectedBrokerProxy {
@@ -1145,6 +1146,9 @@ mod tests {
             executable_identity,
         };
 
+        proxy
+            .revalidate()
+            .expect("broker peer is admitted before exit control");
         let result = proxy.run_revalidated(|_| {
             unsafe {
                 libc::kill(peer_pid, libc::SIGKILL);
@@ -1157,6 +1161,57 @@ mod tests {
             result,
             Err(SystemdServiceError::BrokerProxyUnavailable)
         ));
+    }
+
+    #[test]
+    fn protected_broker_proxy_accepts_peer_retained_until_launcher_close() {
+        let temporary = tempdir().expect("temporary broker socket directory");
+        let socket_path = temporary.path().join("broker.sock");
+        let listener = UnixListener::bind(&socket_path).expect("broker listener");
+
+        let peer_pid = unsafe { libc::fork() };
+        assert!(peer_pid >= 0, "fork must succeed");
+        if peer_pid == 0 {
+            drop(listener);
+            let result = UnixStream::connect(&socket_path).and_then(|mut stream| {
+                stream.write_all(
+                    ota_authority_launcher::linux_observations::BROKER_PROXY_IDENTITY_PREFACE,
+                )?;
+                let mut unexpected = [0_u8; 1];
+                match stream.read(&mut unexpected)? {
+                    0 => Ok(()),
+                    _ => Err(std::io::Error::other(
+                        "unexpected launcher data after broker operation",
+                    )),
+                }
+            });
+            unsafe { libc::_exit(if result.is_ok() { 0 } else { 90 }) };
+        }
+
+        let (stream, _) = listener.accept().expect("accepted broker peer");
+        let peer = receive_authenticated_peer_preface(&stream).expect("guarded broker peer");
+        let mut executable = std::fs::File::open(format!("/proc/{}/exe", peer.pid))
+            .expect("observed broker executable");
+        let executable_identity =
+            crate::config::sha256_file_identity(&mut executable).expect("executable identity");
+        let mut proxy = ProtectedBrokerProxy {
+            stream,
+            peer,
+            executable_identity,
+        };
+
+        proxy
+            .revalidate()
+            .expect("live peer satisfies initial broker identity");
+        proxy
+            .run_revalidated(|_| Ok(()))
+            .expect("live peer remains valid through broker operation");
+        drop(proxy);
+
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(peer_pid, &mut status, 0) }, peer_pid);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 
     #[cfg(feature = "systemd-pressure-faults")]

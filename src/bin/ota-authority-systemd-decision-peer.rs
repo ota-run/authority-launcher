@@ -30,7 +30,7 @@ mod linux {
     use std::io::{Read, Write};
     use std::os::fd::FromRawFd;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::Path;
     use std::time::Duration;
 
@@ -142,7 +142,21 @@ mod linux {
             write_frame(&mut stream, &second)?;
             log_decision_sent(&scenario, 2, &second)?;
         }
+        wait_for_launcher_close(&mut stream)?;
         Ok(())
+    }
+
+    fn wait_for_launcher_close(stream: &mut UnixStream) -> Result<(), String> {
+        let mut unexpected = [0_u8; 1];
+        match stream.read(&mut unexpected) {
+            Ok(0) => Ok(()),
+            Ok(_) => Err(String::from(
+                "decision peer received unexpected data after its response",
+            )),
+            Err(_) => Err(String::from(
+                "decision peer did not observe launcher-owned session completion",
+            )),
+        }
     }
 
     fn log_decision_sent(
