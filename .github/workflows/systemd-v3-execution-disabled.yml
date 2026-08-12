@@ -499,7 +499,7 @@ jobs:
              and .terminal.finalization.completion.outcome == "completed"' \
             "$EVIDENCE_DIR/positive.json"
           assert_terminal_clean positive true
-          receipt_history=$(sudo -u ota-authority-exec sh -c \
+          receipt_history=$(sudo sh -c \
             'cd "$1" && /usr/lib/ota-authority/bin/ota receipt --history --json' \
             sh "$PRESSURE_REPOSITORY")
           printf '%s\n' "$receipt_history" \
