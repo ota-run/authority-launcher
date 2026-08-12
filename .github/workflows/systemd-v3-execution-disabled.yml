@@ -348,13 +348,22 @@ jobs:
             reset_services
             set_broker_scenario "$scenario"
             cursor=$(journal_cursor)
-            sudo -u ota-authority-job \
+            if ! sudo -u ota-authority-job \
               /usr/lib/ota-authority/bin/ota-authority-systemd-pressure-client \
               --authority-id platform-release-authority \
               --repository "$PRESSURE_REPOSITORY" \
               --expected-terminal "$expected_terminal" \
               -- run governed --grant platform-release-authority \
-              | tee "$EVIDENCE_DIR/$case_name.json" >/dev/null
+              | tee "$EVIDENCE_DIR/$case_name.json" >/dev/null; then
+              capture_journal "$case_name-start-failure" "$cursor"
+              systemctl show \
+                ota-authority-pressure-runner.service \
+                ota-authority-launcher.service \
+                ota-authority-attestor.service \
+                ota-authority-broker-proxy.service \
+                > "$EVIDENCE_DIR/$case_name-start-failure.units.txt"
+              exit 1
+            fi
             capture_journal "$case_name" "$cursor"
             jq -e '.ok == true' "$EVIDENCE_DIR/$case_name.json"
             assert_terminal_clean "$case_name"
