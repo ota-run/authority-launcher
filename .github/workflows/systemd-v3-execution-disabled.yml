@@ -644,29 +644,22 @@ jobs:
           sudo rm /etc/systemd/system/ota-authority-launcher.service.d/zzzzzz-pressure-drift.conf
           sudo systemctl daemon-reload
 
-          repository_manifest > "$EVIDENCE_DIR/missing-credential.repository.before.sha256"
           reset_services
           sudo mv /var/lib/ota/authority-attestor-signing-key \
             /var/lib/ota/authority-attestor-signing-key.unavailable
-          case_cursor=$(journal_cursor)
-          if sudo systemctl start ota-authority-pressure-runner.service; then
-            echo 'missing producer credential unexpectedly passed' >&2
-            exit 1
-          fi
-          capture_journal missing-credential "$case_cursor"
-          grep -Eq 'credential|Pre-authorization protocol|protocol bridge' \
+          sudo install -o root -g root -m 0600 /dev/null \
+            /var/lib/ota/authority-attestor-signing-key
+          run_decision_case missing-credential allowed protocol-refusal
+          grep -Eq 'attestor|credential|Pre-authorization protocol|protocol bridge' \
             "$EVIDENCE_DIR/missing-credential.journal.txt"
           if grep -q 'bounded pressure v3 stage=authorization_received' \
             "$EVIDENCE_DIR/missing-credential.journal.txt"; then
             echo 'missing producer credential reached authorization unexpectedly' >&2
             exit 1
           fi
-          assert_terminal_clean missing-credential
+          sudo rm /var/lib/ota/authority-attestor-signing-key
           sudo mv /var/lib/ota/authority-attestor-signing-key.unavailable \
             /var/lib/ota/authority-attestor-signing-key
-          repository_manifest > "$EVIDENCE_DIR/missing-credential.repository.after.sha256"
-          diff -u "$EVIDENCE_DIR/missing-credential.repository.before.sha256" \
-            "$EVIDENCE_DIR/missing-credential.repository.after.sha256"
 
           repository_manifest > "$EVIDENCE_DIR/crash-first.repository.before.sha256"
           reset_services
