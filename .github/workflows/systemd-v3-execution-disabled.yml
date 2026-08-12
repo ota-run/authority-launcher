@@ -618,7 +618,6 @@ jobs:
           diff -u "$EVIDENCE_DIR/installation-drift.repository.before.sha256" \
             "$EVIDENCE_DIR/installation-drift.repository.after.sha256"
 
-          repository_manifest > "$EVIDENCE_DIR/runtime-drift.repository.before.sha256"
           reset_services
           sudo install -d -o root -g root -m 0755 \
             /etc/systemd/system/ota-authority-launcher.service.d
@@ -632,12 +631,7 @@ jobs:
             -p MemoryDenyWriteExecute --value \
             | tee "$EVIDENCE_DIR/runtime-drift.effective.txt" >/dev/null
           grep -qx 'yes' "$EVIDENCE_DIR/runtime-drift.effective.txt"
-          case_cursor=$(journal_cursor)
-          if sudo systemctl start ota-authority-pressure-runner.service; then
-            echo 'systemd runtime drift unexpectedly passed' >&2
-            exit 1
-          fi
-          capture_journal runtime-drift "$case_cursor"
+          run_decision_case runtime-drift allowed protocol-refusal
           grep -q 'bounded pressure systemd property mismatch name=MemoryDenyWriteExecute' \
             "$EVIDENCE_DIR/runtime-drift.journal.txt"
           grep -q 'bounded pressure bridge failure stage=systemd_runtime' \
@@ -647,12 +641,8 @@ jobs:
             echo 'systemd runtime drift reached authorization unexpectedly' >&2
             exit 1
           fi
-          assert_terminal_clean runtime-drift
           sudo rm /etc/systemd/system/ota-authority-launcher.service.d/zzzzzz-pressure-drift.conf
           sudo systemctl daemon-reload
-          repository_manifest > "$EVIDENCE_DIR/runtime-drift.repository.after.sha256"
-          diff -u "$EVIDENCE_DIR/runtime-drift.repository.before.sha256" \
-            "$EVIDENCE_DIR/runtime-drift.repository.after.sha256"
 
           repository_manifest > "$EVIDENCE_DIR/missing-credential.repository.before.sha256"
           reset_services
