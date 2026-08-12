@@ -37,6 +37,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(test)]
+use ota_authority_launcher::linux_observations::LinuxObservationError;
 use ota_authority_launcher::linux_observations::{
     ObservedSessionPeer, observe_connected_peer, receive_authenticated_peer_preface,
     reconcile_connected_peer, revalidate_observed_peer, verify_peer_executable_identity,
@@ -1135,7 +1137,21 @@ mod tests {
         }
 
         let (stream, _) = listener.accept().expect("accepted broker peer");
-        let peer = receive_authenticated_peer_preface(&stream).expect("guarded broker peer");
+        let peer = match receive_authenticated_peer_preface(&stream) {
+            Ok(peer) => peer,
+            // SCM_PIDFD is mandatory for production admission. Some CI kernels cannot provide
+            // it on received stream credentials, so this case must prove clean refusal instead
+            // of treating the unavailable capability as a successful bridge.
+            Err(LinuxObservationError::PeerCredentialsUnavailable) => {
+                drop(stream);
+                let mut status = 0;
+                assert_eq!(unsafe { libc::waitpid(peer_pid, &mut status, 0) }, peer_pid);
+                assert!(libc::WIFEXITED(status));
+                assert_eq!(libc::WEXITSTATUS(status), 0);
+                return;
+            }
+            Err(error) => panic!("guarded broker peer: {error:?}"),
+        };
         let mut executable = std::fs::File::open(format!("/proc/{}/exe", peer.pid))
             .expect("observed broker executable");
         let executable_identity =
