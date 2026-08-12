@@ -33,9 +33,13 @@
   in root-owned durable state and produces a signed `already_consumed` response for an exact replay;
   the hosted workflow requires that response to bind the original lease and consume request while
   Core accepts only the first consumption. The exact scope is still removed before selected work.
-  This remains execution-disabled foundation work: it does not enable repository execution or
-  crossing receipts/archives, and immutable hosted proof remains pending until the updated matrix
-  passes.
+  Immutable Linux/x64 PID 1 systemd run
+  [31631358796](https://github.com/ota-run/authority-launcher/actions/runs/31631358796) proves this
+  bounded path against Launcher `2185682777c3603ae428dda68d47b1e39d709753`, clean source-built
+  Core `874c5954798453f92a0141bfc964fe1a90db8d92`, and Protocol
+  `899718c93f205eea8ae403e041be9449daa89192`. This remains execution-disabled foundation work: it
+  does not enable repository execution or crossing receipts/archives, and broker-process restart
+  persistence is not separately pressure-proven.
 
 - Derive ordinary CI and root-boundary source-identity assertions from the contract-selected setup
   result instead of duplicating a historical Core revision. Both lanes still require a clean source
