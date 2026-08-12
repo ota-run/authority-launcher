@@ -239,7 +239,18 @@ impl SystemdScopeManager {
         let child_is_live =
             recorded_child_is_live_exact(child).map_err(|_| SystemdScopeError::ScopeMismatch)?;
         if child_is_live {
-            self.verify_scope(expected, child)?;
+            if let Err(error) = self.verify_scope(expected, child) {
+                let observed = match cleanup_observation(
+                    expected,
+                    self.observe_existing_scope(expected.unit_name.as_str()),
+                )? {
+                    Some(observed) => observed,
+                    None => return Ok(()),
+                };
+                if !observed_scope_is_exact_and_empty(expected, &observed) {
+                    return Err(error);
+                }
+            }
         } else {
             let observed = match cleanup_observation(
                 expected,
@@ -248,9 +259,7 @@ impl SystemdScopeManager {
                 Some(observed) => observed,
                 None => return Ok(()),
             };
-            if !observed_scope_matches(expected, &observed)
-                || !cgroup_is_empty_or_absent(observed.control_group.as_str())
-            {
+            if !observed_scope_is_exact_and_empty(expected, &observed) {
                 return Err(SystemdScopeError::ScopeMismatch);
             }
         }
@@ -511,6 +520,14 @@ fn observed_scope_matches(expected: &LauncherSystemdScopeV1, observed: &Observed
         && observed.collect_mode == expected.collect_mode
 }
 
+fn observed_scope_is_exact_and_empty(
+    expected: &LauncherSystemdScopeV1,
+    observed: &ObservedScope,
+) -> bool {
+    observed_scope_matches(expected, observed)
+        && cgroup_is_empty_or_absent(observed.control_group.as_str())
+}
+
 fn scope_unit_name(request_identity: &str) -> Result<String, SystemdScopeError> {
     let digest = request_identity
         .strip_prefix("sha256:")
@@ -619,6 +636,21 @@ mod tests {
         assert!(
             cleanup_observation(&expected, Err(SystemdScopeError::ManagerUnavailable)).is_err()
         );
+
+        let exact_empty = ObservedScope {
+            unit_object_path: expected.unit_object_path.clone(),
+            slice: expected.slice.clone(),
+            control_group: expected.control_group.clone(),
+            delegate: expected.delegate,
+            kill_mode: expected.kill_mode.clone(),
+            collect_mode: expected.collect_mode.clone(),
+        };
+        assert!(observed_scope_is_exact_and_empty(&expected, &exact_empty));
+        let mismatched = ObservedScope {
+            unit_object_path: String::from("/org/freedesktop/systemd1/unit/substituted"),
+            ..exact_empty
+        };
+        assert!(!observed_scope_is_exact_and_empty(&expected, &mismatched));
     }
 
     #[test]

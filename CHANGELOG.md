@@ -52,7 +52,9 @@
   count, cleanup, and repository-mutation controls.
 - Treat exact scope disappearance between cleanup observations as terminal only when the recorded
   cgroup is also empty or absent. This closes the denied-decision cleanup race without accepting
-  mismatched or uninspectable scope state.
+  mismatched or uninspectable scope state. The same exact-and-empty fallback covers a child that
+  exits between liveness observation and scope verification, as stale or invalid signed decisions
+  can cause, while nonempty or substituted boundaries still refuse.
 - Authenticate the process that accepts the systemd-activated broker stream with one private
   kernel-credential preface. Launcher now requires matching `SCM_CREDENTIALS` and `SCM_PIDFD`, then
   retains and rechecks that pidfd and the manifest-bound executable around relay traffic. It does
