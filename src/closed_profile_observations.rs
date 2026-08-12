@@ -335,10 +335,10 @@ fn runner_service_state_is_executing(state: Option<&str>) -> bool {
     matches!(state, Some("active" | "activating"))
 }
 
-fn pressure_condition(name: &str, condition: bool) -> Result<(), ClosedProfileObservationError> {
+fn pressure_condition(_name: &str, condition: bool) -> Result<(), ClosedProfileObservationError> {
     if !condition {
         #[cfg(feature = "systemd-pressure-faults")]
-        eprintln!("ota-authority-launcher: bounded pressure condition mismatch name={name}");
+        eprintln!("ota-authority-launcher: bounded pressure condition mismatch name={_name}");
         return Err(ClosedProfileObservationError::Mismatch);
     }
     Ok(())
