@@ -271,7 +271,7 @@ jobs:
             local cursor=$2
             sudo journalctl --no-pager --output=cat \
               --after-cursor "$cursor" \
-              -u ota-authority-pressure-runner.service \
+              -t ota-authority-pressure-client \
               | tee "$EVIDENCE_DIR/$case_name.client-journal.txt" >/dev/null
             sed -n '/^{/,/^}$/p' "$EVIDENCE_DIR/$case_name.client-journal.txt" \
               > "$EVIDENCE_DIR/$case_name.json"
@@ -424,7 +424,7 @@ jobs:
             capture_journal "$case_name" "$cursor"
             sudo journalctl --no-pager --output=cat \
               --after-cursor "$cursor" \
-              -u ota-authority-pressure-runner.service \
+              -t ota-authority-pressure-client \
               | tee "$EVIDENCE_DIR/$case_name.client-journal.txt" >/dev/null
             sed -n '/^{/,/^}$/p' \
               "$EVIDENCE_DIR/$case_name.client-journal.txt" \
@@ -762,7 +762,7 @@ jobs:
           capture_journal missing-broker "$case_cursor"
           sudo journalctl --no-pager --output=cat \
             --after-cursor "$case_cursor" \
-            -u ota-authority-pressure-runner.service \
+            -t ota-authority-pressure-client \
             | tee "$EVIDENCE_DIR/missing-broker.client-journal.txt" >/dev/null
           sed -n '/^{/,/^}$/p' "$EVIDENCE_DIR/missing-broker.client-journal.txt" \
             > "$EVIDENCE_DIR/missing-broker.json"
