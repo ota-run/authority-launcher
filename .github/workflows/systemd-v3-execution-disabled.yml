@@ -246,7 +246,7 @@ jobs:
             test "$scopes" -eq 0
             if test "$selected" = true; then
               test "$(sudo cat "$PRESSURE_REPOSITORY/selected-work-executed")" = executed
-              test -d "$PRESSURE_REPOSITORY/.ota/receipts"
+              sudo test -d "$PRESSURE_REPOSITORY/.ota/receipts"
             else
               test ! -e "$PRESSURE_REPOSITORY/selected-work-executed"
               test ! -e "$PRESSURE_REPOSITORY/.ota"
@@ -602,7 +602,7 @@ jobs:
              and .terminal.finalization.completion.outcome == "failed"' \
             "$EVIDENCE_DIR/selected-failure.json"
           test ! -e "$PRESSURE_REPOSITORY/selected-work-executed"
-          test -d "$PRESSURE_REPOSITORY/.ota/receipts"
+          sudo test -d "$PRESSURE_REPOSITORY/.ota/receipts"
           sudo rm -rf "$PRESSURE_REPOSITORY/.ota"
           sudo cp "$EVIDENCE_DIR/selected-failure.original-ota.yaml" \
             "$PRESSURE_REPOSITORY/ota.yaml"
@@ -658,7 +658,7 @@ jobs:
              and .terminal.finalization.completion.outcome == "interrupted"' \
             "$EVIDENCE_DIR/selected-interruption.json"
           test ! -e "$PRESSURE_REPOSITORY/selected-work-executed"
-          test -d "$PRESSURE_REPOSITORY/.ota/receipts"
+          sudo test -d "$PRESSURE_REPOSITORY/.ota/receipts"
           sudo rm -rf "$PRESSURE_REPOSITORY/.ota"
           sudo cp "$EVIDENCE_DIR/selected-interruption.original-ota.yaml" \
             "$PRESSURE_REPOSITORY/ota.yaml"
