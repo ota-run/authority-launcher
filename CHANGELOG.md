@@ -30,6 +30,9 @@
   result instead of duplicating a historical Core revision. Both lanes still require a clean source
   build and reconcile the installed binary's reported commit, while contract pin advances no longer
   leave a contradictory workflow-owned pin behind.
+- Keep pressure-only Linux observation labels available to the fault-enabled diagnostics without
+  leaving unused bindings in the default production build, restoring strict default-feature Clippy
+  after the repaired source-identity gate exposed the downstream failure.
 - Advance the protected systemd V3 path through execution-disabled signed authorization-decision
   admission. The installation manifest now binds the pressure broker executable and units; the
   launcher retains the protected broker peer, rechecks its manifest-bound live executable around

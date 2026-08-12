@@ -566,7 +566,7 @@ fn verify_systemd_policy(
         .singular_path(ProtectedInstallationRoleV1::PkcheckExecutable)
         .map_err(|_| ClosedProfileObservationError::Unavailable)?;
     let mut outcomes = Vec::new();
-    for (principal, pid, uid) in [
+    for (_principal, pid, uid) in [
         ("job", peer.pid, peer.uid),
         ("execution", child.pid, mapping.execution.uid),
     ] {
@@ -580,7 +580,7 @@ fn verify_systemd_policy(
             if output.status.code() != Some(1) {
                 #[cfg(feature = "systemd-pressure-faults")]
                 eprintln!(
-                    "ota-authority-launcher: bounded pressure Polkit mismatch principal={principal} action={action} status={:?}",
+                    "ota-authority-launcher: bounded pressure Polkit mismatch principal={_principal} action={action} status={:?}",
                     output.status.code()
                 );
                 return Err(ClosedProfileObservationError::Mismatch);
@@ -644,7 +644,7 @@ struct AccessProbeResult {
 }
 
 fn run_access_probe(
-    principal_label: &str,
+    _principal_label: &str,
     principal: &RunAs,
     protected_paths: &[PathBuf],
     host_sockets: &[PathBuf],
@@ -712,7 +712,7 @@ fn run_access_probe(
     {
         #[cfg(feature = "systemd-pressure-faults")]
         eprintln!(
-            "ota-authority-launcher: bounded pressure access mismatch principal={principal_label} categories={}",
+            "ota-authority-launcher: bounded pressure access mismatch principal={_principal_label} categories={}",
             access_failure_categories(byte[0]).join(",")
         );
         return Err(ClosedProfileObservationError::Mismatch);
@@ -801,7 +801,7 @@ fn observed_process_descriptor(pid: u32) -> Result<i32, ClosedProfileObservation
 
 fn process_access_failures(pid: u32, target_descriptor: i32) -> u8 {
     let mut failures = 0_u8;
-    for (bit, name, path) in [
+    for (bit, _name, path) in [
         (1, "proc_fd", format!("/proc/{pid}/fd")),
         (1 << 1, "proc_mem", format!("/proc/{pid}/mem")),
     ] {
@@ -814,7 +814,7 @@ fn process_access_failures(pid: u32, target_descriptor: i32) -> u8 {
             unsafe { libc::close(descriptor) };
             #[cfg(feature = "systemd-pressure-faults")]
             eprintln!(
-                "ota-authority-launcher: bounded pressure process-access primitive={name} outcome=opened"
+                "ota-authority-launcher: bounded pressure process-access primitive={_name} outcome=opened"
             );
             failures |= bit;
         } else {
@@ -822,7 +822,7 @@ fn process_access_failures(pid: u32, target_descriptor: i32) -> u8 {
             if !proc_access_denied_errno(error) {
                 #[cfg(feature = "systemd-pressure-faults")]
                 eprintln!(
-                    "ota-authority-launcher: bounded pressure process-access primitive={name} errno={:?}",
+                    "ota-authority-launcher: bounded pressure process-access primitive={_name} errno={:?}",
                     error
                 );
                 failures |= bit;
