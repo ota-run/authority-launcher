@@ -241,7 +241,13 @@ impl SystemdScopeManager {
         if child_is_live {
             self.verify_scope(expected, child)?;
         } else {
-            let observed = self.observe_existing_scope(expected.unit_name.as_str())?;
+            let observed = match cleanup_observation(
+                expected,
+                self.observe_existing_scope(expected.unit_name.as_str()),
+            )? {
+                Some(observed) => observed,
+                None => return Ok(()),
+            };
             if !observed_scope_matches(expected, &observed)
                 || !cgroup_is_empty_or_absent(observed.control_group.as_str())
             {
@@ -468,6 +474,21 @@ struct ObservedScope {
     collect_mode: String,
 }
 
+fn cleanup_observation(
+    expected: &LauncherSystemdScopeV1,
+    observed: Result<ObservedScope, SystemdScopeError>,
+) -> Result<Option<ObservedScope>, SystemdScopeError> {
+    match observed {
+        Ok(observed) => Ok(Some(observed)),
+        Err(SystemdScopeError::ScopeAbsent)
+            if cgroup_is_empty_or_absent(expected.control_group.as_str()) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn verify_recorded_scope_binding(
     expected: &LauncherSystemdScopeV1,
     child: &LauncherChildProcessV1,
@@ -568,6 +589,36 @@ mod tests {
         assert!(start_error_requires_reconciliation(&zbus::Error::Failure(
             String::from("transport outcome unavailable")
         )));
+    }
+
+    #[test]
+    fn cleanup_accepts_scope_disappearance_between_terminal_observations() {
+        let expected = LauncherSystemdScopeV1 {
+            schema_version: 1,
+            identity: String::new(),
+            invocation_id: String::from("invocation-cleanup-race"),
+            request_identity: format!("sha256:{}", "a".repeat(64)),
+            child_identity: format!("sha256:{}", "b".repeat(64)),
+            child_pid: 42,
+            unit_name: String::from("ota-authority-invocation-cleanup-race.scope"),
+            unit_object_path: String::from(
+                "/org/freedesktop/systemd1/unit/ota_2dauthority_2dcleanup_2erace_2escope",
+            ),
+            slice: String::from("system.slice"),
+            control_group: String::from("/ota-authority-cleanup-race-does-not-exist"),
+            delegate: false,
+            kill_mode: String::from("control-group"),
+            collect_mode: String::from("inactive-or-failed"),
+        };
+
+        assert!(
+            cleanup_observation(&expected, Err(SystemdScopeError::ScopeAbsent))
+                .expect("absent exact scope and cgroup are terminal")
+                .is_none()
+        );
+        assert!(
+            cleanup_observation(&expected, Err(SystemdScopeError::ManagerUnavailable)).is_err()
+        );
     }
 
     #[test]
