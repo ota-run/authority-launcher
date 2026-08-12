@@ -72,6 +72,7 @@ struct Cli {
 enum ExpectedTerminal {
     AllowedDecision,
     DeniedDecision,
+    ObservedDecisionOutcome,
     ProtocolRefusal,
 }
 
@@ -155,20 +156,32 @@ fn validate_pressure_terminal(
     terminal: &LauncherTerminalFrameV1,
     expected: ExpectedTerminal,
 ) -> Result<(), String> {
-    let expected_stage = match expected {
-        ExpectedTerminal::AllowedDecision => {
-            LauncherTerminalStageV1::AuthorizationDecisionVerifiedBeforeLeaseBoundaryRemoved
-        }
-        ExpectedTerminal::DeniedDecision => {
-            LauncherTerminalStageV1::AuthorityRefusedBoundaryRemoved
-        }
-        ExpectedTerminal::ProtocolRefusal => {
-            LauncherTerminalStageV1::PreAuthorizationProtocolRefusedBoundaryRemoved
-        }
+    let stage_matches = match (expected, terminal.stage) {
+        (
+            ExpectedTerminal::AllowedDecision,
+            Some(LauncherTerminalStageV1::AuthorizationDecisionVerifiedBeforeLeaseBoundaryRemoved),
+        )
+        | (
+            ExpectedTerminal::DeniedDecision,
+            Some(LauncherTerminalStageV1::AuthorityRefusedBoundaryRemoved),
+        )
+        | (
+            ExpectedTerminal::ProtocolRefusal,
+            Some(LauncherTerminalStageV1::PreAuthorizationProtocolRefusedBoundaryRemoved),
+        ) => true,
+        (
+            ExpectedTerminal::ObservedDecisionOutcome,
+            Some(
+                LauncherTerminalStageV1::AuthorizationDecisionVerifiedBeforeLeaseBoundaryRemoved
+                | LauncherTerminalStageV1::AuthorityRefusedBoundaryRemoved
+                | LauncherTerminalStageV1::PreAuthorizationProtocolRefusedBoundaryRemoved,
+            ),
+        ) => true,
+        _ => false,
     };
     if terminal.outcome != LauncherTerminalOutcomeV1::Refused
         || terminal.exit_code != Some(2)
-        || terminal.stage != Some(expected_stage)
+        || !stage_matches
     {
         return Err(String::from(
             "the execution-disabled launcher did not confirm its bounded terminal refusal",
@@ -321,7 +334,46 @@ mod tests {
             ),
         };
         assert!(validate_pressure_terminal(&terminal, ExpectedTerminal::AllowedDecision).is_ok());
+        assert!(
+            validate_pressure_terminal(&terminal, ExpectedTerminal::ObservedDecisionOutcome)
+                .is_ok()
+        );
         assert!(validate_pressure_terminal(&terminal, ExpectedTerminal::DeniedDecision).is_err());
+    }
+
+    #[test]
+    fn observed_decision_outcome_accepts_only_bounded_decision_terminals() {
+        for stage in [
+            LauncherTerminalStageV1::AuthorizationDecisionVerifiedBeforeLeaseBoundaryRemoved,
+            LauncherTerminalStageV1::AuthorityRefusedBoundaryRemoved,
+            LauncherTerminalStageV1::PreAuthorizationProtocolRefusedBoundaryRemoved,
+        ] {
+            let terminal = LauncherTerminalFrameV1 {
+                message_kind: LAUNCHER_TERMINAL.into(),
+                protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
+                invocation_id: String::from("invocation-0123456789abcdef0123456789abcdef"),
+                outcome: LauncherTerminalOutcomeV1::Refused,
+                exit_code: Some(2),
+                stage: Some(stage),
+            };
+            assert!(
+                validate_pressure_terminal(&terminal, ExpectedTerminal::ObservedDecisionOutcome)
+                    .is_ok()
+            );
+        }
+
+        let unrelated = LauncherTerminalFrameV1 {
+            message_kind: LAUNCHER_TERMINAL.into(),
+            protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
+            invocation_id: String::from("invocation-0123456789abcdef0123456789abcdef"),
+            outcome: LauncherTerminalOutcomeV1::Refused,
+            exit_code: Some(2),
+            stage: Some(LauncherTerminalStageV1::RequestRefusedBeforeBoundary),
+        };
+        assert!(
+            validate_pressure_terminal(&unrelated, ExpectedTerminal::ObservedDecisionOutcome)
+                .is_err()
+        );
     }
 
     #[test]

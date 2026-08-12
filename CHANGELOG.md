@@ -46,6 +46,10 @@
   manifest before and after. This is not
   production broker implementation or hosted evidence until that workflow is committed and green
   against immutable revisions.
+- Run every hosted decision scenario through the same manifest-bound, hardened systemd client
+  unit. Its observed-outcome mode accepts only the three execution-disabled decision terminals;
+  the workflow still requires each scenario's exact terminal, signed broker checkpoints, relay
+  count, cleanup, and repository-mutation controls.
 - Authenticate the process that accepts the systemd-activated broker stream with one private
   kernel-credential preface. Launcher now requires matching `SCM_CREDENTIALS` and `SCM_PIDFD`, then
   retains and rechecks that pidfd and the manifest-bound executable around relay traffic. It does

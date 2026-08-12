@@ -324,6 +324,7 @@ jobs:
 
           reset_services() {
             sudo systemctl stop \
+              ota-authority-pressure-runner.service \
               ota-authority-launcher.service \
               ota-authority-attestor.service \
               ota-authority-broker-proxy.service || true
@@ -348,13 +349,7 @@ jobs:
             reset_services
             set_broker_scenario "$scenario"
             cursor=$(journal_cursor)
-            if ! sudo -u ota-authority-job \
-              /usr/lib/ota-authority/bin/ota-authority-systemd-pressure-client \
-              --authority-id platform-release-authority \
-              --repository "$PRESSURE_REPOSITORY" \
-              --expected-terminal "$expected_terminal" \
-              -- run governed --grant platform-release-authority \
-              | tee "$EVIDENCE_DIR/$case_name.json" >/dev/null; then
+            if ! sudo systemctl start ota-authority-pressure-runner.service; then
               capture_journal "$case_name-start-failure" "$cursor"
               systemctl show \
                 ota-authority-pressure-runner.service \
@@ -365,7 +360,24 @@ jobs:
               exit 1
             fi
             capture_journal "$case_name" "$cursor"
-            jq -e '.ok == true' "$EVIDENCE_DIR/$case_name.json"
+            sudo journalctl --no-pager --output=cat \
+              --after-cursor "$cursor" \
+              -u ota-authority-pressure-runner.service \
+              | tee "$EVIDENCE_DIR/$case_name.json" >/dev/null
+            case "$expected_terminal" in
+              denied-decision)
+                expected_stage=authority_refused_boundary_removed
+                ;;
+              protocol-refusal)
+                expected_stage=pre_authorization_protocol_refused_boundary_removed
+                ;;
+              *)
+                exit 1
+                ;;
+            esac
+            jq -e --arg stage "$expected_stage" \
+              '.ok == true and .terminal.stage == $stage' \
+              "$EVIDENCE_DIR/$case_name.json"
             assert_terminal_clean "$case_name"
             repository_manifest > "$EVIDENCE_DIR/$case_name.repository.after.sha256"
             diff -u "$EVIDENCE_DIR/$case_name.repository.before.sha256" \
