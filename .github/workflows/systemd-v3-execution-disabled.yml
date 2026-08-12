@@ -245,7 +245,7 @@ jobs:
             test "$slots" -eq 0
             test "$scopes" -eq 0
             if test "$selected" = true; then
-              test "$(cat "$PRESSURE_REPOSITORY/selected-work-executed")" = executed
+              test "$(sudo cat "$PRESSURE_REPOSITORY/selected-work-executed")" = executed
               test -d "$PRESSURE_REPOSITORY/.ota/receipts"
             else
               test ! -e "$PRESSURE_REPOSITORY/selected-work-executed"
@@ -538,7 +538,7 @@ jobs:
           fi
           capture_journal completion-crash-first "$case_cursor"
           test "$(systemctl show ota-authority-launcher.service -p ExecMainStatus --value)" = 90
-          test "$(wc -l < "$PRESSURE_REPOSITORY/selected-work-executed")" -eq 1
+          test "$(sudo wc -l "$PRESSURE_REPOSITORY/selected-work-executed" | awk '{print $1}')" -eq 1
           completion_crash_slot=$(sudo find /var/lib/ota/authority-launcher/active \
             -mindepth 1 -maxdepth 1 -type f -print -quit)
           test -n "$completion_crash_slot"
@@ -560,7 +560,7 @@ jobs:
             exit 1
           fi
           capture_journal completion-crash-recovery "$case_cursor"
-          test "$(wc -l < "$PRESSURE_REPOSITORY/selected-work-executed")" -eq 2
+          test "$(sudo wc -l "$PRESSURE_REPOSITORY/selected-work-executed" | awk '{print $1}')" -eq 2
           assert_terminal_clean completion-crash-recovery true
           test "$(sudo find /var/lib/ota/authority-launcher/active \
             -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 0
