@@ -601,6 +601,7 @@ mod tests {
             socket_unit_identity: identity('2'),
             ota_binary_identity: identity('3'),
             broker_proxy_identity: identity('4'),
+            broker_proxy_executable_identity: identity('6'),
             attestor_key_set_identity: identity('5'),
             attestation_claims: None,
             maximum_request_bytes: 4096,

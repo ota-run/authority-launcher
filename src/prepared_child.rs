@@ -24,8 +24,8 @@
 //!
 //! The child remains root and stopped until the launcher has durably recorded its identity and
 //! bound it to the exact systemd invocation scope. The resume path admits one bounded Ota
-//! process-posture preface and one signed V3 attestation bridge, then stops before authorization or
-//! selected execution.
+//! process-posture preface, one signed V3 attestation bridge, and one bounded authorization-decision
+//! relay, then stops before lease issuance or selected execution.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
@@ -37,11 +37,17 @@ use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use ota_authority_protocol::{
-    ATTESTATION_RESPONSE, AUTHORIZATION_REQUEST, AuthorizationRequest, BrokerChallenge,
+    ATTESTATION_RESPONSE, AUTHORIZATION_DECISION, AUTHORIZATION_DECISION_DOMAIN_V1,
+    AUTHORIZATION_REQUEST, AUTHORIZATION_REQUEST_DOMAIN_V1, AuthorizationDecision,
+    AuthorizationDecisionAdmissionV1, AuthorizationDecisionPayload,
+    AuthorizationDecisionRelayEvidenceV1, AuthorizationRequest, BrokerChallenge,
     LauncherChildProcessV1, LauncherStartupContinuationV1, MAX_FRAME_BYTES, OtaProcessPostureV1,
-    SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3, SignedLauncherAttestationV3, decode_frame,
-    encode_frame, launcher_attestation_identity_v3, launcher_child_process_identity,
-    launcher_startup_continuation_identity, ota_process_posture_identity, sha256_identity,
+    SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3, SignedBrokerMessage,
+    SignedLauncherAttestationV3, authorization_decision_admission_v1_identity,
+    authorization_decision_relay_evidence_v1_identity, decode_frame, encode_frame,
+    launcher_attestation_identity_v3, launcher_child_process_identity,
+    launcher_startup_continuation_identity, message_identity, ota_process_posture_identity,
+    sha256_identity,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -76,6 +82,8 @@ pub(crate) enum PreparedChildError {
     AttestationBridgeUnavailable,
     #[error("the protected Ota child did not reach exact authorization admission")]
     AuthorizationAdmissionMismatch,
+    #[error("the protected Ota child authorization decision bridge is unavailable")]
+    AuthorizationDecisionBridgeUnavailable,
 }
 
 pub(crate) struct PreparedChild {
@@ -140,6 +148,7 @@ impl PreparedChild {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn continue_with_v3_attestation(
         &mut self,
         posture: &OtaProcessPostureV1,
@@ -148,6 +157,83 @@ impl PreparedChild {
             &BrokerChallenge,
         ) -> Result<SignedLauncherAttestationV3, PreparedChildError>,
     ) -> Result<(), PreparedChildError> {
+        self.continue_to_v3_authorization_request(posture, timeout, produce)
+            .map(|_| ())
+    }
+
+    pub(crate) fn relay_v3_authorization_decisions(
+        &mut self,
+        authorization: &AuthorizationRequest,
+        request_identity: &str,
+        broker_proxy: &mut UnixStream,
+        timeout: Duration,
+        mut record: impl FnMut(&AuthorizationDecisionRelayEvidenceV1) -> Result<(), PreparedChildError>,
+    ) -> Result<AuthorizationDecision, PreparedChildError> {
+        write_json_frame(broker_proxy, &authorization, timeout)
+            .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        pressure_v3_stage("authorization_request_forwarded");
+
+        loop {
+            let decision: SignedBrokerMessage<AuthorizationDecisionPayload> =
+                read_json_frame(broker_proxy, timeout)
+                    .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+            if decision.payload.message_kind != AUTHORIZATION_DECISION {
+                return Err(PreparedChildError::AuthorizationDecisionBridgeUnavailable);
+            }
+            let decision_identity =
+                message_identity(AUTHORIZATION_DECISION_DOMAIN_V1.as_bytes(), &decision)
+                    .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+            write_json_frame(&mut self.launcher_session, &decision, timeout)
+                .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+            pressure_v3_stage("authorization_decision_relayed");
+            let admission: AuthorizationDecisionAdmissionV1 =
+                read_json_frame(&mut self.launcher_session, timeout)
+                    .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+            if authorization_decision_admission_v1_identity(&admission)
+                .ok()
+                .as_deref()
+                != Some(admission.identity.as_str())
+                || admission.request_identity != request_identity
+                || admission.authorization_decision_identity != decision_identity
+                || admission.binding_identity != authorization.binding_identity
+                || admission.attestation_identity != authorization.attestation_identity
+                || admission.work_unit_identity != authorization.work_unit_identity
+                || admission.contract_identity != authorization.contract_identity
+                || admission.semantic_scope_identity != authorization.semantic_scope_identity
+                || admission.decision != decision.payload.decision
+            {
+                return Err(PreparedChildError::AuthorizationDecisionBridgeUnavailable);
+            }
+            let mut evidence = AuthorizationDecisionRelayEvidenceV1 {
+                schema_version: 1,
+                identity: String::new(),
+                request_identity: request_identity.to_string(),
+                authorization_decision: decision,
+                authorization_decision_identity: decision_identity,
+                admission,
+            };
+            evidence.identity = authorization_decision_relay_evidence_v1_identity(&evidence)
+                .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+            record(&evidence)?;
+            pressure_v3_relay_evidence(&evidence)?;
+            pressure_v3_stage("authorization_decision_verified");
+            match evidence.authorization_decision.payload.decision {
+                AuthorizationDecision::Pending => {}
+                AuthorizationDecision::Allowed | AuthorizationDecision::Denied => {
+                    return Ok(evidence.authorization_decision.payload.decision);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn continue_to_v3_authorization_request(
+        &mut self,
+        posture: &OtaProcessPostureV1,
+        timeout: Duration,
+        produce: impl FnOnce(
+            &BrokerChallenge,
+        ) -> Result<SignedLauncherAttestationV3, PreparedChildError>,
+    ) -> Result<(AuthorizationRequest, String), PreparedChildError> {
         let mut continuation = LauncherStartupContinuationV1 {
             schema_version: 1,
             identity: String::new(),
@@ -231,8 +317,10 @@ impl PreparedChild {
             return Err(PreparedChildError::AuthorizationAdmissionMismatch);
         }
 
-        // Authorization remains disabled in this slice. The request is intentionally not relayed.
-        Ok(())
+        let request_identity =
+            message_identity(AUTHORIZATION_REQUEST_DOMAIN_V1.as_bytes(), &authorization)
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+        Ok((authorization, request_identity))
     }
 
     fn receive_process_posture_after_resume(
@@ -283,6 +371,22 @@ fn pressure_v3_stage(stage: &'static str) {
     eprintln!("ota-authority-launcher: bounded pressure v3 stage={stage}");
     #[cfg(not(feature = "systemd-pressure-faults"))]
     let _ = stage;
+}
+
+fn pressure_v3_relay_evidence(
+    evidence: &AuthorizationDecisionRelayEvidenceV1,
+) -> Result<(), PreparedChildError> {
+    #[cfg(feature = "systemd-pressure-faults")]
+    {
+        let encoded = serde_json::to_string(evidence)
+            .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        eprintln!(
+            "ota-authority-launcher: bounded pressure authorization relay evidence={encoded}"
+        );
+    }
+    #[cfg(not(feature = "systemd-pressure-faults"))]
+    let _ = evidence;
+    Ok(())
 }
 
 impl Drop for PreparedChild {
@@ -1047,6 +1151,61 @@ mod tests {
         }
     }
 
+    fn authorization_decision_for(
+        request: &AuthorizationRequest,
+        request_identity: &str,
+        decision: AuthorizationDecision,
+        revision: u64,
+    ) -> SignedBrokerMessage<AuthorizationDecisionPayload> {
+        SignedBrokerMessage {
+            payload: AuthorizationDecisionPayload {
+                message_kind: AUTHORIZATION_DECISION.into(),
+                request_identity: request_identity.into(),
+                binding_identity: request.binding_identity.clone(),
+                authority_id: request.authority_id.clone(),
+                attestation_identity: request.attestation_identity.clone(),
+                challenge_nonce_commitment: request.challenge_nonce_commitment.clone(),
+                work_unit_identity: request.work_unit_identity.clone(),
+                contract_identity: request.contract_identity.clone(),
+                semantic_scope_identity: request.semantic_scope_identity.clone(),
+                decision,
+                approval_reference: Some(format!("approval:{revision}")),
+                broker_revision: revision,
+                issued_at: String::from("2026-08-11T00:00:00Z"),
+                expires_at: String::from("2026-08-11T00:01:00Z"),
+            },
+            key_id: String::from("broker-key"),
+            algorithm: String::from("ed25519"),
+            signature: format!("signature-{revision}"),
+        }
+    }
+
+    fn admission_for(
+        request: &AuthorizationRequest,
+        request_identity: &str,
+        decision: &SignedBrokerMessage<AuthorizationDecisionPayload>,
+    ) -> AuthorizationDecisionAdmissionV1 {
+        let decision_identity =
+            message_identity(AUTHORIZATION_DECISION_DOMAIN_V1.as_bytes(), decision)
+                .expect("decision identity");
+        let mut admission = AuthorizationDecisionAdmissionV1 {
+            schema_version: 1,
+            identity: String::new(),
+            message_kind: ota_authority_protocol::AUTHORIZATION_DECISION_ADMISSION.into(),
+            request_identity: request_identity.into(),
+            authorization_decision_identity: decision_identity,
+            binding_identity: request.binding_identity.clone(),
+            attestation_identity: request.attestation_identity.clone(),
+            work_unit_identity: request.work_unit_identity.clone(),
+            contract_identity: request.contract_identity.clone(),
+            semantic_scope_identity: request.semantic_scope_identity.clone(),
+            decision: decision.payload.decision,
+        };
+        admission.identity =
+            authorization_decision_admission_v1_identity(&admission).expect("admission identity");
+        admission
+    }
+
     #[test]
     fn v3_bridge_stops_after_exact_authorization_admission() {
         let job_profile_identity =
@@ -1215,6 +1374,161 @@ mod tests {
     }
 
     #[test]
+    fn authorization_decision_relay_requires_exact_core_admission() {
+        let request = AuthorizationRequest {
+            message_kind: AUTHORIZATION_REQUEST.into(),
+            binding_identity: identity('1'),
+            authority_id: String::from("release"),
+            attestation_identity: identity('2'),
+            challenge_nonce_commitment: identity('3'),
+            work_unit_identity: identity('4'),
+            contract_identity: identity('5'),
+            semantic_scope_identity: identity('6'),
+            runner_principal: identity('7'),
+            actor_mode: String::from("non_agent"),
+            requested_lifetime_seconds: 60,
+        };
+        let request_identity =
+            message_identity(AUTHORIZATION_REQUEST_DOMAIN_V1.as_bytes(), &request)
+                .expect("request identity");
+        let decision = authorization_decision_for(
+            &request,
+            &request_identity,
+            AuthorizationDecision::Allowed,
+            1,
+        );
+        let admission = admission_for(&request, &request_identity, &decision);
+        let (launcher_session, mut core) = UnixStream::pair().expect("core pair");
+        let (mut proxy, mut broker) = UnixStream::pair().expect("broker pair");
+        let expected_request = request.clone();
+        let broker_decision = decision.clone();
+        let broker_thread = std::thread::spawn(move || {
+            let observed: AuthorizationRequest =
+                read_json_frame(&mut broker, Duration::from_secs(1)).expect("broker request");
+            assert_eq!(observed, expected_request);
+            write_json_frame(&mut broker, &broker_decision, Duration::from_secs(1))
+                .expect("broker decision");
+        });
+        let core_decision = decision.clone();
+        let core_thread = std::thread::spawn(move || {
+            let observed: SignedBrokerMessage<AuthorizationDecisionPayload> =
+                read_json_frame(&mut core, Duration::from_secs(1)).expect("core decision");
+            assert_eq!(observed, core_decision);
+            write_json_frame(&mut core, &admission, Duration::from_secs(1))
+                .expect("core admission");
+        });
+        let mut child = PreparedChild {
+            pid: 0,
+            record: LauncherChildProcessV1 {
+                schema_version: 1,
+                identity: identity('8'),
+                invocation_id: String::from("invocation"),
+                request_identity: identity('9'),
+                pid: 41,
+                process_start_time_identity: identity('a'),
+                ota_binary_identity: identity('b'),
+                principal_mapping_identity: identity('c'),
+                working_directory_identity: identity('d'),
+            },
+            launcher_session,
+        };
+        let mut recorded = Vec::new();
+        let observed = child
+            .relay_v3_authorization_decisions(
+                &request,
+                &request_identity,
+                &mut proxy,
+                Duration::from_secs(1),
+                |evidence| {
+                    recorded.push(evidence.clone());
+                    Ok(())
+                },
+            )
+            .expect("verified decision relay");
+        assert_eq!(observed, AuthorizationDecision::Allowed);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            authorization_decision_relay_evidence_v1_identity(&recorded[0])
+                .expect("relay identity"),
+            recorded[0].identity
+        );
+        core_thread.join().expect("core thread");
+        broker_thread.join().expect("broker thread");
+
+        let (launcher_session, mut core) = UnixStream::pair().expect("wrong core pair");
+        let (mut proxy, mut broker) = UnixStream::pair().expect("wrong broker pair");
+        let wrong_decision = decision.clone();
+        let broker_thread = std::thread::spawn(move || {
+            let _: AuthorizationRequest =
+                read_json_frame(&mut broker, Duration::from_secs(1)).expect("broker request");
+            write_json_frame(&mut broker, &wrong_decision, Duration::from_secs(1))
+                .expect("broker decision");
+        });
+        let mut wrong_admission = admission_for(&request, &request_identity, &decision);
+        wrong_admission.semantic_scope_identity = identity('f');
+        wrong_admission.identity = authorization_decision_admission_v1_identity(&wrong_admission)
+            .expect("wrong admission identity");
+        let core_thread = std::thread::spawn(move || {
+            let _: SignedBrokerMessage<AuthorizationDecisionPayload> =
+                read_json_frame(&mut core, Duration::from_secs(1)).expect("core decision");
+            write_json_frame(&mut core, &wrong_admission, Duration::from_secs(1))
+                .expect("wrong core admission");
+        });
+        let mut child = PreparedChild {
+            pid: 0,
+            record: child.record.clone(),
+            launcher_session,
+        };
+        assert_eq!(
+            child.relay_v3_authorization_decisions(
+                &request,
+                &request_identity,
+                &mut proxy,
+                Duration::from_secs(1),
+                |_| Ok(()),
+            ),
+            Err(PreparedChildError::AuthorizationDecisionBridgeUnavailable)
+        );
+        core_thread.join().expect("wrong core thread");
+        broker_thread.join().expect("wrong broker thread");
+
+        let (launcher_session, mut core) = UnixStream::pair().expect("scope core pair");
+        let (mut proxy, mut broker) = UnixStream::pair().expect("scope broker pair");
+        let mut wrong_scope = decision.clone();
+        wrong_scope.payload.semantic_scope_identity = identity('f');
+        let broker_scope_decision = wrong_scope.clone();
+        let broker_thread = std::thread::spawn(move || {
+            let _: AuthorizationRequest =
+                read_json_frame(&mut broker, Duration::from_secs(1)).expect("broker request");
+            write_json_frame(&mut broker, &broker_scope_decision, Duration::from_secs(1))
+                .expect("wrong-scope broker decision");
+        });
+        let core_thread = std::thread::spawn(move || {
+            let observed: SignedBrokerMessage<AuthorizationDecisionPayload> =
+                read_json_frame(&mut core, Duration::from_secs(1)).expect("relayed decision");
+            assert_eq!(observed, wrong_scope);
+            // Core rejection is represented by closing the protected channel without an admission.
+        });
+        let mut child = PreparedChild {
+            pid: 0,
+            record: child.record.clone(),
+            launcher_session,
+        };
+        assert_eq!(
+            child.relay_v3_authorization_decisions(
+                &request,
+                &request_identity,
+                &mut proxy,
+                Duration::from_secs(1),
+                |_| Ok(()),
+            ),
+            Err(PreparedChildError::AuthorizationDecisionBridgeUnavailable)
+        );
+        core_thread.join().expect("scope core thread");
+        broker_thread.join().expect("scope broker thread");
+    }
+
+    #[test]
     fn process_posture_frame_is_bounded_and_exactly_child_bound() {
         let mapping = identity('1');
         let child = LauncherChildProcessV1 {
@@ -1332,6 +1646,7 @@ mod tests {
             socket_unit_identity: identity('c'),
             ota_binary_identity: identity('d'),
             broker_proxy_identity: identity('e'),
+            broker_proxy_executable_identity: identity('1'),
             attestor_key_set_identity: identity('f'),
             attestation_claims: None,
             maximum_request_bytes: 4096,

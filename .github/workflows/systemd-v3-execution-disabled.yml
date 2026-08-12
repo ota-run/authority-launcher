@@ -20,7 +20,7 @@
 #
 #   If you need additional information or have any questions, please email: os@ota.run
 
-name: Systemd V3 execution-disabled pressure
+name: Systemd V3 decision-admission pressure
 
 on:
   pull_request:
@@ -31,7 +31,7 @@ permissions:
 
 jobs:
   systemd-v3:
-    name: Prove complete signed V3 admission without execution
+    name: Prove signed V3 decision admission without lease or execution
     runs-on: ubuntu-24.04
     steps:
       - name: Check out Launcher source
@@ -80,7 +80,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --release --locked --bins --features \
-            'protected-attestor protected-attestor-client systemd-pressure-client systemd-pressure-faults systemd-v3-pressure-provision'
+            'protected-attestor protected-attestor-client systemd-pressure-client systemd-pressure-faults systemd-v3-pressure-provision systemd-decision-pressure-peer'
 
       - name: Provision protected systemd V3 boundary
         env:
@@ -128,6 +128,8 @@ jobs:
             /usr/lib/ota-authority/bin/ota-authority-attestor
           sudo install -o root -g root -m 0755 target/release/ota-authority-systemd-pressure-client \
             /usr/lib/ota-authority/bin/ota-authority-systemd-pressure-client
+          sudo install -o root -g root -m 0755 target/release/ota-authority-systemd-decision-peer \
+            /usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer
           sudo install -o root -g root -m 0755 "$(command -v ota)" \
             /usr/lib/ota-authority/bin/ota
 
@@ -139,6 +141,7 @@ jobs:
             --repository-root "$PRESSURE_REPOSITORY" \
             --launcher-binary /usr/lib/ota-authority/bin/ota-authority-launcher \
             --attestor-binary /usr/lib/ota-authority/bin/ota-authority-attestor \
+            --broker-decision-binary /usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer \
             --ota-binary /usr/lib/ota-authority/bin/ota \
             --pressure-client-binary /usr/lib/ota-authority/bin/ota-authority-systemd-pressure-client \
             | tee "$EVIDENCE_DIR/provision.txt"
@@ -146,6 +149,7 @@ jobs:
           sha256sum \
             /usr/lib/ota-authority/bin/ota-authority-launcher \
             /usr/lib/ota-authority/bin/ota-authority-attestor \
+            /usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer \
             /usr/lib/ota-authority/bin/ota-authority-systemd-pressure-client \
             /usr/lib/ota-authority/bin/ota \
             > "$EVIDENCE_DIR/installed-binaries.sha256"
@@ -153,9 +157,19 @@ jobs:
             "$EVIDENCE_DIR/installation-manifest.json"
           sudo cp /etc/ota/authority-attestor-verifiers.json \
             "$EVIDENCE_DIR/attestor-verifiers.json"
+          sudo cp /etc/ota/crossing-brokers.json \
+            "$EVIDENCE_DIR/broker-verifier-binding.json"
           sudo chown "$(id -u):$(id -g)" \
             "$EVIDENCE_DIR/installation-manifest.json" \
-            "$EVIDENCE_DIR/attestor-verifiers.json"
+            "$EVIDENCE_DIR/attestor-verifiers.json" \
+            "$EVIDENCE_DIR/broker-verifier-binding.json"
+          jq -e \
+            '.schema_version == 1
+             and (.bindings | length) == 1
+             and .bindings[0].authority_id == "platform-release-authority"
+             and (.bindings[0].broker_verifiers | length) == 1
+             and .bindings[0].broker_verifiers[0].key_id == "systemd-broker-pressure-v1"' \
+            "$EVIDENCE_DIR/broker-verifier-binding.json"
 
       - name: Exercise positive, drift, credential, and recovery controls
         env:
@@ -165,9 +179,60 @@ jobs:
           set -euo pipefail
 
           repository_manifest() {
-            sudo find "$PRESSURE_REPOSITORY" -xdev -type f -print0 \
-              | sort -z \
-              | sudo xargs -0 sha256sum
+            sudo python3 - "$PRESSURE_REPOSITORY" <<'PY'
+          import hashlib
+          import json
+          import os
+          import stat
+          import sys
+
+          root = os.path.abspath(sys.argv[1])
+          paths = [root]
+          for directory, names, files in os.walk(root, topdown=True, followlinks=False):
+              names.sort()
+              files.sort()
+              paths.extend(os.path.join(directory, name) for name in names)
+              paths.extend(os.path.join(directory, name) for name in files)
+              names[:] = [name for name in names if not os.path.islink(os.path.join(directory, name))]
+
+          for path in sorted(set(paths), key=lambda value: os.fsencode(os.path.relpath(value, root))):
+              metadata = os.lstat(path)
+              mode = metadata.st_mode
+              if stat.S_ISREG(mode):
+                  kind = "file"
+              elif stat.S_ISDIR(mode):
+                  kind = "directory"
+              elif stat.S_ISLNK(mode):
+                  kind = "symlink"
+              elif stat.S_ISFIFO(mode):
+                  kind = "fifo"
+              elif stat.S_ISSOCK(mode):
+                  kind = "socket"
+              elif stat.S_ISCHR(mode):
+                  kind = "character_device"
+              elif stat.S_ISBLK(mode):
+                  kind = "block_device"
+              else:
+                  kind = "unknown"
+              record = {
+                  "gid": metadata.st_gid,
+                  "kind": kind,
+                  "mode": format(stat.S_IMODE(mode), "04o"),
+                  "mtime_ns": metadata.st_mtime_ns,
+                  "path": os.path.relpath(path, root),
+                  "size": metadata.st_size,
+                  "uid": metadata.st_uid,
+              }
+              if kind == "file":
+                  digest = hashlib.sha256()
+                  with open(path, "rb") as stream:
+                      for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                          digest.update(chunk)
+                  record["sha256"] = digest.hexdigest()
+              elif kind == "symlink":
+                  record["target"] = os.readlink(path)
+              print(json.dumps(record, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+          PY
           }
 
           assert_terminal_clean() {
@@ -192,6 +257,7 @@ jobs:
               -u ota-authority-pressure-runner.service \
               -u ota-authority-launcher.service \
               -u ota-authority-attestor.service \
+              -u ota-authority-broker-proxy.service \
               | tee "$EVIDENCE_DIR/$case_name.journal.txt" >/dev/null
           }
 
@@ -200,12 +266,106 @@ jobs:
               | sed -n 's/^-- cursor: //p'
           }
 
+          assert_count() {
+            local expected=$1
+            local pattern=$2
+            local file=$3
+            local observed
+            observed=$(grep -c -- "$pattern" "$file" || true)
+            test "$observed" -eq "$expected"
+          }
+
+          assert_broker_checkpoint() {
+            local case_name=$1
+            local scenario=$2
+            local ordinal=$3
+            local decision=$4
+            assert_count 1 \
+              "bounded pressure decision_sent scenario=$scenario ordinal=$ordinal decision=$decision" \
+              "$EVIDENCE_DIR/$case_name.journal.txt"
+          }
+
+          extract_relay_evidence() {
+            local case_name=$1
+            local expected_count=$2
+            local expected_decision=${3:-}
+            local output="$EVIDENCE_DIR/$case_name.relay-evidence.jsonl"
+            sed -n 's/^.*bounded pressure authorization relay evidence=//p' \
+              "$EVIDENCE_DIR/$case_name.journal.txt" > "$output"
+            test "$(wc -l < "$output")" -eq "$expected_count"
+            if test "$expected_count" -gt 0; then
+              jq -s -e -c \
+                --arg decision "$expected_decision" \
+                'all(.[];
+                   .schema_version == 1
+                   and .authorization_decision.payload.decision == $decision
+                   and .authorization_decision_identity == .admission.authorization_decision_identity
+                   and .request_identity == .admission.request_identity)' \
+                "$output" >/dev/null
+            fi
+          }
+
+          extract_broker_decisions() {
+            local case_name=$1
+            local expected_count=$2
+            local expected_decision=$3
+            local output="$EVIDENCE_DIR/$case_name.broker-decisions.jsonl"
+            sed -n 's/^.*bounded pressure signed decision [^ ]* [^ ]* evidence=//p' \
+              "$EVIDENCE_DIR/$case_name.journal.txt" > "$output"
+            test "$(wc -l < "$output")" -eq "$expected_count"
+            jq -s -e -c \
+              --arg decision "$expected_decision" \
+              'all(.[];
+                 .payload.message_kind == "authorization_decision"
+                 and .payload.decision == $decision
+                 and .algorithm == "ed25519"
+                 and .key_id == "systemd-broker-pressure-v1")' \
+              "$output" >/dev/null
+          }
+
           reset_services() {
-            sudo systemctl stop ota-authority-launcher.service ota-authority-attestor.service || true
+            sudo systemctl stop \
+              ota-authority-launcher.service \
+              ota-authority-attestor.service \
+              ota-authority-broker-proxy.service || true
             sudo systemctl reset-failed
           }
 
+          set_broker_scenario() {
+            local scenario=$1
+            sudo systemctl stop ota-authority-broker-proxy.service || true
+            printf '%s\n' "$scenario" \
+              | sudo tee /run/ota/authority-broker-pressure-scenario >/dev/null
+            sudo chown root:root /run/ota/authority-broker-pressure-scenario
+            sudo chmod 0600 /run/ota/authority-broker-pressure-scenario
+          }
+
+          run_decision_case() {
+            local case_name=$1
+            local scenario=$2
+            local expected_terminal=$3
+            local cursor
+            repository_manifest > "$EVIDENCE_DIR/$case_name.repository.before.sha256"
+            reset_services
+            set_broker_scenario "$scenario"
+            cursor=$(journal_cursor)
+            sudo -u ota-authority-job \
+              /usr/lib/ota-authority/bin/ota-authority-systemd-pressure-client \
+              --authority-id platform-release-authority \
+              --repository "$PRESSURE_REPOSITORY" \
+              --expected-terminal "$expected_terminal" \
+              -- run governed --grant platform-release-authority \
+              | tee "$EVIDENCE_DIR/$case_name.json" >/dev/null
+            capture_journal "$case_name" "$cursor"
+            jq -e '.ok == true' "$EVIDENCE_DIR/$case_name.json"
+            assert_terminal_clean "$case_name"
+            repository_manifest > "$EVIDENCE_DIR/$case_name.repository.after.sha256"
+            diff -u "$EVIDENCE_DIR/$case_name.repository.before.sha256" \
+              "$EVIDENCE_DIR/$case_name.repository.after.sha256"
+          }
+
           repository_manifest > "$EVIDENCE_DIR/repository.before.sha256"
+          repository_manifest > "$EVIDENCE_DIR/positive.repository.before.sha256"
 
           case_cursor=$(journal_cursor)
           if ! sudo systemctl start ota-authority-pressure-runner.service; then
@@ -214,6 +374,7 @@ jobs:
               ota-authority-pressure-runner.service \
               ota-authority-launcher.service \
               ota-authority-attestor.service \
+              ota-authority-broker-proxy.service \
               > "$EVIDENCE_DIR/positive-start-failure.units.txt"
             exit 1
           fi
@@ -224,12 +385,162 @@ jobs:
           grep -q 'bounded pressure v3 stage=attestation_produced' "$EVIDENCE_DIR/positive.journal.txt"
           grep -q 'bounded pressure v3 stage=attestation_sent' "$EVIDENCE_DIR/positive.journal.txt"
           grep -q 'bounded pressure v3 stage=authorization_received' "$EVIDENCE_DIR/positive.journal.txt"
-          grep -q '"stage": "attestation_admitted_before_authorization_boundary_removed"' \
+          grep -q 'bounded pressure v3 stage=authorization_request_forwarded' "$EVIDENCE_DIR/positive.journal.txt"
+          grep -q 'bounded pressure v3 stage=authorization_decision_relayed' "$EVIDENCE_DIR/positive.journal.txt"
+          grep -q 'bounded pressure v3 stage=authorization_decision_verified' "$EVIDENCE_DIR/positive.journal.txt"
+          assert_broker_checkpoint positive allowed 1 allowed
+          assert_count 1 'bounded pressure v3 stage=authorization_decision_verified' \
+            "$EVIDENCE_DIR/positive.journal.txt"
+          extract_broker_decisions positive 1 allowed
+          extract_relay_evidence positive 1 allowed
+          grep -q '"stage": "authorization_decision_verified_before_lease_boundary_removed"' \
             "$EVIDENCE_DIR/positive.journal.txt"
           assert_terminal_clean positive
+          repository_manifest > "$EVIDENCE_DIR/positive.repository.after.sha256"
+          diff -u "$EVIDENCE_DIR/positive.repository.before.sha256" \
+            "$EVIDENCE_DIR/positive.repository.after.sha256"
           test "$(systemctl show ota-authority-pressure-runner.service -p Result --value)" = success
           test "$(systemctl is-active ota-authority-attestor.service || true)" != active
+          test "$(systemctl is-active ota-authority-broker-proxy.service || true)" != active
 
+          run_decision_case denied denied denied-decision
+          jq -e '.terminal.stage == "authority_refused_boundary_removed"' \
+            "$EVIDENCE_DIR/denied.json"
+          grep -q 'bounded pressure v3 stage=authorization_decision_verified' \
+            "$EVIDENCE_DIR/denied.journal.txt"
+          assert_broker_checkpoint denied denied 1 denied
+          assert_count 1 'bounded pressure v3 stage=authorization_decision_verified' \
+            "$EVIDENCE_DIR/denied.journal.txt"
+          assert_count 1 'bounded pressure v3 stage=authorization_decision_relayed' \
+            "$EVIDENCE_DIR/denied.journal.txt"
+          extract_broker_decisions denied 1 denied
+          extract_relay_evidence denied 1 denied
+
+          run_decision_case stale stale protocol-refusal
+          jq -e '.terminal.stage == "pre_authorization_protocol_refused_boundary_removed"' \
+            "$EVIDENCE_DIR/stale.json"
+          assert_broker_checkpoint stale stale 1 allowed
+          assert_count 1 'bounded pressure v3 stage=authorization_decision_relayed' \
+            "$EVIDENCE_DIR/stale.journal.txt"
+          assert_count 0 'bounded pressure v3 stage=authorization_decision_verified' \
+            "$EVIDENCE_DIR/stale.journal.txt"
+          extract_broker_decisions stale 1 allowed
+          stale_expiry=$(jq -r '.payload.expires_at' \
+            "$EVIDENCE_DIR/stale.broker-decisions.jsonl")
+          test "$(date --date="$stale_expiry" +%s)" -lt "$(date -u +%s)"
+          extract_relay_evidence stale 0
+
+          run_decision_case wrong-scope wrong_scope protocol-refusal
+          jq -e '.terminal.stage == "pre_authorization_protocol_refused_boundary_removed"' \
+            "$EVIDENCE_DIR/wrong-scope.json"
+          assert_broker_checkpoint wrong-scope wrong_scope 1 allowed
+          assert_count 1 'bounded pressure v3 stage=authorization_decision_relayed' \
+            "$EVIDENCE_DIR/wrong-scope.journal.txt"
+          assert_count 0 'bounded pressure v3 stage=authorization_decision_verified' \
+            "$EVIDENCE_DIR/wrong-scope.journal.txt"
+          extract_broker_decisions wrong-scope 1 allowed
+          jq -e \
+            '.payload.semantic_scope_identity == ("sha256:" + ("f" * 64))' \
+            "$EVIDENCE_DIR/wrong-scope.broker-decisions.jsonl"
+          extract_relay_evidence wrong-scope 0
+
+          run_decision_case pending-timeout pending_timeout protocol-refusal
+          jq -e '.terminal.stage == "pre_authorization_protocol_refused_boundary_removed"' \
+            "$EVIDENCE_DIR/pending-timeout.json"
+          assert_broker_checkpoint pending-timeout pending_timeout 1 pending
+          assert_count 1 'bounded pressure v3 stage=authorization_decision_verified' \
+            "$EVIDENCE_DIR/pending-timeout.journal.txt"
+          assert_count 1 'bounded pressure v3 stage=authorization_decision_relayed' \
+            "$EVIDENCE_DIR/pending-timeout.journal.txt"
+          extract_broker_decisions pending-timeout 1 pending
+          assert_count 1 'bounded pressure pending_timeout_wait_completed seconds=3' \
+            "$EVIDENCE_DIR/pending-timeout.journal.txt"
+          extract_relay_evidence pending-timeout 1 pending
+
+          run_decision_case ambiguous ambiguous protocol-refusal
+          jq -e '.terminal.stage == "pre_authorization_protocol_refused_boundary_removed"' \
+            "$EVIDENCE_DIR/ambiguous.json"
+          assert_broker_checkpoint ambiguous ambiguous 1 pending
+          assert_broker_checkpoint ambiguous ambiguous 2 pending
+          assert_count 1 'bounded pressure v3 stage=authorization_decision_verified' \
+            "$EVIDENCE_DIR/ambiguous.journal.txt"
+          assert_count 2 'bounded pressure v3 stage=authorization_decision_relayed' \
+            "$EVIDENCE_DIR/ambiguous.journal.txt"
+          extract_broker_decisions ambiguous 2 pending
+          jq -s -e 'map(.payload.broker_revision) == [1, 2]' \
+            "$EVIDENCE_DIR/ambiguous.broker-decisions.jsonl"
+          extract_relay_evidence ambiguous 1 pending
+
+          reset_services
+          sudo systemctl stop ota-authority-broker-proxy.socket
+          repository_manifest > "$EVIDENCE_DIR/missing-broker.repository.before.sha256"
+          case_cursor=$(journal_cursor)
+          sudo -u ota-authority-job \
+            /usr/lib/ota-authority/bin/ota-authority-systemd-pressure-client \
+            --authority-id platform-release-authority \
+            --repository "$PRESSURE_REPOSITORY" \
+            --expected-terminal protocol-refusal \
+            -- run governed --grant platform-release-authority \
+            | tee "$EVIDENCE_DIR/missing-broker.json" >/dev/null
+          capture_journal missing-broker "$case_cursor"
+          jq -e '.terminal.stage == "pre_authorization_protocol_refused_boundary_removed"' \
+            "$EVIDENCE_DIR/missing-broker.json"
+          assert_count 0 'bounded pressure decision_sent' \
+            "$EVIDENCE_DIR/missing-broker.journal.txt"
+          assert_count 0 'bounded pressure v3 stage=authorization_decision_verified' \
+            "$EVIDENCE_DIR/missing-broker.journal.txt"
+          assert_count 0 'bounded pressure v3 stage=authorization_request_forwarded' \
+            "$EVIDENCE_DIR/missing-broker.journal.txt"
+          assert_count 0 'bounded pressure v3 stage=authorization_decision_relayed' \
+            "$EVIDENCE_DIR/missing-broker.journal.txt"
+          extract_relay_evidence missing-broker 0
+          assert_terminal_clean missing-broker
+          repository_manifest > "$EVIDENCE_DIR/missing-broker.repository.after.sha256"
+          diff -u "$EVIDENCE_DIR/missing-broker.repository.before.sha256" \
+            "$EVIDENCE_DIR/missing-broker.repository.after.sha256"
+          sudo systemctl start ota-authority-broker-proxy.socket
+          set_broker_scenario allowed
+
+          reset_services
+          sudo cp /usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer \
+            /usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer-drift
+          printf drift \
+            | sudo tee -a /usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer-drift \
+              >/dev/null
+          sudo chmod 0755 /usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer-drift
+          sha256sum \
+            /usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer \
+            /usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer-drift \
+            > "$EVIDENCE_DIR/broker-executable-drift.sha256"
+          sudo install -d -o root -g root -m 0755 \
+            /run/systemd/system/ota-authority-broker-proxy.service.d
+          sudo tee \
+            /run/systemd/system/ota-authority-broker-proxy.service.d/zzzz-pressure-executable-drift.conf \
+            >/dev/null <<'UNIT'
+          [Service]
+          ExecStart=
+          ExecStart=/usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer-drift
+          UNIT
+          sudo systemctl daemon-reload
+          run_decision_case broker-executable-drift allowed protocol-refusal
+          jq -e '.terminal.stage == "pre_authorization_protocol_refused_boundary_removed"' \
+            "$EVIDENCE_DIR/broker-executable-drift.json"
+          assert_count 0 'bounded pressure decision_sent' \
+            "$EVIDENCE_DIR/broker-executable-drift.journal.txt"
+          assert_count 0 'bounded pressure v3 stage=authorization_request_forwarded' \
+            "$EVIDENCE_DIR/broker-executable-drift.journal.txt"
+          assert_count 0 'bounded pressure v3 stage=authorization_decision_relayed' \
+            "$EVIDENCE_DIR/broker-executable-drift.journal.txt"
+          assert_count 0 'bounded pressure v3 stage=authorization_decision_verified' \
+            "$EVIDENCE_DIR/broker-executable-drift.journal.txt"
+          systemctl show ota-authority-broker-proxy.service \
+            > "$EVIDENCE_DIR/broker-executable-drift.units.txt"
+          sudo rm \
+            /run/systemd/system/ota-authority-broker-proxy.service.d/zzzz-pressure-executable-drift.conf \
+            /usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer-drift
+          sudo systemctl daemon-reload
+
+          repository_manifest > "$EVIDENCE_DIR/installation-drift.repository.before.sha256"
           reset_services
           sudo cp /usr/lib/ota-authority/bin/ota-authority-attestor "$RUNNER_TEMP/attestor.clean"
           printf drift | sudo tee -a /usr/lib/ota-authority/bin/ota-authority-attestor >/dev/null
@@ -249,7 +560,11 @@ jobs:
           assert_terminal_clean installation-drift
           sudo install -o root -g root -m 0755 "$RUNNER_TEMP/attestor.clean" \
             /usr/lib/ota-authority/bin/ota-authority-attestor
+          repository_manifest > "$EVIDENCE_DIR/installation-drift.repository.after.sha256"
+          diff -u "$EVIDENCE_DIR/installation-drift.repository.before.sha256" \
+            "$EVIDENCE_DIR/installation-drift.repository.after.sha256"
 
+          repository_manifest > "$EVIDENCE_DIR/runtime-drift.repository.before.sha256"
           reset_services
           sudo install -d -o root -g root -m 0755 \
             /etc/systemd/system/ota-authority-launcher.service.d
@@ -277,7 +592,11 @@ jobs:
           assert_terminal_clean runtime-drift
           sudo rm /etc/systemd/system/ota-authority-launcher.service.d/zzzzzz-pressure-drift.conf
           sudo systemctl daemon-reload
+          repository_manifest > "$EVIDENCE_DIR/runtime-drift.repository.after.sha256"
+          diff -u "$EVIDENCE_DIR/runtime-drift.repository.before.sha256" \
+            "$EVIDENCE_DIR/runtime-drift.repository.after.sha256"
 
+          repository_manifest > "$EVIDENCE_DIR/missing-credential.repository.before.sha256"
           reset_services
           sudo mv /var/lib/ota/authority-attestor-signing-key \
             /var/lib/ota/authority-attestor-signing-key.unavailable
@@ -297,7 +616,11 @@ jobs:
           assert_terminal_clean missing-credential
           sudo mv /var/lib/ota/authority-attestor-signing-key.unavailable \
             /var/lib/ota/authority-attestor-signing-key
+          repository_manifest > "$EVIDENCE_DIR/missing-credential.repository.after.sha256"
+          diff -u "$EVIDENCE_DIR/missing-credential.repository.before.sha256" \
+            "$EVIDENCE_DIR/missing-credential.repository.after.sha256"
 
+          repository_manifest > "$EVIDENCE_DIR/crash-first.repository.before.sha256"
           reset_services
           sudo install -d -o root -g root -m 0755 /run/ota
           sudo install -o root -g root -m 0600 /dev/null \
@@ -332,6 +655,7 @@ jobs:
               ota-authority-pressure-runner.service \
               ota-authority-launcher.service \
               ota-authority-attestor.service \
+              ota-authority-broker-proxy.service \
               > "$EVIDENCE_DIR/crash-recovery-start-failure.units.txt"
             exit 1
           fi
@@ -339,6 +663,82 @@ jobs:
           grep -q 'bounded pressure v3 stage=authorization_received' \
             "$EVIDENCE_DIR/crash-recovery.journal.txt"
           assert_terminal_clean crash-recovery
+          repository_manifest > "$EVIDENCE_DIR/crash-first.repository.after.sha256"
+          diff -u "$EVIDENCE_DIR/crash-first.repository.before.sha256" \
+            "$EVIDENCE_DIR/crash-first.repository.after.sha256"
+
+          repository_manifest > "$EVIDENCE_DIR/decision-crash.repository.before.sha256"
+          reset_services
+          set_broker_scenario allowed
+          sudo install -o root -g root -m 0600 /dev/null \
+            /run/ota/authority-launcher-pressure-exit-after-decision
+          case_cursor=$(journal_cursor)
+          if sudo systemctl start ota-authority-pressure-runner.service; then
+            echo 'post-decision crash injection unexpectedly completed' >&2
+            exit 1
+          fi
+          capture_journal decision-crash-first "$case_cursor"
+          test "$(systemctl show ota-authority-launcher.service -p ExecMainStatus --value)" = 87
+          decision_crash_slots=$(sudo find /var/lib/ota/authority-launcher/active \
+            -mindepth 1 -maxdepth 1 -type f | wc -l)
+          printf 'active_slots=%s\n' "$decision_crash_slots" \
+            > "$EVIDENCE_DIR/decision-crash-first.boundary.txt"
+          test "$decision_crash_slots" -eq 1
+          decision_crash_slot=$(sudo find /var/lib/ota/authority-launcher/active \
+            -mindepth 1 -maxdepth 1 -type f -print -quit)
+          sudo cp "$decision_crash_slot" \
+            "$EVIDENCE_DIR/decision-crash-first.active-slot.json"
+          sudo chown "$(id -u):$(id -g)" \
+            "$EVIDENCE_DIR/decision-crash-first.active-slot.json"
+          jq -e \
+            '.stage == "authorization_decision_verified"
+             and .child != null
+             and .scope != null
+             and .authorization_decision.authorization_decision.payload.decision == "allowed"
+             and .authorization_decision.admission.decision == "allowed"' \
+            "$EVIDENCE_DIR/decision-crash-first.active-slot.json"
+          assert_broker_checkpoint decision-crash-first allowed 1 allowed
+          test ! -e "$PRESSURE_REPOSITORY/selected-work-must-not-exist"
+          test ! -e "$PRESSURE_REPOSITORY/.ota"
+
+          sudo systemctl reset-failed
+          case_cursor=$(journal_cursor)
+          if ! sudo systemctl start ota-authority-pressure-runner.service; then
+            capture_journal decision-crash-recovery-start-failure "$case_cursor"
+            systemctl show \
+              ota-authority-pressure-runner.service \
+              ota-authority-launcher.service \
+              ota-authority-attestor.service \
+              ota-authority-broker-proxy.service \
+              > "$EVIDENCE_DIR/decision-crash-recovery-start-failure.units.txt"
+            exit 1
+          fi
+          capture_journal decision-crash-recovery "$case_cursor"
+          assert_broker_checkpoint decision-crash-recovery allowed 1 allowed
+          assert_count 1 'bounded pressure v3 stage=authorization_request_forwarded' \
+            "$EVIDENCE_DIR/decision-crash-recovery.journal.txt"
+          assert_count 1 'bounded pressure v3 stage=authorization_decision_relayed' \
+            "$EVIDENCE_DIR/decision-crash-recovery.journal.txt"
+          assert_count 1 'bounded pressure v3 stage=authorization_decision_verified' \
+            "$EVIDENCE_DIR/decision-crash-recovery.journal.txt"
+          extract_broker_decisions decision-crash-recovery 1 allowed
+          extract_relay_evidence decision-crash-recovery 1 allowed
+          crashed_request=$(jq -r '.authorization_decision.request_identity' \
+            "$EVIDENCE_DIR/decision-crash-first.active-slot.json")
+          fresh_request=$(jq -r '.request_identity' \
+            "$EVIDENCE_DIR/decision-crash-recovery.relay-evidence.jsonl")
+          crashed_scope=$(jq -r \
+            '.authorization_decision.authorization_decision.payload.semantic_scope_identity' \
+            "$EVIDENCE_DIR/decision-crash-first.active-slot.json")
+          fresh_scope=$(jq -r \
+            '.authorization_decision.payload.semantic_scope_identity' \
+            "$EVIDENCE_DIR/decision-crash-recovery.relay-evidence.jsonl")
+          test "$fresh_request" != "$crashed_request"
+          test "$fresh_scope" = "$crashed_scope"
+          assert_terminal_clean decision-crash-recovery
+          repository_manifest > "$EVIDENCE_DIR/decision-crash.repository.after.sha256"
+          diff -u "$EVIDENCE_DIR/decision-crash.repository.before.sha256" \
+            "$EVIDENCE_DIR/decision-crash.repository.after.sha256"
 
           repository_manifest > "$EVIDENCE_DIR/repository.after.sha256"
           diff -u "$EVIDENCE_DIR/repository.before.sha256" \
@@ -352,6 +752,7 @@ jobs:
           systemctl show \
             ota-authority-launcher.service \
             ota-authority-attestor.service \
+            ota-authority-broker-proxy.service \
             ota-authority-pressure-runner.service \
             > "$EVIDENCE_DIR/systemd-units.txt"
 

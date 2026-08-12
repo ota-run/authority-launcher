@@ -26,6 +26,27 @@
 
 ## Unreleased
 
+- Advance the protected systemd V3 path through execution-disabled signed authorization-decision
+  admission. The installation manifest now binds the pressure broker executable and units; the
+  launcher retains the protected broker peer, rechecks its manifest-bound live executable around
+  relay traffic, forwards only Core's exact request, relays only signed decisions, requires Core's
+  exact verification acknowledgement, and durably journals the relay before cleanup. Allowed
+  decisions end at
+  `authorization_decision_verified_before_lease_boundary_removed`; denied decisions and malformed,
+  stale, wrong-scope, ambiguous, timed-out, or unavailable broker responses remain typed bounded
+  refusals. No lease is issued or consumed, no selected work runs, and no receipt/archive is made.
+- Add the pressure-only signed decision peer and scenario-specific pressure-client terminal
+  expectations. The prepared immutable Linux/x64 workflow covers allowed, denied, stale,
+  wrong-scope, pending-timeout, ambiguous, and unavailable-proxy cases with repository and cleanup
+  controls. Each negative case requires its exact signed peer checkpoint and acknowledgement count
+  rather than accepting a generic protocol refusal. Artifacts retain each public signed decision,
+  the public broker verifier binding, and complete bounded relay envelopes for independent
+  re-verification. A pressure-only crash after durable decision recording proves cleanup-only
+  recovery before a fresh request, and every decision scenario compares its complete repository
+  manifest before and after. This is not
+  production broker implementation or hosted evidence until that workflow is committed and green
+  against immutable revisions.
+
 - Verify protected producer freshness at response receipt rather than before transport. A signed
   response issued across a whole-second boundary can no longer be rejected against a stale
   pre-request clock sample during crash recovery.

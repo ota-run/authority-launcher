@@ -36,7 +36,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 #[cfg(target_os = "linux")]
 use ota_authority_protocol::{
     LAUNCHER_INVOCATION_REQUEST, LauncherInvocationRequestV1, LauncherTerminalFrameV1,
@@ -61,8 +61,18 @@ struct Cli {
     authority_id: String,
     #[arg(long)]
     repository: PathBuf,
+    #[arg(long, value_enum, default_value_t = ExpectedTerminal::AllowedDecision)]
+    expected_terminal: ExpectedTerminal,
     #[arg(last = true, required = true)]
     ota_args: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ExpectedTerminal {
+    AllowedDecision,
+    DeniedDecision,
+    ProtocolRefusal,
 }
 
 #[cfg(target_os = "linux")]
@@ -131,7 +141,7 @@ fn run(cli: Cli) -> Result<PressureEvidence, String> {
         .write_all(frame.as_slice())
         .map_err(|_| String::from("the pressure request could not be sent"))?;
     let terminal = read_terminal(&mut stream)?;
-    validate_pressure_terminal(&terminal)?;
+    validate_pressure_terminal(&terminal, cli.expected_terminal)?;
     Ok(PressureEvidence {
         ok: true,
         kind: "systemd_transient_scope_pressure",
@@ -141,11 +151,24 @@ fn run(cli: Cli) -> Result<PressureEvidence, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn validate_pressure_terminal(terminal: &LauncherTerminalFrameV1) -> Result<(), String> {
+fn validate_pressure_terminal(
+    terminal: &LauncherTerminalFrameV1,
+    expected: ExpectedTerminal,
+) -> Result<(), String> {
+    let expected_stage = match expected {
+        ExpectedTerminal::AllowedDecision => {
+            LauncherTerminalStageV1::AuthorizationDecisionVerifiedBeforeLeaseBoundaryRemoved
+        }
+        ExpectedTerminal::DeniedDecision => {
+            LauncherTerminalStageV1::AuthorityRefusedBoundaryRemoved
+        }
+        ExpectedTerminal::ProtocolRefusal => {
+            LauncherTerminalStageV1::PreAuthorizationProtocolRefusedBoundaryRemoved
+        }
+    };
     if terminal.outcome != LauncherTerminalOutcomeV1::Refused
         || terminal.exit_code != Some(2)
-        || terminal.stage
-            != Some(LauncherTerminalStageV1::AttestationAdmittedBeforeAuthorizationBoundaryRemoved)
+        || terminal.stage != Some(expected_stage)
     {
         return Err(String::from(
             "the execution-disabled launcher did not confirm its bounded terminal refusal",
@@ -282,11 +305,11 @@ mod tests {
             stage: Some(LauncherTerminalStageV1::RequestRefusedBeforeBoundary),
         };
 
-        assert!(validate_pressure_terminal(&terminal).is_err());
+        assert!(validate_pressure_terminal(&terminal, ExpectedTerminal::AllowedDecision).is_err());
     }
 
     #[test]
-    fn pressure_terminal_requires_v3_admission_before_authorization_cleanup() {
+    fn pressure_terminal_requires_verified_decision_before_lease_cleanup() {
         let terminal = LauncherTerminalFrameV1 {
             message_kind: LAUNCHER_TERMINAL.into(),
             protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
@@ -294,10 +317,11 @@ mod tests {
             outcome: LauncherTerminalOutcomeV1::Refused,
             exit_code: Some(2),
             stage: Some(
-                LauncherTerminalStageV1::AttestationAdmittedBeforeAuthorizationBoundaryRemoved,
+                LauncherTerminalStageV1::AuthorizationDecisionVerifiedBeforeLeaseBoundaryRemoved,
             ),
         };
-        assert!(validate_pressure_terminal(&terminal).is_ok());
+        assert!(validate_pressure_terminal(&terminal, ExpectedTerminal::AllowedDecision).is_ok());
+        assert!(validate_pressure_terminal(&terminal, ExpectedTerminal::DeniedDecision).is_err());
     }
 
     #[test]

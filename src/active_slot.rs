@@ -33,9 +33,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use ota_authority_protocol::{
-    LauncherChildProcessV1, LauncherSystemdScopeV1, LauncherWorkingDirectoryV1,
-    launcher_child_process_identity, launcher_systemd_scope_identity,
-    launcher_working_directory_identity, message_identity,
+    AuthorizationDecision, AuthorizationDecisionRelayEvidenceV1, LauncherChildProcessV1,
+    LauncherSystemdScopeV1, LauncherWorkingDirectoryV1,
+    authorization_decision_relay_evidence_v1_identity, launcher_child_process_identity,
+    launcher_systemd_scope_identity, launcher_working_directory_identity, message_identity,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -51,6 +52,7 @@ pub(crate) enum ActiveSlotStage {
     Intent,
     ChildPrepared,
     ScopeAttached,
+    AuthorizationDecisionVerified,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,6 +69,8 @@ pub(crate) struct ActiveSlotJournalV1 {
     pub child: Option<LauncherChildProcessV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<LauncherSystemdScopeV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_decision: Option<AuthorizationDecisionRelayEvidenceV1>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -212,6 +216,7 @@ impl ActiveSlot {
             working_directory,
             child: None,
             scope: None,
+            authorization_decision: None,
         };
         journal.identity = active_slot_identity(&journal)?;
         write_new(&path, &journal)?;
@@ -260,6 +265,41 @@ impl ActiveSlot {
         self.journal.scope.as_ref()
     }
 
+    pub(crate) fn record_authorization_decision(
+        &mut self,
+        evidence: AuthorizationDecisionRelayEvidenceV1,
+    ) -> Result<(), ActiveSlotError> {
+        if authorization_decision_relay_evidence_v1_identity(&evidence)
+            .ok()
+            .as_deref()
+            != Some(evidence.identity.as_str())
+            || self.journal.child.is_none()
+            || self.journal.scope.is_none()
+        {
+            return Err(ActiveSlotError::InvalidJournal);
+        }
+        match (
+            &self.journal.stage,
+            self.journal.authorization_decision.as_ref(),
+        ) {
+            (ActiveSlotStage::ScopeAttached, None) => {}
+            (ActiveSlotStage::AuthorizationDecisionVerified, Some(previous))
+                if previous == &evidence =>
+            {
+                return Ok(());
+            }
+            (ActiveSlotStage::AuthorizationDecisionVerified, Some(previous))
+                if previous.authorization_decision.payload.decision
+                    == AuthorizationDecision::Pending
+                    && same_authorization_request(previous, &evidence) => {}
+            _ => return Err(ActiveSlotError::InvalidJournal),
+        }
+        self.journal.stage = ActiveSlotStage::AuthorizationDecisionVerified;
+        self.journal.authorization_decision = Some(evidence);
+        self.journal.identity = active_slot_identity(&self.journal)?;
+        replace_atomically(&self.directory, &self.path, &self.journal)
+    }
+
     pub(crate) fn finalize(self) -> Result<(), ActiveSlotError> {
         fs::remove_file(&self.path).map_err(|_| ActiveSlotError::PersistenceFailed)?;
         sync_directory(&self.directory)
@@ -272,7 +312,34 @@ fn is_direct_successor(current: &ActiveSlotJournalV1, recovered: &ActiveSlotJour
             current.child.is_none() && current.scope.is_none() && recovered.scope.is_none()
         }
         (ActiveSlotStage::ChildPrepared, ActiveSlotStage::ScopeAttached) => {
-            current.child == recovered.child && current.scope.is_none() && recovered.scope.is_some()
+            current.child == recovered.child
+                && current.scope.is_none()
+                && recovered.scope.is_some()
+                && current.authorization_decision.is_none()
+                && recovered.authorization_decision.is_none()
+        }
+        (ActiveSlotStage::ScopeAttached, ActiveSlotStage::AuthorizationDecisionVerified) => {
+            current.child == recovered.child
+                && current.scope == recovered.scope
+                && current.authorization_decision.is_none()
+                && recovered.authorization_decision.is_some()
+        }
+        (
+            ActiveSlotStage::AuthorizationDecisionVerified,
+            ActiveSlotStage::AuthorizationDecisionVerified,
+        ) => {
+            current.child == recovered.child
+                && current.scope == recovered.scope
+                && current
+                    .authorization_decision
+                    .as_ref()
+                    .zip(recovered.authorization_decision.as_ref())
+                    .is_some_and(|(previous, next)| {
+                        previous == next
+                            || (previous.authorization_decision.payload.decision
+                                == AuthorizationDecision::Pending
+                                && same_authorization_request(previous, next))
+                    })
         }
         _ => false,
     }
@@ -290,7 +357,11 @@ pub(crate) fn active_slot_identity(
             .as_deref()
             != Some(journal.working_directory.identity.as_str())
         || match journal.stage {
-            ActiveSlotStage::Intent => journal.child.is_some() || journal.scope.is_some(),
+            ActiveSlotStage::Intent => {
+                journal.child.is_some()
+                    || journal.scope.is_some()
+                    || journal.authorization_decision.is_some()
+            }
             ActiveSlotStage::ChildPrepared => {
                 journal.child.as_ref().is_none_or(|child| {
                     launcher_child_process_identity(child).ok().as_deref()
@@ -300,6 +371,7 @@ pub(crate) fn active_slot_identity(
                         || child.principal_mapping_identity != journal.principal_mapping_identity
                         || child.working_directory_identity != journal.working_directory.identity
                 }) || journal.scope.is_some()
+                    || journal.authorization_decision.is_some()
             }
             ActiveSlotStage::ScopeAttached => {
                 journal.child.as_ref().is_none_or(|child| {
@@ -317,7 +389,33 @@ pub(crate) fn active_slot_identity(
                         || Some(scope.child_identity.as_str())
                             != journal.child.as_ref().map(|child| child.identity.as_str())
                         || Some(scope.child_pid) != journal.child.as_ref().map(|child| child.pid)
-                })
+                }) || journal.authorization_decision.is_some()
+            }
+            ActiveSlotStage::AuthorizationDecisionVerified => {
+                journal.child.as_ref().is_none_or(|child| {
+                    launcher_child_process_identity(child).ok().as_deref()
+                        != Some(child.identity.as_str())
+                        || child.invocation_id != journal.invocation_id
+                        || child.request_identity != journal.request_identity
+                        || child.principal_mapping_identity != journal.principal_mapping_identity
+                        || child.working_directory_identity != journal.working_directory.identity
+                }) || journal.scope.as_ref().is_none_or(|scope| {
+                    launcher_systemd_scope_identity(scope).ok().as_deref()
+                        != Some(scope.identity.as_str())
+                        || scope.invocation_id != journal.invocation_id
+                        || scope.request_identity != journal.request_identity
+                        || Some(scope.child_identity.as_str())
+                            != journal.child.as_ref().map(|child| child.identity.as_str())
+                        || Some(scope.child_pid) != journal.child.as_ref().map(|child| child.pid)
+                }) || journal
+                    .authorization_decision
+                    .as_ref()
+                    .is_none_or(|evidence| {
+                        authorization_decision_relay_evidence_v1_identity(evidence)
+                            .ok()
+                            .as_deref()
+                            != Some(evidence.identity.as_str())
+                    })
             }
         }
     {
@@ -327,6 +425,36 @@ pub(crate) fn active_slot_identity(
     canonical.identity.clear();
     message_identity(ACTIVE_SLOT_IDENTITY_DOMAIN_V1, &canonical)
         .map_err(|_| ActiveSlotError::InvalidJournal)
+}
+
+fn same_authorization_request(
+    previous: &AuthorizationDecisionRelayEvidenceV1,
+    next: &AuthorizationDecisionRelayEvidenceV1,
+) -> bool {
+    previous.request_identity == next.request_identity
+        && previous.authorization_decision.payload.binding_identity
+            == next.authorization_decision.payload.binding_identity
+        && previous.authorization_decision.payload.authority_id
+            == next.authorization_decision.payload.authority_id
+        && previous.authorization_decision.payload.attestation_identity
+            == next.authorization_decision.payload.attestation_identity
+        && previous
+            .authorization_decision
+            .payload
+            .challenge_nonce_commitment
+            == next
+                .authorization_decision
+                .payload
+                .challenge_nonce_commitment
+        && previous.authorization_decision.payload.work_unit_identity
+            == next.authorization_decision.payload.work_unit_identity
+        && previous.authorization_decision.payload.contract_identity
+            == next.authorization_decision.payload.contract_identity
+        && previous
+            .authorization_decision
+            .payload
+            .semantic_scope_identity
+            == next.authorization_decision.payload.semantic_scope_identity
 }
 
 fn verify_store(
@@ -452,9 +580,13 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use ota_authority_protocol::{
-        LauncherChildProcessV1, LauncherSystemdScopeV1, LauncherWorkingDirectoryV1,
-        launcher_child_process_identity, launcher_systemd_scope_identity,
-        launcher_working_directory_identity,
+        AUTHORIZATION_DECISION, AUTHORIZATION_DECISION_ADMISSION, AUTHORIZATION_DECISION_DOMAIN_V1,
+        AuthorizationDecision, AuthorizationDecisionAdmissionV1, AuthorizationDecisionPayload,
+        AuthorizationDecisionRelayEvidenceV1, LauncherChildProcessV1, LauncherSystemdScopeV1,
+        LauncherWorkingDirectoryV1, SignedBrokerMessage,
+        authorization_decision_admission_v1_identity,
+        authorization_decision_relay_evidence_v1_identity, launcher_child_process_identity,
+        launcher_systemd_scope_identity, launcher_working_directory_identity, message_identity,
     };
     use tempfile::tempdir;
 
@@ -505,6 +637,7 @@ mod tests {
             working_directory,
             child: Some(child),
             scope: None,
+            authorization_decision: None,
         };
         journal.identity = active_slot_identity(&journal).expect("journal identity");
         journal
@@ -532,6 +665,64 @@ mod tests {
         };
         scope.identity = launcher_systemd_scope_identity(&scope).expect("scope identity");
         scope
+    }
+
+    fn decision_evidence(
+        decision: AuthorizationDecision,
+        revision: u64,
+        semantic_scope_identity: String,
+    ) -> AuthorizationDecisionRelayEvidenceV1 {
+        let request_identity = identity('1');
+        let signed = SignedBrokerMessage {
+            payload: AuthorizationDecisionPayload {
+                message_kind: AUTHORIZATION_DECISION.into(),
+                request_identity: request_identity.clone(),
+                binding_identity: identity('2'),
+                authority_id: String::from("release"),
+                attestation_identity: identity('3'),
+                challenge_nonce_commitment: identity('4'),
+                work_unit_identity: identity('5'),
+                contract_identity: identity('6'),
+                semantic_scope_identity,
+                decision,
+                approval_reference: Some(format!("approval:{revision}")),
+                broker_revision: revision,
+                issued_at: String::from("2026-08-11T00:00:00Z"),
+                expires_at: String::from("2026-08-11T00:01:00Z"),
+            },
+            key_id: String::from("broker-key"),
+            algorithm: String::from("ed25519"),
+            signature: format!("signature-{revision}"),
+        };
+        let decision_identity =
+            message_identity(AUTHORIZATION_DECISION_DOMAIN_V1.as_bytes(), &signed)
+                .expect("decision identity");
+        let mut admission = AuthorizationDecisionAdmissionV1 {
+            schema_version: 1,
+            identity: String::new(),
+            message_kind: AUTHORIZATION_DECISION_ADMISSION.into(),
+            request_identity: request_identity.clone(),
+            authorization_decision_identity: decision_identity.clone(),
+            binding_identity: signed.payload.binding_identity.clone(),
+            attestation_identity: signed.payload.attestation_identity.clone(),
+            work_unit_identity: signed.payload.work_unit_identity.clone(),
+            contract_identity: signed.payload.contract_identity.clone(),
+            semantic_scope_identity: signed.payload.semantic_scope_identity.clone(),
+            decision,
+        };
+        admission.identity =
+            authorization_decision_admission_v1_identity(&admission).expect("admission identity");
+        let mut evidence = AuthorizationDecisionRelayEvidenceV1 {
+            schema_version: 1,
+            identity: String::new(),
+            request_identity,
+            authorization_decision: signed,
+            authorization_decision_identity: decision_identity,
+            admission,
+        };
+        evidence.identity = authorization_decision_relay_evidence_v1_identity(&evidence)
+            .expect("relay evidence identity");
+        evidence
     }
 
     #[test]
@@ -605,6 +796,110 @@ mod tests {
     }
 
     #[test]
+    fn slot_durably_reconciles_pending_then_allowed_decision() {
+        let temporary = tempdir().expect("temporary directory");
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))
+            .expect("permissions");
+        let owner = unsafe { libc::geteuid() };
+        let mapping_identity = identity('a');
+        let invocation_request_identity = identity('b');
+        let mut slot = ActiveSlot::begin(
+            temporary.path(),
+            owner,
+            temporary.path(),
+            "invocation-decision",
+            mapping_identity.as_str(),
+            invocation_request_identity.as_str(),
+            working_directory(),
+        )
+        .expect("begin slot");
+        let prepared = prepared_journal(
+            "invocation-decision",
+            mapping_identity.as_str(),
+            invocation_request_identity.as_str(),
+        );
+        let child = prepared.child.expect("prepared child");
+        slot.record_child(child.clone()).expect("record child");
+        slot.record_scope(attached_scope(&child))
+            .expect("record scope");
+
+        let pending = decision_evidence(AuthorizationDecision::Pending, 1, identity('7'));
+        slot.record_authorization_decision(pending.clone())
+            .expect("record pending decision");
+        let pending_journal = load_journal(&slot.path).expect("pending journal");
+        assert_eq!(
+            pending_journal.stage,
+            ActiveSlotStage::AuthorizationDecisionVerified
+        );
+        assert_eq!(pending_journal.authorization_decision, Some(pending));
+
+        let allowed = decision_evidence(AuthorizationDecision::Allowed, 2, identity('7'));
+        slot.record_authorization_decision(allowed.clone())
+            .expect("record allowed decision");
+        let allowed_journal = load_journal(&slot.path).expect("allowed journal");
+        assert_eq!(allowed_journal.authorization_decision, Some(allowed));
+
+        let substituted = decision_evidence(AuthorizationDecision::Allowed, 3, identity('8'));
+        assert_eq!(
+            slot.record_authorization_decision(substituted),
+            Err(ActiveSlotError::InvalidJournal)
+        );
+        slot.finalize().expect("finalize slot");
+    }
+
+    #[test]
+    fn pending_decision_temporary_successor_is_promoted_for_recovery() {
+        let temporary = tempdir().expect("temporary directory");
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))
+            .expect("permissions");
+        let owner = unsafe { libc::geteuid() };
+        let mapping_identity = identity('a');
+        let invocation_request_identity = identity('b');
+        let mut slot = ActiveSlot::begin(
+            temporary.path(),
+            owner,
+            temporary.path(),
+            "invocation-decision-recovery",
+            mapping_identity.as_str(),
+            invocation_request_identity.as_str(),
+            working_directory(),
+        )
+        .expect("begin slot");
+        let prepared = prepared_journal(
+            "invocation-decision-recovery",
+            mapping_identity.as_str(),
+            invocation_request_identity.as_str(),
+        );
+        let child = prepared.child.expect("prepared child");
+        slot.record_child(child.clone()).expect("record child");
+        slot.record_scope(attached_scope(&child))
+            .expect("record scope");
+        slot.record_authorization_decision(decision_evidence(
+            AuthorizationDecision::Pending,
+            1,
+            identity('7'),
+        ))
+        .expect("record pending decision");
+
+        let allowed = decision_evidence(AuthorizationDecision::Allowed, 2, identity('7'));
+        let mut successor = slot.journal.clone();
+        successor.authorization_decision = Some(allowed.clone());
+        successor.identity = active_slot_identity(&successor).expect("successor identity");
+        let temporary_path = temporary.path().join(".invocation-decision-recovery.tmp");
+        write_new(&temporary_path, &successor).expect("temporary decision journal");
+        sync_directory(temporary.path()).expect("temporary journal sync");
+        drop(slot);
+
+        let mut recovered = ActiveSlot::load_all(temporary.path(), owner, temporary.path())
+            .expect("load decision successor");
+        assert!(!temporary_path.exists());
+        assert_eq!(recovered.len(), 1);
+        let promoted = recovered.pop().expect("promoted slot");
+        assert_eq!(promoted.journal.authorization_decision, Some(allowed));
+        promoted.finalize().expect("finalize promoted slot");
+    }
+
+    #[test]
     fn slot_rejects_unprotected_store_and_substituted_child_binding() {
         let temporary = tempdir().expect("temporary directory");
         fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o755))
@@ -643,6 +938,7 @@ mod tests {
                 working_directory_identity: identity('f'),
             }),
             scope: None,
+            authorization_decision: None,
         };
         let child = journal.child.as_mut().expect("child");
         child.identity = launcher_child_process_identity(child).expect("child identity");

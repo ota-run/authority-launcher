@@ -71,6 +71,8 @@ const VERIFIER_SET: &str = "/etc/ota/authority-attestor-verifiers.json";
 const INSTALLATION_MANIFEST: &str = "/etc/ota/authority-launcher-installation.json";
 const BROKER_STORE: &str = "/etc/ota/crossing-brokers.json";
 const SIGNING_KEY: &str = "/var/lib/ota/authority-attestor-signing-key";
+const BROKER_SIGNING_KEY: &str = "/var/lib/ota/authority-broker-signing-key";
+const BROKER_SCENARIO: &str = "/run/ota/authority-broker-pressure-scenario";
 const ISSUANCE_STATE: &str = "/var/lib/ota/authority-attestor";
 const LAUNCHER_STATE: &str = "/var/lib/ota/authority-launcher";
 const ACTIVE_SLOT_STATE: &str = "/var/lib/ota/authority-launcher/active";
@@ -108,6 +110,7 @@ pub(crate) struct ProvisionRequest {
     pub repository_root: PathBuf,
     pub launcher_binary: PathBuf,
     pub attestor_binary: PathBuf,
+    pub broker_decision_binary: PathBuf,
     pub ota_binary: PathBuf,
     pub pressure_client_binary: PathBuf,
 }
@@ -137,6 +140,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     let repository_root = protected_directory(&request.repository_root, Some(execution.uid))?;
     let launcher_binary = protected_executable(&request.launcher_binary)?;
     let attestor_binary = protected_executable(&request.attestor_binary)?;
+    let broker_decision_binary = protected_executable(&request.broker_decision_binary)?;
     let ota_binary = protected_executable(&request.ota_binary)?;
     let pressure_client_binary = protected_executable(&request.pressure_client_binary)?;
     for path in [
@@ -177,6 +181,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     let launcher_paths = protected_role_paths(
         &launcher_binary,
         &attestor_binary,
+        &broker_decision_binary,
         &ota_binary,
         &pressure_client_binary,
     );
@@ -198,7 +203,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     let launcher_socket = launcher_socket_unit(job.group.as_str());
     let attestor_service = attestor_service_unit(&attestor_binary);
     let attestor_socket = attestor_socket_unit();
-    let broker_service = broker_proxy_service_unit();
+    let broker_service = broker_proxy_service_unit(&broker_decision_binary);
     let broker_socket = broker_proxy_socket_unit();
     let runner_service = runner_service_unit(
         &request.authority_id,
@@ -335,6 +340,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         service_unit_identity: launcher_service_identity,
         socket_unit_identity: launcher_socket_identity,
         ota_binary_identity: sha256_file(&ota_binary)?,
+        broker_proxy_executable_identity: sha256_file(&broker_decision_binary)?,
         broker_proxy_identity: broker_proxy_installation_identity(
             broker_service_identity.as_str(),
             broker_socket_identity.as_str(),
@@ -393,7 +399,14 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         0o600,
     )?;
 
-    let broker_key = SigningKey::from_bytes(&random_seed()?);
+    let broker_seed = random_seed()?;
+    let broker_key = SigningKey::from_bytes(&broker_seed);
+    write_root_file(
+        Path::new(BROKER_SIGNING_KEY),
+        URL_SAFE_NO_PAD.encode(broker_seed).as_bytes(),
+        0o600,
+    )?;
+    write_root_file(Path::new(BROKER_SCENARIO), b"allowed\n", 0o600)?;
     let mut broker_binding = json!({
         "schema_version": 3,
         "identity": "",
@@ -413,7 +426,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
             "session_audience": "ota-crossing-broker"
         },
         "broker_verifiers": [{
-            "key_id": "unused-pressure-broker-v1",
+            "key_id": "systemd-broker-pressure-v1",
             "algorithm": "ed25519",
             "public_key": URL_SAFE_NO_PAD.encode(broker_key.verifying_key().to_bytes())
         }],
@@ -465,6 +478,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     let mut files = protected_role_paths(
         &launcher_binary,
         &attestor_binary,
+        &broker_decision_binary,
         &ota_binary,
         &pressure_client_binary,
     )
@@ -508,10 +522,15 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
 fn protected_role_paths(
     launcher: &Path,
     attestor: &Path,
+    broker_decision: &Path,
     ota: &Path,
     pressure_client: &Path,
 ) -> Vec<(ProtectedInstallationRoleV1, PathBuf)> {
     let mut paths = vec![
+        (
+            ProtectedInstallationRoleV1::BrokerProxyExecutable,
+            broker_decision.to_path_buf(),
+        ),
         (
             ProtectedInstallationRoleV1::LauncherExecutable,
             launcher.to_path_buf(),
@@ -646,7 +665,7 @@ fn protected_directories() -> [(&'static str, u32); 7] {
 
 fn launcher_service_unit(launcher: &Path, repository: &Path, read_only: &[String]) -> String {
     format!(
-        "[Unit]\nDescription=Ota protected authority launcher\nRequires=ota-authority-launcher.socket ota-authority-attestor.socket\nAfter=ota-authority-launcher.socket ota-authority-attestor.socket\n\n[Service]\nType=simple\nExecStart={} serve-systemd\nUser=root\nGroup=root\nUMask=0077\nNoNewPrivileges=yes\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nReadOnlyPaths={}\nReadWritePaths={} {} {}\n",
+        "[Unit]\nDescription=Ota protected authority launcher\nRequires=ota-authority-launcher.socket ota-authority-attestor.socket\nAfter=ota-authority-launcher.socket ota-authority-attestor.socket\n\n[Service]\nType=simple\nExecStart={} serve-systemd\nUser=root\nGroup=root\nUMask=0077\nNoNewPrivileges=yes\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths={}\nReadWritePaths={} {} {}\n",
         launcher.display(),
         read_only.join(" "),
         LAUNCHER_RUNTIME,
@@ -657,7 +676,7 @@ fn launcher_service_unit(launcher: &Path, repository: &Path, read_only: &[String
 
 fn launcher_hardening_drop_in(repository: &Path, read_only: &[String]) -> String {
     format!(
-        "[Service]\nUser=root\nGroup=root\nUMask=0077\nNoNewPrivileges=yes\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nReadOnlyPaths=\nReadOnlyPaths={}\nReadWritePaths=\nReadWritePaths={} {} {}\n",
+        "[Service]\nUser=root\nGroup=root\nUMask=0077\nNoNewPrivileges=yes\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths=\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths=\nReadOnlyPaths={}\nReadWritePaths=\nReadWritePaths={} {} {}\n",
         read_only.join(" "),
         LAUNCHER_RUNTIME,
         LAUNCHER_STATE,
@@ -673,14 +692,14 @@ fn launcher_socket_unit(group: &str) -> String {
 
 fn attestor_service_unit(attestor: &Path) -> String {
     format!(
-        "[Unit]\nDescription=Ota protected authority attestor\nRequires=ota-authority-attestor.socket\nAfter=ota-authority-attestor.socket\n\n[Service]\nType=simple\nExecStart={}\nUser=root\nGroup=root\nUMask=0077\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nRestrictNamespaces=yes\nRestrictRealtime=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nRestrictAddressFamilies=AF_UNIX\nReadOnlyPaths={ETC_OTA}\nReadWritePaths={ISSUANCE_STATE}\nLoadCredential=ota-attestor-ed25519:{SIGNING_KEY}\n",
+        "[Unit]\nDescription=Ota protected authority attestor\nRequires=ota-authority-attestor.socket\nAfter=ota-authority-attestor.socket\n\n[Service]\nType=simple\nExecStart={}\nUser=root\nGroup=root\nUMask=0077\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nRestrictNamespaces=yes\nRestrictRealtime=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nRestrictAddressFamilies=AF_UNIX\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths={ETC_OTA}\nReadWritePaths={ISSUANCE_STATE}\nLoadCredential=ota-attestor-ed25519:{SIGNING_KEY}\n",
         attestor.display()
     )
 }
 
 fn attestor_hardening_drop_in() -> String {
     format!(
-        "[Service]\nUser=root\nGroup=root\nUMask=0077\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nRestrictNamespaces=yes\nRestrictRealtime=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nRestrictAddressFamilies=AF_UNIX\nReadOnlyPaths=\nReadOnlyPaths={ETC_OTA} /run/systemd/system\nReadWritePaths=\nReadWritePaths={ISSUANCE_STATE}\nLoadCredential=\nLoadCredential=ota-attestor-ed25519:{SIGNING_KEY}\n"
+        "[Service]\nUser=root\nGroup=root\nUMask=0077\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nRestrictNamespaces=yes\nRestrictRealtime=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nRestrictAddressFamilies=AF_UNIX\nInaccessiblePaths=\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths=\nReadOnlyPaths={ETC_OTA} /run/systemd/system\nReadWritePaths=\nReadWritePaths={ISSUANCE_STATE}\nLoadCredential=\nLoadCredential=ota-attestor-ed25519:{SIGNING_KEY}\n"
     )
 }
 
@@ -690,9 +709,10 @@ fn attestor_socket_unit() -> String {
     )
 }
 
-fn broker_proxy_service_unit() -> String {
-    String::from(
-        "[Unit]\nDescription=Execution-disabled Ota broker proxy placeholder\n\n[Service]\nType=simple\nExecStart=/usr/bin/sleep infinity\nUser=root\nGroup=root\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nRestrictAddressFamilies=AF_UNIX\n",
+fn broker_proxy_service_unit(binary: &Path) -> String {
+    format!(
+        "[Unit]\nDescription=Execution-disabled Ota signed decision pressure peer\nRequires=ota-authority-broker-proxy.socket\nAfter=ota-authority-broker-proxy.socket\n\n[Service]\nType=simple\nExecStart={}\nUser=root\nGroup=root\nUMask=0077\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nPrivateNetwork=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nRestrictRealtime=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nMemoryDenyWriteExecute=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=\nAmbientCapabilities=\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths={BROKER_SCENARIO}\nLoadCredential=ota-broker-ed25519:{BROKER_SIGNING_KEY}\n",
+        binary.display()
     )
 }
 
@@ -910,7 +930,18 @@ mod tests {
         assert!(service.contains("serve-systemd"));
         assert!(service.contains("RestrictSUIDSGID=no"));
         assert!(service.contains("AmbientCapabilities=CAP_SETUID"));
+        assert!(service.contains(&format!(
+            "InaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}"
+        )));
         assert!(!service.contains("authority-broker execute"));
+        let broker = broker_proxy_service_unit(Path::new(
+            "/usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer",
+        ));
+        assert!(broker.contains("CapabilityBoundingSet=\n"));
+        assert!(broker.contains("PrivateNetwork=yes"));
+        assert!(broker.contains(&format!(
+            "InaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}"
+        )));
         assert!(attestor_socket_unit().contains("ListenSequentialPacket="));
         assert!(protected_directories().contains(&(ACTIVE_SLOT_STATE, 0o700)));
         let rule = polkit_deny_rule(

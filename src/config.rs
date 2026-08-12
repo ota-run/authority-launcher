@@ -116,6 +116,7 @@ pub(crate) struct SystemdLauncherServiceConfigV1 {
     pub service_unit_identity: String,
     pub socket_unit_identity: String,
     pub ota_binary_identity: String,
+    pub broker_proxy_executable_identity: String,
     pub broker_proxy_identity: String,
     pub attestor_key_set_identity: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -360,6 +361,7 @@ fn validate_systemd_launcher_service_config(
         || !is_sha256_identity(config.service_unit_identity.as_str())
         || !is_sha256_identity(config.socket_unit_identity.as_str())
         || !is_sha256_identity(config.ota_binary_identity.as_str())
+        || !is_sha256_identity(config.broker_proxy_executable_identity.as_str())
         || !is_sha256_identity(config.broker_proxy_identity.as_str())
         || !is_sha256_identity(config.attestor_key_set_identity.as_str())
         || config.broker_proxy_peer.uid != 0
@@ -785,6 +787,7 @@ mod tests {
             socket_unit_identity: identity('b'),
             ota_binary_identity: identity('c'),
             broker_proxy_identity: identity('d'),
+            broker_proxy_executable_identity: identity('f'),
             attestor_key_set_identity: identity('e'),
             attestation_claims: None,
             maximum_request_bytes: 4096,

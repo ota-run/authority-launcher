@@ -22,30 +22,27 @@
 
 //! Linux socket-activation admission for the planned protected launcher service.
 //!
-//! This foundation deliberately stops before broker traffic or selected execution. It proves the
+//! This foundation deliberately stops before lease issuance or selected execution. It proves the
 //! service can consume only the fixed listener, derive the connecting job principal through
 //! `SO_PEERCRED`, durably prepare an exact stopped Ota child, attach and verify its transient
 //! systemd scope, admit that child's exact bounded process-posture preface, and bridge one signed
-//! V3 attestation. Authorization remains disabled and exact cleanup is still mandatory.
+//! V3 attestation and one exact signed authorization decision. Lease consumption remains disabled
+//! and exact cleanup is still mandatory.
 
 use std::env;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-#[cfg(feature = "systemd-pressure-faults")]
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::time::Duration;
 
-#[cfg(test)]
-use ota_authority_launcher::linux_observations::revalidate_connected_peer;
 use ota_authority_launcher::linux_observations::{
     ObservedSessionPeer, observe_connected_peer, reconcile_connected_peer,
-    verify_peer_process_status,
+    revalidate_connected_peer, verify_peer_executable_identity, verify_peer_process_status,
 };
 use ota_authority_protocol::{
-    ATTESTATION_RESPONSE, LAUNCHER_TERMINAL, LauncherAttestationClaimsV3,
+    ATTESTATION_RESPONSE, AuthorizationDecision, LAUNCHER_TERMINAL, LauncherAttestationClaimsV3,
     LauncherAttestationSigningRequestV1, LauncherInvocationRequestV1, LauncherTerminalFrameV1,
     LauncherTerminalOutcomeV1, LauncherTerminalStageV1, LauncherWorkingDirectoryV1,
     MAX_FRAME_BYTES, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1,
@@ -86,6 +83,11 @@ const PRESSURE_EXIT_AFTER_SCOPE_MARKER: &str =
     "/run/ota/authority-launcher-pressure-exit-after-scope";
 #[cfg(feature = "systemd-pressure-faults")]
 const PRESSURE_EXIT_AFTER_SCOPE_CODE: i32 = 86;
+#[cfg(feature = "systemd-pressure-faults")]
+const PRESSURE_EXIT_AFTER_DECISION_MARKER: &str =
+    "/run/ota/authority-launcher-pressure-exit-after-decision";
+#[cfg(feature = "systemd-pressure-faults")]
+const PRESSURE_EXIT_AFTER_DECISION_CODE: i32 = 87;
 
 #[derive(Debug, Error)]
 pub(crate) enum SystemdServiceError {
@@ -113,7 +115,6 @@ pub(crate) enum SystemdServiceError {
     ChildCleanupFailed,
     #[error("the systemd launcher transient scope boundary is unavailable")]
     ScopeUnavailable,
-    #[cfg(test)]
     #[error("the systemd launcher protected broker proxy is unavailable")]
     BrokerProxyUnavailable,
     #[error("the protected launcher installation identity is unavailable or mismatched")]
@@ -122,6 +123,8 @@ pub(crate) enum SystemdServiceError {
     RuntimeProfileUnavailable,
     #[error("the systemd launcher protocol bridge refused before authorization")]
     PreAuthorizationProtocolRefused,
+    #[error("the systemd launcher authorization decision was refused or unavailable")]
+    AuthorizationDecisionRefused,
     #[error("the systemd launcher could not confirm terminal scope cleanup")]
     ScopeCleanupFailed,
     #[error("the systemd launcher admission foundation does not yet execute governed work")]
@@ -204,17 +207,22 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
     );
 
     match child_boundary {
-        Ok(_prepared_child) => {
-            // Execution remains disabled. Refusal is emitted only after the prepared child was
-            // killed, reaped, and removed from the durable active-slot store.
+        Ok((_prepared_child, decision)) => {
+            // Lease issuance and execution remain disabled. Refusal is emitted only after the
+            // prepared child was killed, reaped, and removed from the durable active-slot store.
             write_terminal(
                 &mut stream,
                 invocation_id.as_str(),
                 LauncherTerminalOutcomeV1::Refused,
                 Some(2),
-                Some(
-                    LauncherTerminalStageV1::AttestationAdmittedBeforeAuthorizationBoundaryRemoved,
-                ),
+                Some(match decision {
+                    AuthorizationDecision::Allowed => {
+                        LauncherTerminalStageV1::AuthorizationDecisionVerifiedBeforeLeaseBoundaryRemoved
+                    }
+                    AuthorizationDecision::Denied | AuthorizationDecision::Pending => {
+                        LauncherTerminalStageV1::AuthorityRefusedBoundaryRemoved
+                    }
+                }),
             )?;
             Err(SystemdServiceError::ExecutionNotEnabled)
         }
@@ -231,8 +239,10 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
             )?;
             Err(error)
         }
-        #[cfg(test)]
-        Err(error @ SystemdServiceError::BrokerProxyUnavailable) => {
+        Err(
+            error @ (SystemdServiceError::BrokerProxyUnavailable
+            | SystemdServiceError::AuthorizationDecisionRefused),
+        ) => {
             write_terminal(
                 &mut stream,
                 invocation_id.as_str(),
@@ -269,7 +279,13 @@ fn prepare_disabled_child_boundary(
     active_slot_directory: &Path,
     active_slot_owner_uid: u32,
     active_slot_trusted_root: &Path,
-) -> Result<ota_authority_protocol::LauncherChildProcessV1, SystemdServiceError> {
+) -> Result<
+    (
+        ota_authority_protocol::LauncherChildProcessV1,
+        AuthorizationDecision,
+    ),
+    SystemdServiceError,
+> {
     let scope_manager = SystemdScopeManager::connect().map_err(map_systemd_scope_error)?;
     prepare_disabled_child_boundary_with_scope(
         config,
@@ -282,7 +298,7 @@ fn prepare_disabled_child_boundary(
         active_slot_owner_uid,
         active_slot_trusted_root,
         &scope_manager,
-        |child, principal_mapping, scope| {
+        |child, principal_mapping, scope, active_slot| {
             let posture = child
                 .resume_and_receive_process_posture(
                     principal_mapping.identity.as_str(),
@@ -290,8 +306,8 @@ fn prepare_disabled_child_boundary(
                 )
                 .map_err(|error| pressure_prepared_child_failure("process_posture", error))?;
             let child_record = child.record.clone();
-            child
-                .continue_with_v3_attestation(
+            let (authorization, request_identity) = child
+                .continue_to_v3_authorization_request(
                     &posture,
                     Duration::from_secs(config.maximum_startup_seconds),
                     |challenge| {
@@ -323,7 +339,31 @@ fn prepare_disabled_child_boundary(
                         .map_err(|_| pressure_bridge_failure("attestation_producer"))
                     },
                 )
-                .map_err(|error| pressure_prepared_child_failure("v3_session", error))
+                .map_err(|error| pressure_prepared_child_failure("v3_session", error))?;
+            let mut proxy = ProtectedBrokerProxy::connect(
+                config,
+                Duration::from_secs(config.maximum_terminal_wait_seconds),
+            )?;
+            proxy.run_revalidated(|stream| {
+                child
+                    .relay_v3_authorization_decisions(
+                        &authorization,
+                        &request_identity,
+                        stream,
+                        Duration::from_secs(config.maximum_terminal_wait_seconds),
+                        |evidence| {
+                            active_slot
+                                .record_authorization_decision(evidence.clone())
+                                .map_err(|_| {
+                                    PreparedChildError::AuthorizationDecisionBridgeUnavailable
+                                })?;
+                            pressure_exit_after_authorization_decision_recorded().map_err(|_| {
+                                PreparedChildError::AuthorizationDecisionBridgeUnavailable
+                            })
+                        },
+                    )
+                    .map_err(map_prepared_child_error)
+            })
         },
     )
 }
@@ -441,16 +481,60 @@ fn produce_attestation(
     Ok(response.attestation)
 }
 
-#[cfg(test)]
 struct ProtectedBrokerProxy {
     stream: UnixStream,
     peer: ObservedSessionPeer,
+    executable_identity: String,
 }
 
-#[cfg(test)]
 impl ProtectedBrokerProxy {
+    fn connect(
+        config: &SystemdLauncherServiceConfigV1,
+        timeout: Duration,
+    ) -> Result<Self, SystemdServiceError> {
+        let path = config.broker_proxy_socket.as_path();
+        let parent = path
+            .parent()
+            .ok_or(SystemdServiceError::BrokerProxyUnavailable)?;
+        verify_protected_directory(parent, 0, Path::new("/"))
+            .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
+        if !metadata.file_type().is_socket()
+            || metadata.uid() != config.broker_proxy_peer.uid
+            || metadata.gid() != config.broker_proxy_peer.gid
+            || metadata.permissions().mode() & 0o7777 != 0o600
+        {
+            return Err(SystemdServiceError::BrokerProxyUnavailable);
+        }
+        let stream =
+            UnixStream::connect(path).map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
+        stream
+            .set_read_timeout(Some(timeout))
+            .and_then(|()| stream.set_write_timeout(Some(timeout)))
+            .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
+        let peer = observe_connected_peer(&stream)
+            .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
+        reconcile_connected_peer(
+            &peer,
+            config.broker_proxy_peer.uid,
+            config.broker_proxy_peer.gid,
+        )
+        .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
+        verify_peer_executable_identity(&peer, &config.broker_proxy_executable_identity)
+            .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)?;
+        let proxy = Self {
+            stream,
+            peer,
+            executable_identity: config.broker_proxy_executable_identity.clone(),
+        };
+        proxy.revalidate()?;
+        Ok(proxy)
+    }
+
     fn revalidate(&self) -> Result<(), SystemdServiceError> {
         revalidate_connected_peer(&self.stream, &self.peer)
+            .and_then(|()| verify_peer_executable_identity(&self.peer, &self.executable_identity))
             .map_err(|_| SystemdServiceError::BrokerProxyUnavailable)
     }
 
@@ -478,13 +562,20 @@ fn prepare_disabled_child_boundary_with_scope<F>(
     active_slot_trusted_root: &Path,
     scope_manager: &impl ScopeBoundary,
     posture_gate: F,
-) -> Result<ota_authority_protocol::LauncherChildProcessV1, SystemdServiceError>
+) -> Result<
+    (
+        ota_authority_protocol::LauncherChildProcessV1,
+        AuthorizationDecision,
+    ),
+    SystemdServiceError,
+>
 where
     F: FnOnce(
         &mut crate::prepared_child::PreparedChild,
         &ota_authority_protocol::LauncherPrincipalMappingV1,
         &ota_authority_protocol::LauncherSystemdScopeV1,
-    ) -> Result<(), SystemdServiceError>,
+        &mut ActiveSlot,
+    ) -> Result<AuthorizationDecision, SystemdServiceError>,
 {
     let request_identity = launcher_invocation_request_identity(request)
         .map_err(|_| SystemdServiceError::InvalidRequest)?;
@@ -586,7 +677,7 @@ where
             .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
         return Err(error);
     }
-    let posture_result = posture_gate(&mut child, &principal_mapping, &scope);
+    let posture_result = posture_gate(&mut child, &principal_mapping, &scope, &mut active_slot);
     let child_record = child.record.clone();
     scope_manager
         .stop_and_confirm_empty(
@@ -601,8 +692,8 @@ where
     active_slot
         .finalize()
         .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
-    posture_result?;
-    Ok(child_record)
+    let decision = posture_result?;
+    Ok((child_record, decision))
 }
 
 #[cfg(feature = "systemd-pressure-faults")]
@@ -623,6 +714,26 @@ fn pressure_exit_after_scope_recorded() -> Result<(), SystemdServiceError> {
 
 #[cfg(not(feature = "systemd-pressure-faults"))]
 fn pressure_exit_after_scope_recorded() -> Result<(), SystemdServiceError> {
+    Ok(())
+}
+
+#[cfg(feature = "systemd-pressure-faults")]
+fn pressure_exit_after_authorization_decision_recorded() -> Result<(), SystemdServiceError> {
+    if !consume_pressure_exit_marker(
+        Path::new(PRESSURE_EXIT_AFTER_DECISION_MARKER),
+        Path::new("/"),
+        0,
+    )? {
+        return Ok(());
+    }
+
+    // The durable decision envelope must survive this abrupt exit so startup recovery can prove
+    // cleanup-only reconciliation without resuming the child or requesting a lease.
+    unsafe { libc::_exit(PRESSURE_EXIT_AFTER_DECISION_CODE) }
+}
+
+#[cfg(not(feature = "systemd-pressure-faults"))]
+fn pressure_exit_after_authorization_decision_recorded() -> Result<(), SystemdServiceError> {
     Ok(())
 }
 
@@ -673,6 +784,9 @@ fn map_prepared_child_error(error: PreparedChildError) -> SystemdServiceError {
         PreparedChildError::AttestationBridgeUnavailable
         | PreparedChildError::AuthorizationAdmissionMismatch => {
             SystemdServiceError::PreAuthorizationProtocolRefused
+        }
+        PreparedChildError::AuthorizationDecisionBridgeUnavailable => {
+            SystemdServiceError::AuthorizationDecisionRefused
         }
         _ => SystemdServiceError::ChildPreparationFailed,
     }
@@ -1022,7 +1136,14 @@ mod tests {
         stream.read_exact(&mut ready).expect("broker peer ready");
         assert_eq!(&ready, b"ready");
         let peer = observe_connected_peer(&stream).expect("guarded broker peer");
-        let mut proxy = ProtectedBrokerProxy { stream, peer };
+        let mut executable = std::fs::File::open("/proc/self/exe").expect("test executable");
+        let executable_identity =
+            crate::config::sha256_file_identity(&mut executable).expect("executable identity");
+        let mut proxy = ProtectedBrokerProxy {
+            stream,
+            peer,
+            executable_identity,
+        };
 
         let result = proxy.run_revalidated(|_| {
             unsafe {
@@ -1339,6 +1460,7 @@ mod tests {
             socket_unit_identity: identity('c'),
             ota_binary_identity: identity('d'),
             broker_proxy_identity: identity('e'),
+            broker_proxy_executable_identity: identity('1'),
             attestor_key_set_identity: identity('f'),
             attestation_claims: None,
             maximum_request_bytes: 4096,
@@ -1356,7 +1478,7 @@ mod tests {
         let executable = std::fs::File::open("/bin/true").expect("test executable");
         let scope_boundary = RecordingScopeBoundary::default();
         let posture_gate_ran_after_scope = Cell::new(false);
-        let child = prepare_disabled_child_boundary_with_scope(
+        let (child, decision) = prepare_disabled_child_boundary_with_scope(
             &config,
             &executable,
             &repository,
@@ -1367,7 +1489,7 @@ mod tests {
             0,
             temporary.path(),
             &scope_boundary,
-            |_child, _principal_mapping, _scope| {
+            |_child, _principal_mapping, _scope, _active_slot| {
                 let journal_path = fs::read_dir(&active)
                     .expect("active directory")
                     .next()
@@ -1383,10 +1505,11 @@ mod tests {
                         && journal.get("stage").and_then(serde_json::Value::as_str)
                             == Some("scope_attached"),
                 );
-                Ok(())
+                Ok(AuthorizationDecision::Allowed)
             },
         )
         .expect("prepare and clean child boundary");
+        assert_eq!(decision, AuthorizationDecision::Allowed);
         assert!(posture_gate_ran_after_scope.get());
         assert_eq!(scope_boundary.attached.borrow().len(), 1);
         assert_eq!(scope_boundary.stopped.borrow().len(), 1);
@@ -1407,7 +1530,7 @@ mod tests {
                 0,
                 temporary.path(),
                 &refused_scope,
-                |child, _principal_mapping, _scope| {
+                |child, _principal_mapping, _scope, _active_slot| {
                     refused_pid.set(child.record.pid);
                     Err(SystemdServiceError::PreAuthorizationProtocolRefused)
                 },
@@ -1431,7 +1554,9 @@ mod tests {
                 0,
                 temporary.path(),
                 &UncertainScopeBoundary,
-                |_child, _principal_mapping, _scope| Ok(()),
+                |_child, _principal_mapping, _scope, _active_slot| {
+                    Ok(AuthorizationDecision::Allowed)
+                },
             ),
             Err(SystemdServiceError::ScopeCleanupFailed)
         ));

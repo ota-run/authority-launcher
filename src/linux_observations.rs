@@ -33,6 +33,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const MAX_PROC_STATUS_BYTES: u64 = 64 * 1024;
@@ -49,6 +50,8 @@ pub enum LinuxObservationError {
     ProcessStatusMalformed,
     #[error("the connected job peer process status violates the closed profile")]
     ProcessStatusMismatch,
+    #[error("the connected peer executable is unavailable or mismatched")]
+    ProcessExecutableMismatch,
 }
 
 #[derive(Debug)]
@@ -105,6 +108,33 @@ pub fn reconcile_connected_peer(
         return Err(LinuxObservationError::PeerCredentialsMismatch);
     }
     Ok(())
+}
+
+pub fn verify_peer_executable_identity(
+    peer: &ObservedSessionPeer,
+    expected_identity: &str,
+) -> Result<(), LinuxObservationError> {
+    require_live_pidfd(&peer.pidfd)?;
+    let mut executable = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(format!("/proc/{}/exe", peer.pid))
+        .map_err(|_| LinuxObservationError::ProcessExecutableMismatch)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = executable
+            .read(&mut buffer)
+            .map_err(|_| LinuxObservationError::ProcessExecutableMismatch)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if format!("sha256:{:x}", hasher.finalize()) != expected_identity {
+        return Err(LinuxObservationError::ProcessExecutableMismatch);
+    }
+    require_live_pidfd(&peer.pidfd)
 }
 
 pub fn verify_peer_process_status(
@@ -356,6 +386,31 @@ mod tests {
             0
         );
         assert_eq!(revalidate_connected_peer(&stream, &observed), Ok(()));
+        let mut current_executable = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open("/proc/self/exe")
+            .expect("current executable");
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let read = current_executable
+                .read(&mut buffer)
+                .expect("executable read");
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let executable_identity = format!("sha256:{:x}", hasher.finalize());
+        assert_eq!(
+            verify_peer_executable_identity(&observed, &executable_identity),
+            Ok(())
+        );
+        assert_eq!(
+            verify_peer_executable_identity(&observed, &format!("sha256:{}", "f".repeat(64))),
+            Err(LinuxObservationError::ProcessExecutableMismatch)
+        );
         assert_eq!(
             reconcile_connected_peer(&observed, expected_uid, expected_gid),
             Ok(())

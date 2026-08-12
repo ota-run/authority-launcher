@@ -72,8 +72,8 @@ enum Command {
         ota_args: Vec<String>,
     },
 
-    /// Internal systemd socket-activation entrypoint. This remains execution-disabled after V3
-    /// attestation admission; authorization and one-use lease consumption are not enabled.
+    /// Internal systemd socket-activation entrypoint. This remains execution-disabled after one
+    /// verified authorization decision; lease issuance and consumption are not enabled.
     #[command(hide = true)]
     ServeSystemd,
 
@@ -93,6 +93,8 @@ enum Command {
         launcher_binary: std::path::PathBuf,
         #[arg(long)]
         attestor_binary: std::path::PathBuf,
+        #[arg(long)]
+        broker_decision_binary: std::path::PathBuf,
         #[arg(long)]
         ota_binary: std::path::PathBuf,
         #[arg(long)]
@@ -116,6 +118,7 @@ fn main() -> ExitCode {
             repository_root,
             launcher_binary,
             attestor_binary,
+            broker_decision_binary,
             ota_binary,
             pressure_client_binary,
         } => pressure_provision::provision(pressure_provision::ProvisionRequest {
@@ -125,6 +128,7 @@ fn main() -> ExitCode {
             repository_root,
             launcher_binary,
             attestor_binary,
+            broker_decision_binary,
             ota_binary,
             pressure_client_binary,
         }),

@@ -59,8 +59,11 @@ invokes that producer. It verifies protected installation identities, exact syst
 properties, process containment, account/sudo/Polkit posture, protected-path and host-socket access,
 and Ota process-access denial before relaying the independently verified signed V3 attestation to
 Core. Any missing or mismatched observation refuses. This establishes a real local V3 attestation
-bridge, not a usable authority path: the launcher still does not forward Core's authorization
-request, connect to a remote broker, obtain or consume a lease, or execute selected work.
+bridge. The current execution-disabled decision slice additionally forwards Core's exact
+authorization request to one protected, installation-bound local broker proxy, relays only signed
+authorization decisions, requires Core's identity-bound verification acknowledgement, and durably
+records that exact relay before cleanup. It still does not obtain a lease, consume authority, or
+execute selected work.
 
 The feature-gated `ota-authority-pressure-peer` binary is an exception for conformance testing
 only. It uses fixed public test keys and deterministic scenarios to exercise protocol v2 through a
@@ -247,9 +250,11 @@ binds the exact invocation, child, working directory, posture, and principal map
 parse the command and freeze the real semantic scope. The launcher submits Core's exact challenge
 plus its complete observed profile to the separately credentialed protected attestor, independently
 verifies the returned signature and claims projection, then relays only that signed V3 response. It
-observes Core's exact matching authorization request without forwarding it, and
-finally kills the complete scope, confirms it absent and its cgroup empty or absent, kills/reaps the
-child, and removes the slot.
+reconciles Core's exact matching authorization request, connects only to the protected broker proxy
+bound by the installation manifest, and relays signed decisions back to Core. Core returns one
+identity-bound verification acknowledgement; the launcher journals the exact signed decision plus
+that acknowledgement before it kills the complete scope, confirms it absent and its cgroup empty
+or absent, kills/reaps the child, and removes the slot.
 
 On startup, retained journals are reconciled before accepting a client. A valid child- or
 scope-bearing temporary journal is promoted rather than discarded. Intent-only state remains a
@@ -257,21 +262,23 @@ hard refusal because it cannot establish child absence. An exact pre-scope child
 through Linux `pidfd`; a scope-bearing journal additionally requires the exact unit and kernel
 cgroup to be stopped and observed empty. PID reuse, identity mismatch, unsupported cleanup, or any
 uncertain outcome retains the slot and fails closed.
-This path remains execution-disabled after signed V3 admission. It does **not** forward the
-authorization request, obtain a decision, issue or consume a lease, execute repository work, or
-create crossing receipt/archive evidence. Only `ota-authority-attestor` receives the systemd-delivered
+This path remains execution-disabled after signed V3 decision admission. It does **not** issue or
+consume a lease, execute repository work, or create crossing receipt/archive evidence. Only
+`ota-authority-attestor` receives the systemd-delivered
 signing credential; the launcher retains public verification truth only. Missing, malformed,
 oversized, self-inconsistent, or substituted posture, continuation, challenge, attestation, or
-authorization admission fails closed and enters the same exact cleanup path. OrbStack's systemd
-ARM64 VM now exercises this local candidate through real PID 1 systemd. That local evidence is not
-immutable hosted Linux/x64 pressure and does not establish provider-attested separation.
+authorization decision/admission fails closed and enters the same exact cleanup path. The new
+decision path remains a candidate until immutable Linux/x64 PID 1 systemd pressure passes and does
+not establish provider-attested separation.
 
 The feature-gated `ota-authority-systemd-pressure-client` is the unprivileged side of that positive
 kernel proof. It connects only to `/run/ota/authority-launcher.sock`, submits one bounded
 `LauncherInvocationRequestV1`, and accepts only the execution-disabled terminal refusal emitted
-with the typed `attestation_admitted_before_authorization_boundary_removed` stage after the service
-has admitted Core's signed V3 response and confirmed exact scope and child cleanup. A posture-only,
-repository-open, or generic boundary refusal cannot satisfy this pressure client. Before sending
+with a caller-selected exact expected stage. Its default requires
+`authorization_decision_verified_before_lease_boundary_removed` after Core has verified one signed
+allowed decision and the service has confirmed exact scope and child cleanup. Pressure-only
+negative cases can instead require exact denied-decision or pre-authorization-protocol refusal;
+a posture-only, repository-open, or generic boundary failure cannot satisfy it. Before sending
 the request it requires the fixed socket and parent to have the protected root-owned posture and
 requires the connected Unix peer to be root-owned. It cannot select another socket, install
 configuration, mutate systemd, provide authority, or enable execution. The binary is not installed
@@ -317,6 +324,24 @@ durable `scope_attached` crash slot, zero terminal slots/scopes, byte-identical 
 manifests, no selected-work or `.ota` state, and only public verifier identity. This closes the
 hosted execution-disabled V3 admission gate only; it does not prove broker authorization, lease
 consumption, selected execution, crossing receipts/archives, or provider-attested separation.
+
+The current uncommitted follow-on replaces the withheld-request endpoint with a feature-gated,
+root-owned signed-decision pressure peer. Its hosted matrix is prepared to distinguish allowed,
+denied, stale, wrong-scope, timed-out pending, ambiguous, and unavailable-proxy outcomes, while
+requiring zero selected-work, receipt, active-slot, or transient-scope residue. Until that matrix is
+green against immutable Protocol, Launcher, and Core revisions, signed decision relay remains local
+implementation evidence rather than completed pressure evidence.
+
+The pressure peer emits bounded scenario, ordinal, decision, and decision-identity checkpoints. The
+launcher verifies the live pidfd-bound broker executable before and after relay traffic, and emits
+the complete public relay envelope only under the pressure fault feature and only after durable
+active-slot recording. The hosted artifact retains those envelopes together with the public signed
+broker responses and broker verifier binding, allowing the signed decision and Core acknowledgement
+identities to be re-verified after cleanup without retaining either signing key. Stale and
+wrong-scope controls require zero acknowledgements; timeout requires exactly one acknowledged
+pending decision; ambiguity requires two signed pending responses but exactly one acknowledgement.
+The prepared matrix also crashes after durable allowed-decision recording and requires startup
+reconciliation to remove that exact slot, child, cgroup, and scope before a fresh request proceeds.
 
 ## What belongs here
 

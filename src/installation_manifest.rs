@@ -66,6 +66,7 @@ pub(crate) enum ProtectedInstallationRoleV1 {
     LauncherServiceDropIn,
     LauncherSocketUnit,
     LauncherSocketDropIn,
+    BrokerProxyExecutable,
     BrokerProxyServiceUnit,
     BrokerProxySocketUnit,
     AttestorExecutable,
@@ -243,6 +244,8 @@ fn load_protected_installation_manifest_at(
             != config.ota_binary_identity
         || manifest.singular_identity(ProtectedInstallationRoleV1::AttestorVerifierSet)?
             != config.attestor_key_set_identity
+        || manifest.singular_identity(ProtectedInstallationRoleV1::BrokerProxyExecutable)?
+            != config.broker_proxy_executable_identity
         || broker_proxy_installation_identity(
             manifest.singular_identity(ProtectedInstallationRoleV1::BrokerProxyServiceUnit)?,
             manifest.singular_identity(ProtectedInstallationRoleV1::BrokerProxySocketUnit)?,
@@ -316,6 +319,7 @@ fn validate_manifest_shape(
         ProtectedInstallationRoleV1::LauncherConfiguration,
         ProtectedInstallationRoleV1::LauncherServiceUnit,
         ProtectedInstallationRoleV1::LauncherSocketUnit,
+        ProtectedInstallationRoleV1::BrokerProxyExecutable,
         ProtectedInstallationRoleV1::BrokerProxyServiceUnit,
         ProtectedInstallationRoleV1::BrokerProxySocketUnit,
         ProtectedInstallationRoleV1::AttestorExecutable,
@@ -451,6 +455,10 @@ mod tests {
                 root.path().join("launcher.socket"),
             ),
             (
+                ProtectedInstallationRoleV1::BrokerProxyExecutable,
+                root.path().join("broker-proxy"),
+            ),
+            (
                 ProtectedInstallationRoleV1::BrokerProxyServiceUnit,
                 root.path().join("broker-proxy.service"),
             ),
@@ -516,6 +524,8 @@ mod tests {
         config.ota_binary_identity = role_identity(ProtectedInstallationRoleV1::OtaExecutable);
         config.attestor_key_set_identity =
             role_identity(ProtectedInstallationRoleV1::AttestorVerifierSet);
+        config.broker_proxy_executable_identity =
+            role_identity(ProtectedInstallationRoleV1::BrokerProxyExecutable);
         config.broker_proxy_identity = broker_proxy_installation_identity(
             role_identity(ProtectedInstallationRoleV1::BrokerProxyServiceUnit).as_str(),
             role_identity(ProtectedInstallationRoleV1::BrokerProxySocketUnit).as_str(),
@@ -627,6 +637,7 @@ mod tests {
             socket_unit_identity: identity('2'),
             ota_binary_identity: identity('3'),
             broker_proxy_identity: identity('4'),
+            broker_proxy_executable_identity: identity('6'),
             attestor_key_set_identity: identity('5'),
             attestation_claims: None,
             maximum_request_bytes: 4096,
