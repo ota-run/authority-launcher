@@ -733,7 +733,7 @@ fn runner_service_unit(
     client: &Path,
 ) -> String {
     format!(
-        "[Unit]\nDescription=Ota V3 protected-launcher pressure client\nAfter=ota-authority-launcher.socket\nRequires=ota-authority-launcher.socket\n\n[Service]\nType=oneshot\nUser={}\nGroup={}\nSupplementaryGroups=\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nRestrictSUIDSGID=yes\nRestrictNamespaces=yes\nRestrictAddressFamilies=AF_UNIX\nSyslogIdentifier=ota-authority-pressure-client\nWorkingDirectory={}\nExecStart={} --authority-id {} --repository {} --expected-terminal observed-decision-outcome -- run governed --grant {}\n",
+        "[Unit]\nDescription=Ota V3 protected-launcher pressure client\nAfter=ota-authority-launcher.socket\nRequires=ota-authority-launcher.socket\n\n[Service]\nType=oneshot\nUser={}\nGroup={}\nSupplementaryGroups=\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nRestrictSUIDSGID=yes\nRestrictNamespaces=yes\nRestrictAddressFamilies=AF_UNIX\nSyslogIdentifier=ota-authority-pressure-client\nWorkingDirectory={}\nExecStart={} --authority-id {} --repository {} --expected-terminal observed-decision-outcome -- run governed --grant {} --receipt\n",
         account.name,
         account.group,
         repository.display(),
@@ -978,7 +978,7 @@ mod tests {
                 Path::new("/srv/ota-pressure"),
                 Path::new("/usr/lib/ota-authority/bin/pressure-client"),
             )
-            .contains("-- run governed --grant release")
+            .contains("-- run governed --grant release --receipt")
         );
     }
 

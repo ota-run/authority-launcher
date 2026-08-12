@@ -498,6 +498,8 @@ jobs:
              and .terminal.finalization.active_slot_removed == true
              and .terminal.finalization.completion.outcome == "completed"' \
             "$EVIDENCE_DIR/positive.json"
+          sudo find "$PRESSURE_REPOSITORY" -printf '%M %u %g %p\n' \
+            | sort > "$EVIDENCE_DIR/positive.repository-tree.txt"
           assert_terminal_clean positive true
           sudo cp -a "$PRESSURE_REPOSITORY/.ota" "$EVIDENCE_DIR/positive-ota-evidence"
           sudo chown -R "$(id -u):$(id -g)" "$EVIDENCE_DIR/positive-ota-evidence"
