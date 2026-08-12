@@ -933,7 +933,7 @@ jobs:
           extract_consumption_relay_evidence consumption-crash-recovery 1
           crashed_consume=$(jq -r '.lease_consumption.consume_request_identity' \
             "$EVIDENCE_DIR/consumption-crash-first.active-slot.json")
-          fresh_consume=$(jq -r '.[0].consume_request_identity' \
+          fresh_consume=$(jq -r '.consume_request_identity' \
             "$EVIDENCE_DIR/consumption-crash-recovery.lease-relay-evidence.jsonl")
           test "$fresh_consume" != "$crashed_consume"
           repository_manifest > "$EVIDENCE_DIR/consumption-crash.repository.after.sha256"
