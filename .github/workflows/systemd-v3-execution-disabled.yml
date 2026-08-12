@@ -31,7 +31,7 @@ permissions:
 
 jobs:
   systemd-v3:
-    name: Prove signed V3 decision admission without lease or execution
+    name: Prove signed V3 decision and lease consumption without execution
     runs-on: ubuntu-24.04
     steps:
       - name: Check out Launcher source
@@ -325,6 +325,29 @@ jobs:
             fi
           }
 
+          extract_exact_replay_refusal() {
+            local case_name=$1
+            local output="$EVIDENCE_DIR/$case_name.exact-replay-refusal.jsonl"
+            sed -n 's/^.*bounded pressure exact_replay_refused [^ ]* [^ ]* evidence=//p' \
+              "$EVIDENCE_DIR/$case_name.journal.txt" > "$output"
+            test "$(wc -l < "$output")" -eq 1
+            jq -s -e -c \
+              'length == 1
+               and .[0].payload.message_kind == "lease_consume_response"
+               and .[0].payload.state == "already_consumed"
+               and .[0].algorithm == "ed25519"
+               and .[0].key_id == "systemd-broker-pressure-v1"' \
+              "$output" >/dev/null
+            jq -e -n \
+              --slurpfile consumed "$EVIDENCE_DIR/$case_name.lease-relay-evidence.jsonl" \
+              --slurpfile replay "$output" \
+              '($consumed | length) == 1
+               and ($replay | length == 1)
+               and $consumed[0].prepared_lease_identity == $replay[0].payload.lease_identity
+               and $consumed[0].consume_request_identity == $replay[0].payload.consume_request_identity
+               and $consumed[0].consume_response.payload.state == "consumed"'
+          }
+
           extract_broker_decisions() {
             local case_name=$1
             local expected_count=$2
@@ -444,6 +467,7 @@ jobs:
           extract_broker_decisions positive 1 allowed
           extract_relay_evidence positive 1 allowed
           extract_consumption_relay_evidence positive 1
+          extract_exact_replay_refusal positive
           grep -q '"stage": "lease_consumed_before_execution_disabled_boundary_removed"' \
             "$EVIDENCE_DIR/positive.journal.txt"
           assert_terminal_clean positive
@@ -946,6 +970,23 @@ jobs:
           test -z "$(git status --porcelain --untracked-files=no)"
 
           test ! -d "$PRESSURE_REPOSITORY/.ota"
+          sudo stat -c '%U %G %a %F' /var/lib/ota/authority-broker-pressure \
+            | tee "$EVIDENCE_DIR/broker-state-posture.txt" >/dev/null
+          sudo stat -c '%U %G %a %F' \
+            /var/lib/ota/authority-broker-pressure/consumed-leases.json \
+            | tee -a "$EVIDENCE_DIR/broker-state-posture.txt" >/dev/null
+          sed -n '1p' "$EVIDENCE_DIR/broker-state-posture.txt" \
+            | grep -Fx 'root root 700 directory'
+          sed -n '2p' "$EVIDENCE_DIR/broker-state-posture.txt" \
+            | grep -Fx 'root root 600 regular file'
+          sudo cp /var/lib/ota/authority-broker-pressure/consumed-leases.json \
+            "$EVIDENCE_DIR/consumed-leases.json"
+          sudo chown "$(id -u):$(id -g)" "$EVIDENCE_DIR/consumed-leases.json"
+          positive_lease=$(jq -r '.prepared_lease_identity' \
+            "$EVIDENCE_DIR/positive.lease-relay-evidence.jsonl")
+          jq -e --arg lease "$positive_lease" 'index($lease) != null' \
+            "$EVIDENCE_DIR/consumed-leases.json" >/dev/null
+          sudo rm -rf /var/lib/ota/authority-broker-pressure
           test -z "$(sudo find /var/lib/ota -type f \
             \( -iname '*decision*' -o -iname '*lease*' -o -iname '*receipt*' -o -iname '*archive*' \) \
             -print -quit)"

@@ -29,9 +29,13 @@
 - Extend the execution-disabled protected systemd foundation through one exact prepared-lease and
   consumed-response relay. The launcher durably journals the exact transaction-bound intent and
   consumed relay, while Core verifies that protected persistence in private in-memory transaction
-  state before acknowledging it. The exact scope is still removed before selected work. This is
-  local foundation work only: it does not enable repository execution, crossing receipts/archives,
-  or immutable hosted pressure.
+  state before acknowledging it. The pressure broker now atomically records spent lease identities
+  in root-owned durable state and produces a signed `already_consumed` response for an exact replay;
+  the hosted workflow requires that response to bind the original lease and consume request while
+  Core accepts only the first consumption. The exact scope is still removed before selected work.
+  This remains execution-disabled foundation work: it does not enable repository execution or
+  crossing receipts/archives, and immutable hosted proof remains pending until the updated matrix
+  passes.
 
 - Derive ordinary CI and root-boundary source-identity assertions from the contract-selected setup
   result instead of duplicating a historical Core revision. Both lanes still require a clean source

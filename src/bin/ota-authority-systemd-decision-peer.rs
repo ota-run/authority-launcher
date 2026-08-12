@@ -27,10 +27,12 @@
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::collections::BTreeSet;
     use std::fs;
-    use std::io::{Read, Write};
-    use std::os::fd::FromRawFd;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::fs::{File, OpenOptions};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::Path;
     use std::time::Duration;
@@ -54,6 +56,9 @@ mod linux {
     const CREDENTIAL_NAME: &str = "ota-broker-ed25519";
     const KEY_ID: &str = "systemd-broker-pressure-v1";
     const SCENARIO_PATH: &str = "/run/ota/authority-broker-pressure-scenario";
+    const SPENT_LEASES_PATH: &str = "/var/lib/ota/authority-broker-pressure/consumed-leases.json";
+    const SPENT_LEASES_LOCK_PATH: &str =
+        "/var/lib/ota/authority-broker-pressure/consumed-leases.lock";
     // Keep the pressure lease below both the configured lease ceiling and attestation lifetime.
     const LEASE_VALIDITY_SECONDS: i64 = 20;
 
@@ -286,26 +291,175 @@ mod linux {
         }
         let consume_identity = message_identity(LEASE_CONSUME_DOMAIN_V1.as_bytes(), &consume)
             .map_err(|_| String::from("decision peer consume identity failed"))?;
-        let response = sign_message(
+        let state = consume_lease_once(lease_identity.as_str())?;
+        if state != LeaseConsumeState::Consumed {
+            return Err(String::from("decision peer lease was already spent"));
+        }
+        let response = signed_consume_response(
+            key,
+            &consume,
+            consume_identity.as_str(),
+            lease_identity.as_str(),
+            state,
+            2,
+            decision.payload.issued_at.as_str(),
+        )?;
+        write_frame(stream, &response)?;
+        eprintln!("ota-authority-systemd-decision-peer: bounded pressure lease_consumed_relayed");
+
+        // Reopen the durable store and replay the exact consume request. This response is retained
+        // as public pressure evidence but is never forwarded to Core.
+        let replay_state = consume_lease_once(lease_identity.as_str())?;
+        if replay_state != LeaseConsumeState::AlreadyConsumed {
+            return Err(String::from("decision peer exact replay was not refused"));
+        }
+        let replay = signed_consume_response(
+            key,
+            &consume,
+            consume_identity.as_str(),
+            lease_identity.as_str(),
+            replay_state,
+            3,
+            decision.payload.issued_at.as_str(),
+        )?;
+        let replay_identity =
+            message_identity(LEASE_CONSUME_RESPONSE_DOMAIN_V1.as_bytes(), &replay)
+                .map_err(|_| String::from("decision peer replay response identity failed"))?;
+        let encoded = serde_json::to_string(&replay)
+            .map_err(|_| String::from("decision peer replay evidence failed"))?;
+        eprintln!(
+            "ota-authority-systemd-decision-peer: bounded pressure exact_replay_refused state=already_consumed response_identity={replay_identity} evidence={encoded}"
+        );
+        Ok(())
+    }
+
+    fn signed_consume_response(
+        key: &SigningKey,
+        consume: &LeaseConsumeRequest,
+        consume_identity: &str,
+        lease_identity: &str,
+        state: LeaseConsumeState,
+        broker_revision: u64,
+        consumed_at: &str,
+    ) -> Result<SignedBrokerMessage<LeaseConsumeResponsePayload>, String> {
+        sign_message(
             key,
             LEASE_CONSUME_RESPONSE_DOMAIN_V1.as_bytes(),
             LeaseConsumeResponsePayload {
                 message_kind: LEASE_CONSUME_RESPONSE.into(),
-                consume_request_identity: consume_identity,
+                consume_request_identity: consume_identity.to_string(),
                 binding_identity: consume.binding_identity.clone(),
-                lease_identity,
+                lease_identity: lease_identity.to_string(),
                 challenge_nonce_commitment: consume.challenge_nonce_commitment.clone(),
                 work_unit_identity: consume.work_unit_identity.clone(),
                 crossing_transaction_id: consume.crossing_transaction_id.clone(),
                 crossing_transaction_identity: consume.crossing_transaction_identity.clone(),
-                state: LeaseConsumeState::Consumed,
-                broker_revision: 2,
-                consumed_at: decision.payload.issued_at.clone(),
+                state,
+                broker_revision,
+                consumed_at: consumed_at.to_string(),
             },
-        )?;
-        write_frame(stream, &response)?;
-        eprintln!("ota-authority-systemd-decision-peer: bounded pressure lease_consumed_relayed");
-        Ok(())
+        )
+    }
+
+    fn consume_lease_once(lease_identity: &str) -> Result<LeaseConsumeState, String> {
+        consume_lease_once_at(
+            Path::new(SPENT_LEASES_LOCK_PATH),
+            Path::new(SPENT_LEASES_PATH),
+            lease_identity,
+        )
+    }
+
+    fn consume_lease_once_at(
+        lock_path: &Path,
+        state_path: &Path,
+        lease_identity: &str,
+    ) -> Result<LeaseConsumeState, String> {
+        let lock = open_protected_state_file(lock_path)?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(String::from("decision peer spent-lease lock failed"));
+        }
+        let mut consumed = read_consumed_leases(state_path)?;
+        if !consumed.insert(lease_identity.to_string()) {
+            return Ok(LeaseConsumeState::AlreadyConsumed);
+        }
+        persist_consumed_leases(state_path, &consumed)?;
+        Ok(LeaseConsumeState::Consumed)
+    }
+
+    fn open_protected_state_file(path: &Path) -> Result<File, String> {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|_| String::from("decision peer spent-lease state is unavailable"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| String::from("decision peer spent-lease state is unavailable"))?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != 0
+            || metadata.permissions().mode() & 0o7777 != 0o600
+            || metadata.nlink() != 1
+        {
+            return Err(String::from(
+                "decision peer spent-lease state is unprotected",
+            ));
+        }
+        Ok(file)
+    }
+
+    fn read_consumed_leases(path: &Path) -> Result<BTreeSet<String>, String> {
+        let mut file = open_protected_state_file(path)?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|_| String::from("decision peer spent-lease state is unavailable"))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|_| String::from("decision peer spent-lease state is unavailable"))?;
+        if bytes.is_empty() {
+            Ok(BTreeSet::new())
+        } else {
+            serde_json::from_slice(&bytes)
+                .map_err(|_| String::from("decision peer spent-lease state is invalid"))
+        }
+    }
+
+    fn persist_consumed_leases(
+        state_path: &Path,
+        consumed: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        let directory = state_path
+            .parent()
+            .ok_or_else(|| String::from("decision peer spent-lease state path is invalid"))?;
+        let file_name = state_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| String::from("decision peer spent-lease state path is invalid"))?;
+        let temporary = directory.join(format!("{file_name}.{}", unsafe { libc::getpid() }));
+        let bytes = serde_json::to_vec(consumed)
+            .map_err(|_| String::from("decision peer spent-lease state is invalid"))?;
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&temporary)
+            .map_err(|_| String::from("decision peer spent-lease state write failed"))?;
+        let result = (|| {
+            file.write_all(&bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|_| String::from("decision peer spent-lease state write failed"))?;
+            fs::rename(&temporary, state_path)
+                .map_err(|_| String::from("decision peer spent-lease state commit failed"))?;
+            File::open(directory)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| String::from("decision peer spent-lease directory sync failed"))
+        })();
+        if result.is_err() {
+            fs::remove_file(&temporary).ok();
+        }
+        result
     }
 
     fn lease_expiration(issued_at: &str) -> Result<String, String> {
@@ -367,6 +521,26 @@ mod linux {
                 lease_expiration("2026-08-12T12:00:00Z").expect("lease expiration"),
                 "2026-08-12T12:00:20Z"
             );
+        }
+
+        #[test]
+        fn spent_lease_state_refuses_exact_replay_durably() {
+            let directory = tempfile::tempdir().expect("temporary state directory");
+            let lock = directory.path().join("consumed-leases.lock");
+            let state = directory.path().join("consumed-leases.json");
+            assert_eq!(
+                consume_lease_once_at(&lock, &state, "sha256:lease-a").expect("first consumption"),
+                LeaseConsumeState::Consumed
+            );
+            assert_eq!(
+                consume_lease_once_at(&lock, &state, "sha256:lease-a")
+                    .expect("replayed consumption"),
+                LeaseConsumeState::AlreadyConsumed
+            );
+            let persisted: BTreeSet<String> =
+                serde_json::from_slice(&fs::read(&state).expect("persisted spent-lease state"))
+                    .expect("valid spent-lease state");
+            assert_eq!(persisted, BTreeSet::from([String::from("sha256:lease-a")]));
         }
     }
 }

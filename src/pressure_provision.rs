@@ -72,6 +72,7 @@ const INSTALLATION_MANIFEST: &str = "/etc/ota/authority-launcher-installation.js
 const BROKER_STORE: &str = "/etc/ota/crossing-brokers.json";
 const SIGNING_KEY: &str = "/var/lib/ota/authority-attestor-signing-key";
 const BROKER_SIGNING_KEY: &str = "/var/lib/ota/authority-broker-signing-key";
+const BROKER_STATE: &str = "/var/lib/ota/authority-broker-pressure";
 const BROKER_SCENARIO: &str = "/run/ota/authority-broker-pressure-scenario";
 const ISSUANCE_STATE: &str = "/var/lib/ota/authority-attestor";
 const LAUNCHER_STATE: &str = "/var/lib/ota/authority-launcher";
@@ -653,7 +654,7 @@ fn polkit_deny_rule(job: &Account, execution: &Account) -> Result<String, String
     ))
 }
 
-fn protected_directories() -> [(&'static str, u32); 7] {
+fn protected_directories() -> [(&'static str, u32); 8] {
     [
         (ETC_OTA, 0o755),
         (STATE_ROOT, 0o755),
@@ -661,6 +662,7 @@ fn protected_directories() -> [(&'static str, u32); 7] {
         (ISSUANCE_STATE, 0o700),
         (LAUNCHER_STATE, 0o700),
         (ACTIVE_SLOT_STATE, 0o700),
+        (BROKER_STATE, 0o700),
         (LAUNCHER_RUNTIME, 0o700),
     ]
 }
@@ -713,7 +715,7 @@ fn attestor_socket_unit() -> String {
 
 fn broker_proxy_service_unit(binary: &Path) -> String {
     format!(
-        "[Unit]\nDescription=Execution-disabled Ota signed decision pressure peer\nRequires=ota-authority-broker-proxy.socket\nAfter=ota-authority-broker-proxy.socket\n\n[Service]\nType=simple\nExecStart={}\nUser=root\nGroup=root\nUMask=0077\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nPrivateNetwork=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nRestrictRealtime=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nMemoryDenyWriteExecute=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=\nAmbientCapabilities=\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths={BROKER_SCENARIO}\nLoadCredential=ota-broker-ed25519:{BROKER_SIGNING_KEY}\n",
+        "[Unit]\nDescription=Execution-disabled Ota signed decision pressure peer\nRequires=ota-authority-broker-proxy.socket\nAfter=ota-authority-broker-proxy.socket\n\n[Service]\nType=simple\nExecStart={}\nUser=root\nGroup=root\nUMask=0077\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nPrivateNetwork=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nRestrictRealtime=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nMemoryDenyWriteExecute=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=\nAmbientCapabilities=\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths={BROKER_SCENARIO}\nReadWritePaths={BROKER_STATE}\nLoadCredential=ota-broker-ed25519:{BROKER_SIGNING_KEY}\n",
         binary.display()
     )
 }
