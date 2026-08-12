@@ -73,7 +73,7 @@ enum Command {
     },
 
     /// Internal systemd socket-activation entrypoint. This remains execution-disabled after one
-    /// verified authorization decision; lease issuance and consumption are not enabled.
+    /// verified authorization decision and one bounded consumed lease relay.
     #[command(hide = true)]
     ServeSystemd,
 

@@ -34,9 +34,11 @@ use std::path::{Path, PathBuf};
 
 use ota_authority_protocol::{
     AuthorizationDecision, AuthorizationDecisionRelayEvidenceV1, LauncherChildProcessV1,
-    LauncherSystemdScopeV1, LauncherWorkingDirectoryV1,
-    authorization_decision_relay_evidence_v1_identity, launcher_child_process_identity,
-    launcher_systemd_scope_identity, launcher_working_directory_identity, message_identity,
+    LauncherSystemdScopeV1, LauncherWorkingDirectoryV1, LeaseConsumptionIntentRelayEvidenceV1,
+    LeaseConsumptionRelayEvidenceV1, authorization_decision_relay_evidence_v1_identity,
+    launcher_child_process_identity, launcher_systemd_scope_identity,
+    launcher_working_directory_identity, lease_consumption_intent_relay_evidence_v1_identity,
+    lease_consumption_relay_evidence_v1_identity, message_identity,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -53,6 +55,8 @@ pub(crate) enum ActiveSlotStage {
     ChildPrepared,
     ScopeAttached,
     AuthorizationDecisionVerified,
+    LeaseConsumptionIntentRecorded,
+    LeaseConsumptionVerified,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -71,6 +75,10 @@ pub(crate) struct ActiveSlotJournalV1 {
     pub scope: Option<LauncherSystemdScopeV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization_decision: Option<AuthorizationDecisionRelayEvidenceV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_consumption_intent: Option<LeaseConsumptionIntentRelayEvidenceV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_consumption: Option<LeaseConsumptionRelayEvidenceV1>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -217,6 +225,8 @@ impl ActiveSlot {
             child: None,
             scope: None,
             authorization_decision: None,
+            lease_consumption_intent: None,
+            lease_consumption: None,
         };
         journal.identity = active_slot_identity(&journal)?;
         write_new(&path, &journal)?;
@@ -300,6 +310,76 @@ impl ActiveSlot {
         replace_atomically(&self.directory, &self.path, &self.journal)
     }
 
+    pub(crate) fn record_lease_consumption(
+        &mut self,
+        evidence: LeaseConsumptionRelayEvidenceV1,
+    ) -> Result<(), ActiveSlotError> {
+        if lease_consumption_relay_evidence_v1_identity(&evidence)
+            .ok()
+            .as_deref()
+            != Some(evidence.identity.as_str())
+            || self.journal.stage != ActiveSlotStage::LeaseConsumptionIntentRecorded
+            || self
+                .journal
+                .authorization_decision
+                .as_ref()
+                .is_none_or(|decision| {
+                    decision.identity != evidence.authorization_decision_relay_identity
+                        || decision.authorization_decision.payload.decision
+                            != AuthorizationDecision::Allowed
+                })
+            || self.journal.lease_consumption.is_some()
+        {
+            return Err(ActiveSlotError::InvalidJournal);
+        }
+        self.journal.stage = ActiveSlotStage::LeaseConsumptionVerified;
+        self.journal.lease_consumption = Some(evidence);
+        self.journal.identity = active_slot_identity(&self.journal)?;
+        replace_atomically(&self.directory, &self.path, &self.journal)
+    }
+
+    pub(crate) fn record_lease_consumption_intent(
+        &mut self,
+        evidence: LeaseConsumptionIntentRelayEvidenceV1,
+    ) -> Result<(), ActiveSlotError> {
+        if lease_consumption_intent_relay_evidence_v1_identity(&evidence)
+            .ok()
+            .as_deref()
+            != Some(evidence.identity.as_str())
+            || self.journal.stage != ActiveSlotStage::AuthorizationDecisionVerified
+            || self
+                .journal
+                .authorization_decision
+                .as_ref()
+                .is_none_or(|decision| {
+                    decision.identity != evidence.authorization_decision_relay_identity
+                        || decision.authorization_decision.payload.decision
+                            != AuthorizationDecision::Allowed
+                })
+            || self.journal.lease_consumption_intent.is_some()
+            || self.journal.lease_consumption.is_some()
+        {
+            return Err(ActiveSlotError::InvalidJournal);
+        }
+        self.journal.stage = ActiveSlotStage::LeaseConsumptionIntentRecorded;
+        self.journal.lease_consumption_intent = Some(evidence);
+        self.journal.identity = active_slot_identity(&self.journal)?;
+        replace_atomically(&self.directory, &self.path, &self.journal)
+    }
+
+    pub(crate) fn has_lease_consumption(&self) -> bool {
+        self.journal.stage == ActiveSlotStage::LeaseConsumptionVerified
+            && self.journal.lease_consumption.is_some()
+    }
+
+    pub(crate) fn has_lease_consumption_intent(&self) -> bool {
+        matches!(
+            self.journal.stage,
+            ActiveSlotStage::LeaseConsumptionIntentRecorded
+                | ActiveSlotStage::LeaseConsumptionVerified
+        ) && self.journal.lease_consumption_intent.is_some()
+    }
+
     pub(crate) fn finalize(self) -> Result<(), ActiveSlotError> {
         fs::remove_file(&self.path).map_err(|_| ActiveSlotError::PersistenceFailed)?;
         sync_directory(&self.directory)
@@ -323,6 +403,28 @@ fn is_direct_successor(current: &ActiveSlotJournalV1, recovered: &ActiveSlotJour
                 && current.scope == recovered.scope
                 && current.authorization_decision.is_none()
                 && recovered.authorization_decision.is_some()
+        }
+        (
+            ActiveSlotStage::AuthorizationDecisionVerified,
+            ActiveSlotStage::LeaseConsumptionIntentRecorded,
+        ) => {
+            current.child == recovered.child
+                && current.scope == recovered.scope
+                && current.authorization_decision == recovered.authorization_decision
+                && current.lease_consumption_intent.is_none()
+                && recovered.lease_consumption_intent.is_some()
+                && recovered.lease_consumption.is_none()
+        }
+        (
+            ActiveSlotStage::LeaseConsumptionIntentRecorded,
+            ActiveSlotStage::LeaseConsumptionVerified,
+        ) => {
+            current.child == recovered.child
+                && current.scope == recovered.scope
+                && current.authorization_decision == recovered.authorization_decision
+                && current.lease_consumption_intent == recovered.lease_consumption_intent
+                && current.lease_consumption.is_none()
+                && recovered.lease_consumption.is_some()
         }
         (
             ActiveSlotStage::AuthorizationDecisionVerified,
@@ -361,6 +463,8 @@ pub(crate) fn active_slot_identity(
                 journal.child.is_some()
                     || journal.scope.is_some()
                     || journal.authorization_decision.is_some()
+                    || journal.lease_consumption_intent.is_some()
+                    || journal.lease_consumption.is_some()
             }
             ActiveSlotStage::ChildPrepared => {
                 journal.child.as_ref().is_none_or(|child| {
@@ -372,6 +476,8 @@ pub(crate) fn active_slot_identity(
                         || child.working_directory_identity != journal.working_directory.identity
                 }) || journal.scope.is_some()
                     || journal.authorization_decision.is_some()
+                    || journal.lease_consumption_intent.is_some()
+                    || journal.lease_consumption.is_some()
             }
             ActiveSlotStage::ScopeAttached => {
                 journal.child.as_ref().is_none_or(|child| {
@@ -390,6 +496,8 @@ pub(crate) fn active_slot_identity(
                             != journal.child.as_ref().map(|child| child.identity.as_str())
                         || Some(scope.child_pid) != journal.child.as_ref().map(|child| child.pid)
                 }) || journal.authorization_decision.is_some()
+                    || journal.lease_consumption_intent.is_some()
+                    || journal.lease_consumption.is_some()
             }
             ActiveSlotStage::AuthorizationDecisionVerified => {
                 journal.child.as_ref().is_none_or(|child| {
@@ -416,6 +524,86 @@ pub(crate) fn active_slot_identity(
                             .as_deref()
                             != Some(evidence.identity.as_str())
                     })
+                    || journal.lease_consumption_intent.is_some()
+                    || journal.lease_consumption.is_some()
+            }
+            ActiveSlotStage::LeaseConsumptionIntentRecorded => {
+                journal.child.is_none()
+                    || journal.scope.is_none()
+                    || journal
+                        .authorization_decision
+                        .as_ref()
+                        .is_none_or(|decision| {
+                            decision.authorization_decision.payload.decision
+                                != AuthorizationDecision::Allowed
+                        })
+                    || journal
+                        .lease_consumption_intent
+                        .as_ref()
+                        .is_none_or(|intent| {
+                            lease_consumption_intent_relay_evidence_v1_identity(intent)
+                                .ok()
+                                .as_deref()
+                                != Some(intent.identity.as_str())
+                                || Some(intent.authorization_decision_relay_identity.as_str())
+                                    != journal
+                                        .authorization_decision
+                                        .as_ref()
+                                        .map(|decision| decision.identity.as_str())
+                        })
+                    || journal.lease_consumption.is_some()
+            }
+            ActiveSlotStage::LeaseConsumptionVerified => {
+                journal.child.as_ref().is_none_or(|child| {
+                    launcher_child_process_identity(child).ok().as_deref()
+                        != Some(child.identity.as_str())
+                        || child.invocation_id != journal.invocation_id
+                        || child.request_identity != journal.request_identity
+                        || child.principal_mapping_identity != journal.principal_mapping_identity
+                        || child.working_directory_identity != journal.working_directory.identity
+                }) || journal.scope.as_ref().is_none_or(|scope| {
+                    launcher_systemd_scope_identity(scope).ok().as_deref()
+                        != Some(scope.identity.as_str())
+                        || scope.invocation_id != journal.invocation_id
+                        || scope.request_identity != journal.request_identity
+                        || Some(scope.child_identity.as_str())
+                            != journal.child.as_ref().map(|child| child.identity.as_str())
+                        || Some(scope.child_pid) != journal.child.as_ref().map(|child| child.pid)
+                }) || journal
+                    .authorization_decision
+                    .as_ref()
+                    .is_none_or(|decision| {
+                        authorization_decision_relay_evidence_v1_identity(decision)
+                            .ok()
+                            .as_deref()
+                            != Some(decision.identity.as_str())
+                            || decision.authorization_decision.payload.decision
+                                != AuthorizationDecision::Allowed
+                    })
+                    || journal.lease_consumption.as_ref().is_none_or(|evidence| {
+                        lease_consumption_relay_evidence_v1_identity(evidence)
+                            .ok()
+                            .as_deref()
+                            != Some(evidence.identity.as_str())
+                            || Some(evidence.authorization_decision_relay_identity.as_str())
+                                != journal
+                                    .authorization_decision
+                                    .as_ref()
+                                    .map(|decision| decision.identity.as_str())
+                    })
+                    || journal
+                        .lease_consumption_intent
+                        .as_ref()
+                        .is_none_or(|intent| {
+                            lease_consumption_intent_relay_evidence_v1_identity(intent)
+                                .ok()
+                                .as_deref()
+                                != Some(intent.identity.as_str())
+                                || journal.lease_consumption.as_ref().is_none_or(|evidence| {
+                                    intent.consume_request_identity
+                                        != evidence.consume_request_identity
+                                })
+                        })
             }
         }
     {
@@ -638,6 +826,8 @@ mod tests {
             child: Some(child),
             scope: None,
             authorization_decision: None,
+            lease_consumption_intent: None,
+            lease_consumption: None,
         };
         journal.identity = active_slot_identity(&journal).expect("journal identity");
         journal
@@ -939,6 +1129,8 @@ mod tests {
             }),
             scope: None,
             authorization_decision: None,
+            lease_consumption_intent: None,
+            lease_consumption: None,
         };
         let child = journal.child.as_mut().expect("child");
         child.identity = launcher_child_process_identity(child).expect("child identity");

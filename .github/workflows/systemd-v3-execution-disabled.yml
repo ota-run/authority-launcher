@@ -304,6 +304,27 @@ jobs:
             fi
           }
 
+          extract_consumption_relay_evidence() {
+            local case_name=$1
+            local expected_count=$2
+            local output="$EVIDENCE_DIR/$case_name.lease-relay-evidence.jsonl"
+            sed -n 's/^.*bounded pressure lease relay evidence=//p' \
+              "$EVIDENCE_DIR/$case_name.journal.txt" > "$output"
+            test "$(wc -l < "$output")" -eq "$expected_count"
+            if test "$expected_count" -gt 0; then
+              jq -s -e -c \
+                'all(.[];
+                   .schema_version == 1
+                   and .consume_response.payload.state == "consumed"
+                   and .prepared_lease_identity == .consume_request.lease_identity
+                   and .consume_request_identity == .consume_response.payload.consume_request_identity
+                   and .admission.prepared_lease_identity == .prepared_lease_identity
+                   and .admission.consume_request_identity == .consume_request_identity
+                   and .admission.consume_response_identity == .consume_response_identity)' \
+                "$output" >/dev/null
+            fi
+          }
+
           extract_broker_decisions() {
             local case_name=$1
             local expected_count=$2
@@ -412,12 +433,18 @@ jobs:
           grep -q 'bounded pressure v3 stage=authorization_request_forwarded' "$EVIDENCE_DIR/positive.journal.txt"
           grep -q 'bounded pressure v3 stage=authorization_decision_relayed' "$EVIDENCE_DIR/positive.journal.txt"
           grep -q 'bounded pressure v3 stage=authorization_decision_verified' "$EVIDENCE_DIR/positive.journal.txt"
+          grep -q 'bounded pressure v3 stage=prepared_lease_relayed' "$EVIDENCE_DIR/positive.journal.txt"
+          grep -q 'bounded pressure v3 stage=lease_consume_forwarded' "$EVIDENCE_DIR/positive.journal.txt"
+          grep -q 'bounded pressure v3 stage=lease_consumption_response_relayed' "$EVIDENCE_DIR/positive.journal.txt"
+          grep -q 'bounded pressure v3 stage=lease_consumption_persisted' "$EVIDENCE_DIR/positive.journal.txt"
+          grep -q 'bounded pressure lease_consumed_relayed' "$EVIDENCE_DIR/positive.journal.txt"
           assert_broker_checkpoint positive allowed 1 allowed
           assert_count 1 'bounded pressure v3 stage=authorization_decision_verified' \
             "$EVIDENCE_DIR/positive.journal.txt"
           extract_broker_decisions positive 1 allowed
           extract_relay_evidence positive 1 allowed
-          grep -q '"stage": "authorization_decision_verified_before_lease_boundary_removed"' \
+          extract_consumption_relay_evidence positive 1
+          grep -q '"stage": "lease_consumed_before_execution_disabled_boundary_removed"' \
             "$EVIDENCE_DIR/positive.journal.txt"
           assert_terminal_clean positive
           repository_manifest > "$EVIDENCE_DIR/positive.repository.after.sha256"
@@ -439,6 +466,7 @@ jobs:
             "$EVIDENCE_DIR/denied.journal.txt"
           extract_broker_decisions denied 1 denied
           extract_relay_evidence denied 1 denied
+          extract_consumption_relay_evidence denied 0
 
           run_decision_case stale stale protocol-refusal
           jq -e '.terminal.stage == "pre_authorization_protocol_refused_boundary_removed"' \
@@ -453,6 +481,7 @@ jobs:
             "$EVIDENCE_DIR/stale.broker-decisions.jsonl")
           test "$(date --date="$stale_expiry" +%s)" -lt "$(date -u +%s)"
           extract_relay_evidence stale 0
+          extract_consumption_relay_evidence stale 0
 
           run_decision_case wrong-scope wrong_scope protocol-refusal
           jq -e '.terminal.stage == "pre_authorization_protocol_refused_boundary_removed"' \
@@ -467,6 +496,7 @@ jobs:
             '.payload.semantic_scope_identity == ("sha256:" + ("f" * 64))' \
             "$EVIDENCE_DIR/wrong-scope.broker-decisions.jsonl"
           extract_relay_evidence wrong-scope 0
+          extract_consumption_relay_evidence wrong-scope 0
 
           run_decision_case pending-timeout pending_timeout protocol-refusal
           jq -e '.terminal.stage == "pre_authorization_protocol_refused_boundary_removed"' \
@@ -480,6 +510,7 @@ jobs:
           assert_count 1 'bounded pressure pending_timeout_wait_completed seconds=3' \
             "$EVIDENCE_DIR/pending-timeout.journal.txt"
           extract_relay_evidence pending-timeout 1 pending
+          extract_consumption_relay_evidence pending-timeout 0
 
           run_decision_case ambiguous ambiguous protocol-refusal
           jq -e '.terminal.stage == "pre_authorization_protocol_refused_boundary_removed"' \
@@ -494,6 +525,7 @@ jobs:
           jq -s -e 'map(.payload.broker_revision) == [1, 2]' \
             "$EVIDENCE_DIR/ambiguous.broker-decisions.jsonl"
           extract_relay_evidence ambiguous 1 pending
+          extract_consumption_relay_evidence ambiguous 0
 
           reset_services
           sudo install -d -o root -g root -m 0755 \
@@ -538,6 +570,7 @@ jobs:
           assert_count 0 'bounded pressure v3 stage=authorization_decision_relayed' \
             "$EVIDENCE_DIR/missing-broker.journal.txt"
           extract_relay_evidence missing-broker 0
+          extract_consumption_relay_evidence missing-broker 0
           systemctl show ota-authority-broker-proxy.service \
             > "$EVIDENCE_DIR/missing-broker.units.txt"
           grep -q 'ExecStart={ path=/usr/bin/false ' \
@@ -780,6 +813,132 @@ jobs:
           repository_manifest > "$EVIDENCE_DIR/decision-crash.repository.after.sha256"
           diff -u "$EVIDENCE_DIR/decision-crash.repository.before.sha256" \
             "$EVIDENCE_DIR/decision-crash.repository.after.sha256"
+
+          repository_manifest > "$EVIDENCE_DIR/intent-ack-crash.repository.before.sha256"
+          reset_services
+          set_broker_scenario allowed
+          sudo install -o root -g root -m 0600 /dev/null \
+            /run/ota/authority-launcher-pressure-exit-after-intent-ack
+          case_cursor=$(journal_cursor)
+          if sudo systemctl start ota-authority-pressure-runner.service; then
+            echo 'post-intent-ack crash injection unexpectedly completed' >&2
+            exit 1
+          fi
+          capture_journal intent-ack-crash-first "$case_cursor"
+          test "$(systemctl show ota-authority-launcher.service -p ExecMainStatus --value)" = 89
+          intent_ack_slots=$(sudo find /var/lib/ota/authority-launcher/active \
+            -mindepth 1 -maxdepth 1 -type f | wc -l)
+          test "$intent_ack_slots" -eq 1
+          intent_ack_slot=$(sudo find /var/lib/ota/authority-launcher/active \
+            -mindepth 1 -maxdepth 1 -type f -print -quit)
+          sudo cp "$intent_ack_slot" \
+            "$EVIDENCE_DIR/intent-ack-crash-first.active-slot.json"
+          sudo chown "$(id -u):$(id -g)" \
+            "$EVIDENCE_DIR/intent-ack-crash-first.active-slot.json"
+          jq -e \
+            '.stage == "lease_consumption_intent_recorded"
+             and .authorization_decision.authorization_decision.payload.decision == "allowed"
+             and .lease_consumption_intent != null
+             and .lease_consumption == null' \
+            "$EVIDENCE_DIR/intent-ack-crash-first.active-slot.json"
+          assert_broker_checkpoint intent-ack-crash-first allowed 1 allowed
+          assert_count 1 'bounded pressure v3 stage=lease_consumption_intent_persisted' \
+            "$EVIDENCE_DIR/intent-ack-crash-first.journal.txt"
+          assert_count 0 'bounded pressure v3 stage=lease_consume_forwarded' \
+            "$EVIDENCE_DIR/intent-ack-crash-first.journal.txt"
+          test ! -e "$PRESSURE_REPOSITORY/selected-work-must-not-exist"
+          test ! -e "$PRESSURE_REPOSITORY/.ota"
+
+          sudo systemctl reset-failed
+          case_cursor=$(journal_cursor)
+          if ! sudo systemctl start ota-authority-pressure-runner.service; then
+            capture_journal intent-ack-crash-recovery-start-failure "$case_cursor"
+            exit 1
+          fi
+          capture_journal intent-ack-crash-recovery "$case_cursor"
+          assert_terminal_clean intent-ack-crash-recovery
+          assert_count 1 'bounded pressure v3 stage=lease_consume_forwarded' \
+            "$EVIDENCE_DIR/intent-ack-crash-recovery.journal.txt"
+          extract_consumption_relay_evidence intent-ack-crash-recovery 1
+          abandoned_intent_consume=$(jq -r \
+            '.lease_consumption_intent.consume_request_identity' \
+            "$EVIDENCE_DIR/intent-ack-crash-first.active-slot.json")
+          retry_consume=$(jq -r '.consume_request_identity' \
+            "$EVIDENCE_DIR/intent-ack-crash-recovery.lease-relay-evidence.jsonl")
+          test "$retry_consume" != "$abandoned_intent_consume"
+          test "$(sudo find /var/lib/ota/authority-launcher/active \
+            -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 0
+          repository_manifest > "$EVIDENCE_DIR/intent-ack-crash.repository.after.sha256"
+          diff -u "$EVIDENCE_DIR/intent-ack-crash.repository.before.sha256" \
+            "$EVIDENCE_DIR/intent-ack-crash.repository.after.sha256"
+
+          repository_manifest > "$EVIDENCE_DIR/consumption-crash.repository.before.sha256"
+          reset_services
+          set_broker_scenario allowed
+          sudo install -o root -g root -m 0600 /dev/null \
+            /run/ota/authority-launcher-pressure-exit-after-consumption
+          case_cursor=$(journal_cursor)
+          if sudo systemctl start ota-authority-pressure-runner.service; then
+            echo 'post-consumption crash injection unexpectedly completed' >&2
+            exit 1
+          fi
+          capture_journal consumption-crash-first "$case_cursor"
+          test "$(systemctl show ota-authority-launcher.service -p ExecMainStatus --value)" = 88
+          consumption_crash_slots=$(sudo find /var/lib/ota/authority-launcher/active \
+            -mindepth 1 -maxdepth 1 -type f | wc -l)
+          printf 'active_slots=%s\n' "$consumption_crash_slots" \
+            > "$EVIDENCE_DIR/consumption-crash-first.boundary.txt"
+          test "$consumption_crash_slots" -eq 1
+          consumption_crash_slot=$(sudo find /var/lib/ota/authority-launcher/active \
+            -mindepth 1 -maxdepth 1 -type f -print -quit)
+          sudo cp "$consumption_crash_slot" \
+            "$EVIDENCE_DIR/consumption-crash-first.active-slot.json"
+          sudo chown "$(id -u):$(id -g)" \
+            "$EVIDENCE_DIR/consumption-crash-first.active-slot.json"
+          jq -e \
+            '.stage == "lease_consumption_verified"
+             and .authorization_decision.authorization_decision.payload.decision == "allowed"
+             and .lease_consumption_intent != null
+             and .lease_consumption != null
+             and .lease_consumption_intent.consume_request_identity
+                 == .lease_consumption.consume_request_identity
+             and .lease_consumption.consume_response.payload.state == "consumed"' \
+            "$EVIDENCE_DIR/consumption-crash-first.active-slot.json"
+          assert_broker_checkpoint consumption-crash-first allowed 1 allowed
+          assert_count 1 'bounded pressure v3 stage=lease_consumption_intent_persisted' \
+            "$EVIDENCE_DIR/consumption-crash-first.journal.txt"
+          assert_count 1 'bounded pressure v3 stage=lease_consume_forwarded' \
+            "$EVIDENCE_DIR/consumption-crash-first.journal.txt"
+          test ! -e "$PRESSURE_REPOSITORY/selected-work-must-not-exist"
+          test ! -e "$PRESSURE_REPOSITORY/.ota"
+
+          sudo systemctl reset-failed
+          case_cursor=$(journal_cursor)
+          if ! sudo systemctl start ota-authority-pressure-runner.service; then
+            capture_journal consumption-crash-recovery-start-failure "$case_cursor"
+            systemctl show \
+              ota-authority-pressure-runner.service \
+              ota-authority-launcher.service \
+              ota-authority-attestor.service \
+              ota-authority-broker-proxy.service \
+              > "$EVIDENCE_DIR/consumption-crash-recovery-start-failure.units.txt"
+            exit 1
+          fi
+          capture_journal consumption-crash-recovery "$case_cursor"
+          assert_terminal_clean consumption-crash-recovery
+          # Recovery consumes no additional frame for the crashed work unit. The accepted retry is
+          # a fresh invocation with a different request identity and its own bounded consumption.
+          assert_count 1 'bounded pressure v3 stage=lease_consume_forwarded' \
+            "$EVIDENCE_DIR/consumption-crash-recovery.journal.txt"
+          extract_consumption_relay_evidence consumption-crash-recovery 1
+          crashed_consume=$(jq -r '.lease_consumption.consume_request_identity' \
+            "$EVIDENCE_DIR/consumption-crash-first.active-slot.json")
+          fresh_consume=$(jq -r '.[0].consume_request_identity' \
+            "$EVIDENCE_DIR/consumption-crash-recovery.lease-relay-evidence.jsonl")
+          test "$fresh_consume" != "$crashed_consume"
+          repository_manifest > "$EVIDENCE_DIR/consumption-crash.repository.after.sha256"
+          diff -u "$EVIDENCE_DIR/consumption-crash.repository.before.sha256" \
+            "$EVIDENCE_DIR/consumption-crash.repository.after.sha256"
 
           repository_manifest > "$EVIDENCE_DIR/repository.after.sha256"
           diff -u "$EVIDENCE_DIR/repository.before.sha256" \

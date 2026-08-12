@@ -25,7 +25,7 @@
 //! The child remains root and stopped until the launcher has durably recorded its identity and
 //! bound it to the exact systemd invocation scope. The resume path admits one bounded Ota
 //! process-posture preface, one signed V3 attestation bridge, and one bounded authorization-decision
-//! relay, then stops before lease issuance or selected execution.
+//! relay, then stops after one consumed lease and before selected execution.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
@@ -40,13 +40,20 @@ use ota_authority_protocol::{
     ATTESTATION_RESPONSE, AUTHORIZATION_DECISION, AUTHORIZATION_DECISION_DOMAIN_V1,
     AUTHORIZATION_REQUEST, AUTHORIZATION_REQUEST_DOMAIN_V1, AuthorizationDecision,
     AuthorizationDecisionAdmissionV1, AuthorizationDecisionPayload,
-    AuthorizationDecisionRelayEvidenceV1, AuthorizationRequest, BrokerChallenge,
-    LauncherChildProcessV1, LauncherStartupContinuationV1, MAX_FRAME_BYTES, OtaProcessPostureV1,
+    AuthorizationDecisionRelayEvidenceV1, AuthorizationRequest, BrokerChallenge, LEASE_CONSUME,
+    LEASE_CONSUME_RESPONSE, LEASE_CONSUMPTION_INTENT_PERSISTENCE, LEASE_CONSUMPTION_PERSISTENCE,
+    LEASE_ISSUANCE, LauncherChildProcessV1, LauncherStartupContinuationV1, LeaseConsumeRequest,
+    LeaseConsumeResponsePayload, LeaseConsumptionAdmissionV1, LeaseConsumptionIntentPersistenceV1,
+    LeaseConsumptionIntentRelayEvidenceV1, LeaseConsumptionPersistenceV1,
+    LeaseConsumptionRelayEvidenceV1, MAX_FRAME_BYTES, OtaProcessPostureV1, PreparedLeasePayload,
     SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3, SignedBrokerMessage,
     SignedLauncherAttestationV3, authorization_decision_admission_v1_identity,
     authorization_decision_relay_evidence_v1_identity, decode_frame, encode_frame,
     launcher_attestation_identity_v3, launcher_child_process_identity,
-    launcher_startup_continuation_identity, message_identity, ota_process_posture_identity,
+    launcher_startup_continuation_identity, lease_consumption_admission_v1_identity,
+    lease_consumption_intent_persistence_v1_identity,
+    lease_consumption_intent_relay_evidence_v1_identity, lease_consumption_persistence_v1_identity,
+    lease_consumption_relay_evidence_v1_identity, message_identity, ota_process_posture_identity,
     sha256_identity,
 };
 use serde::Serialize;
@@ -161,6 +168,7 @@ impl PreparedChild {
             .map(|_| ())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn relay_v3_authorization_decisions(
         &mut self,
         authorization: &AuthorizationRequest,
@@ -168,7 +176,19 @@ impl PreparedChild {
         broker_proxy: &mut UnixStream,
         timeout: Duration,
         mut record: impl FnMut(&AuthorizationDecisionRelayEvidenceV1) -> Result<(), PreparedChildError>,
-    ) -> Result<AuthorizationDecision, PreparedChildError> {
+        mut record_consumption: impl FnMut(
+            &LeaseConsumptionRelayEvidenceV1,
+        ) -> Result<(), PreparedChildError>,
+        mut record_consumption_intent: impl FnMut(
+            &LeaseConsumptionIntentRelayEvidenceV1,
+        ) -> Result<(), PreparedChildError>,
+    ) -> Result<
+        (
+            AuthorizationDecision,
+            Option<LeaseConsumptionRelayEvidenceV1>,
+        ),
+        PreparedChildError,
+    > {
         write_json_frame(broker_proxy, &authorization, timeout)
             .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
         pressure_v3_stage("authorization_request_forwarded");
@@ -219,11 +239,168 @@ impl PreparedChild {
             pressure_v3_stage("authorization_decision_verified");
             match evidence.authorization_decision.payload.decision {
                 AuthorizationDecision::Pending => {}
-                AuthorizationDecision::Allowed | AuthorizationDecision::Denied => {
-                    return Ok(evidence.authorization_decision.payload.decision);
+                AuthorizationDecision::Allowed => {
+                    let consumption = self.relay_v3_lease_consumption(
+                        &evidence,
+                        broker_proxy,
+                        timeout,
+                        &mut record_consumption,
+                        &mut record_consumption_intent,
+                    )?;
+                    return Ok((AuthorizationDecision::Allowed, Some(consumption)));
+                }
+                AuthorizationDecision::Denied => {
+                    return Ok((evidence.authorization_decision.payload.decision, None));
                 }
             }
         }
+    }
+
+    fn relay_v3_lease_consumption(
+        &mut self,
+        decision: &AuthorizationDecisionRelayEvidenceV1,
+        broker_proxy: &mut UnixStream,
+        timeout: Duration,
+        record: &mut impl FnMut(&LeaseConsumptionRelayEvidenceV1) -> Result<(), PreparedChildError>,
+        record_intent: &mut impl FnMut(
+            &LeaseConsumptionIntentRelayEvidenceV1,
+        ) -> Result<(), PreparedChildError>,
+    ) -> Result<LeaseConsumptionRelayEvidenceV1, PreparedChildError> {
+        let prepared_lease: SignedBrokerMessage<PreparedLeasePayload> =
+            read_json_frame(broker_proxy, timeout)
+                .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        if prepared_lease.payload.message_kind != LEASE_ISSUANCE {
+            return Err(PreparedChildError::AuthorizationDecisionBridgeUnavailable);
+        }
+        let prepared_lease_identity = message_identity(
+            ota_authority_protocol::LEASE_ISSUANCE_DOMAIN_V1.as_bytes(),
+            &prepared_lease,
+        )
+        .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        if prepared_lease.payload.authorization_decision_identity
+            != decision.authorization_decision_identity
+            || prepared_lease.payload.binding_identity
+                != decision.authorization_decision.payload.binding_identity
+            || prepared_lease.payload.work_unit_identity
+                != decision.authorization_decision.payload.work_unit_identity
+        {
+            return Err(PreparedChildError::AuthorizationDecisionBridgeUnavailable);
+        }
+        write_json_frame(&mut self.launcher_session, &prepared_lease, timeout)
+            .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        pressure_v3_stage("prepared_lease_relayed");
+
+        let consume_request: LeaseConsumeRequest =
+            read_json_frame(&mut self.launcher_session, timeout)
+                .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        if consume_request.message_kind != LEASE_CONSUME
+            || consume_request.lease_identity != prepared_lease_identity
+            || consume_request.binding_identity != prepared_lease.payload.binding_identity
+            || consume_request.work_unit_identity != prepared_lease.payload.work_unit_identity
+        {
+            return Err(PreparedChildError::AuthorizationDecisionBridgeUnavailable);
+        }
+        let consume_request_identity = message_identity(
+            ota_authority_protocol::LEASE_CONSUME_DOMAIN_V1.as_bytes(),
+            &consume_request,
+        )
+        .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        let mut intent = LeaseConsumptionIntentRelayEvidenceV1 {
+            schema_version: 1,
+            identity: String::new(),
+            authorization_decision_relay_identity: decision.identity.clone(),
+            prepared_lease: prepared_lease.clone(),
+            prepared_lease_identity: prepared_lease_identity.clone(),
+            consume_request: consume_request.clone(),
+            consume_request_identity: consume_request_identity.clone(),
+        };
+        intent.identity = lease_consumption_intent_relay_evidence_v1_identity(&intent)
+            .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        record_intent(&intent)?;
+        let mut intent_persistence = LeaseConsumptionIntentPersistenceV1 {
+            schema_version: 1,
+            identity: String::new(),
+            message_kind: LEASE_CONSUMPTION_INTENT_PERSISTENCE.into(),
+            consumption_intent_identity: intent.identity.clone(),
+        };
+        intent_persistence.identity =
+            lease_consumption_intent_persistence_v1_identity(&intent_persistence)
+                .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        write_json_frame(&mut self.launcher_session, &intent_persistence, timeout)
+            .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        pressure_v3_stage("lease_consumption_intent_persisted");
+        crate::systemd_service::pressure_exit_after_intent_persistence_acknowledged()
+            .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        write_json_frame(broker_proxy, &consume_request, timeout)
+            .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        pressure_v3_stage("lease_consume_forwarded");
+
+        let consume_response: SignedBrokerMessage<LeaseConsumeResponsePayload> =
+            read_json_frame(broker_proxy, timeout)
+                .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        if consume_response.payload.message_kind != LEASE_CONSUME_RESPONSE
+            || consume_response.payload.consume_request_identity != consume_request_identity
+            || consume_response.payload.lease_identity != prepared_lease_identity
+            || consume_response.payload.binding_identity != consume_request.binding_identity
+            || consume_response.payload.work_unit_identity != consume_request.work_unit_identity
+        {
+            return Err(PreparedChildError::AuthorizationDecisionBridgeUnavailable);
+        }
+        let consume_response_identity = message_identity(
+            ota_authority_protocol::LEASE_CONSUME_RESPONSE_DOMAIN_V1.as_bytes(),
+            &consume_response,
+        )
+        .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        write_json_frame(&mut self.launcher_session, &consume_response, timeout)
+            .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        pressure_v3_stage("lease_consumption_response_relayed");
+
+        let admission: LeaseConsumptionAdmissionV1 =
+            read_json_frame(&mut self.launcher_session, timeout)
+                .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        if lease_consumption_admission_v1_identity(&admission)
+            .ok()
+            .as_deref()
+            != Some(admission.identity.as_str())
+            || admission.prepared_lease_identity != prepared_lease_identity
+            || admission.consume_request_identity != consume_request_identity
+            || admission.consume_response_identity != consume_response_identity
+            || admission.binding_identity != consume_request.binding_identity
+            || admission.work_unit_identity != consume_request.work_unit_identity
+            || admission.crossing_transaction_id != consume_request.crossing_transaction_id
+            || admission.crossing_transaction_identity
+                != consume_request.crossing_transaction_identity
+        {
+            return Err(PreparedChildError::AuthorizationDecisionBridgeUnavailable);
+        }
+        let mut evidence = LeaseConsumptionRelayEvidenceV1 {
+            schema_version: 1,
+            identity: String::new(),
+            authorization_decision_relay_identity: decision.identity.clone(),
+            prepared_lease,
+            prepared_lease_identity,
+            consume_request,
+            consume_request_identity,
+            consume_response,
+            consume_response_identity,
+            admission,
+        };
+        evidence.identity = lease_consumption_relay_evidence_v1_identity(&evidence)
+            .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        record(&evidence)?;
+        pressure_v3_consumption_evidence(&evidence)?;
+        let mut persistence = LeaseConsumptionPersistenceV1 {
+            schema_version: 1,
+            identity: String::new(),
+            message_kind: LEASE_CONSUMPTION_PERSISTENCE.into(),
+            consumption_admission_identity: evidence.admission.identity.clone(),
+        };
+        persistence.identity = lease_consumption_persistence_v1_identity(&persistence)
+            .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        write_json_frame(&mut self.launcher_session, &persistence, timeout)
+            .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        pressure_v3_stage("lease_consumption_persisted");
+        Ok(evidence)
     }
 
     pub(crate) fn continue_to_v3_authorization_request(
@@ -383,6 +560,20 @@ fn pressure_v3_relay_evidence(
         eprintln!(
             "ota-authority-launcher: bounded pressure authorization relay evidence={encoded}"
         );
+    }
+    #[cfg(not(feature = "systemd-pressure-faults"))]
+    let _ = evidence;
+    Ok(())
+}
+
+fn pressure_v3_consumption_evidence(
+    evidence: &LeaseConsumptionRelayEvidenceV1,
+) -> Result<(), PreparedChildError> {
+    #[cfg(feature = "systemd-pressure-faults")]
+    {
+        let encoded = serde_json::to_string(evidence)
+            .map_err(|_| PreparedChildError::AuthorizationDecisionBridgeUnavailable)?;
+        eprintln!("ota-authority-launcher: bounded pressure lease relay evidence={encoded}");
     }
     #[cfg(not(feature = "systemd-pressure-faults"))]
     let _ = evidence;
@@ -1016,8 +1207,9 @@ mod tests {
 
     use ota_authority_protocol::{
         AuthorizationRequest, LauncherAttestationPayloadV3, LauncherPrincipalMappingV1,
-        LauncherWorkingDirectoryV1, OTA_PROCESS_POSTURE, RuntimeBoundaryObservationState,
-        SignedLauncherAttestationV3, SystemdJobPrincipalObservation, SystemdLauncherObservation,
+        LauncherWorkingDirectoryV1, LeaseConsumeState, OTA_PROCESS_POSTURE,
+        RuntimeBoundaryObservationState, SignedLauncherAttestationV3,
+        SystemdJobPrincipalObservation, SystemdLauncherObservation,
         SystemdProtectedLauncherInstanceEvidenceV1, SystemdProtectedLauncherInstanceEvidenceV2,
         UnixPrincipalIdentity, encode_frame, launcher_principal_mapping_identity,
         launcher_working_directory_identity, systemd_job_principal_profile_identity,
@@ -1394,7 +1586,7 @@ mod tests {
         let decision = authorization_decision_for(
             &request,
             &request_identity,
-            AuthorizationDecision::Allowed,
+            AuthorizationDecision::Denied,
             1,
         );
         let admission = admission_for(&request, &request_identity, &decision);
@@ -1443,9 +1635,12 @@ mod tests {
                     recorded.push(evidence.clone());
                     Ok(())
                 },
+                |_| Ok(()),
+                |_| Ok(()),
             )
             .expect("verified decision relay");
-        assert_eq!(observed, AuthorizationDecision::Allowed);
+        assert_eq!(observed.0, AuthorizationDecision::Denied);
+        assert!(observed.1.is_none());
         assert_eq!(recorded.len(), 1);
         assert_eq!(
             authorization_decision_relay_evidence_v1_identity(&recorded[0])
@@ -1486,6 +1681,8 @@ mod tests {
                 &mut proxy,
                 Duration::from_secs(1),
                 |_| Ok(()),
+                |_| Ok(()),
+                |_| Ok(()),
             ),
             Err(PreparedChildError::AuthorizationDecisionBridgeUnavailable)
         );
@@ -1521,11 +1718,239 @@ mod tests {
                 &mut proxy,
                 Duration::from_secs(1),
                 |_| Ok(()),
+                |_| Ok(()),
+                |_| Ok(()),
             ),
             Err(PreparedChildError::AuthorizationDecisionBridgeUnavailable)
         );
         core_thread.join().expect("scope core thread");
         broker_thread.join().expect("scope broker thread");
+    }
+
+    #[test]
+    fn consumed_lease_requires_and_emits_launcher_persistence() {
+        let request = AuthorizationRequest {
+            message_kind: AUTHORIZATION_REQUEST.into(),
+            binding_identity: identity('1'),
+            authority_id: String::from("release"),
+            attestation_identity: identity('2'),
+            challenge_nonce_commitment: identity('3'),
+            work_unit_identity: identity('4'),
+            contract_identity: identity('5'),
+            semantic_scope_identity: identity('6'),
+            runner_principal: identity('7'),
+            actor_mode: String::from("non_agent"),
+            requested_lifetime_seconds: 60,
+        };
+        let request_identity =
+            message_identity(AUTHORIZATION_REQUEST_DOMAIN_V1.as_bytes(), &request)
+                .expect("request identity");
+        let decision = authorization_decision_for(
+            &request,
+            &request_identity,
+            AuthorizationDecision::Allowed,
+            1,
+        );
+        let decision_identity =
+            message_identity(AUTHORIZATION_DECISION_DOMAIN_V1.as_bytes(), &decision)
+                .expect("decision identity");
+        let decision_admission = admission_for(&request, &request_identity, &decision);
+        let lease = SignedBrokerMessage {
+            payload: PreparedLeasePayload {
+                message_kind: LEASE_ISSUANCE.into(),
+                authorization_decision_identity: decision_identity,
+                binding_identity: request.binding_identity.clone(),
+                authority_id: request.authority_id.clone(),
+                attestation_identity: request.attestation_identity.clone(),
+                challenge_nonce_commitment: request.challenge_nonce_commitment.clone(),
+                work_unit_identity: request.work_unit_identity.clone(),
+                contract_identity: request.contract_identity.clone(),
+                semantic_scope_identity: request.semantic_scope_identity.clone(),
+                runner_principal: request.runner_principal.clone(),
+                broker_revision: 1,
+                lease_sequence: 1,
+                issued_at: String::from("2026-08-12T00:00:00Z"),
+                expires_at: String::from("2026-08-12T00:01:00Z"),
+            },
+            key_id: String::from("broker-key"),
+            algorithm: String::from("ed25519"),
+            signature: String::from("lease-signature"),
+        };
+        let lease_identity = message_identity(
+            ota_authority_protocol::LEASE_ISSUANCE_DOMAIN_V1.as_bytes(),
+            &lease,
+        )
+        .expect("lease identity");
+        let consume = LeaseConsumeRequest {
+            message_kind: LEASE_CONSUME.into(),
+            binding_identity: request.binding_identity.clone(),
+            lease_identity: lease_identity.clone(),
+            challenge_nonce_commitment: request.challenge_nonce_commitment.clone(),
+            work_unit_identity: request.work_unit_identity.clone(),
+            crossing_transaction_id: String::from("crossing-1"),
+            crossing_transaction_identity: identity('8'),
+        };
+        let consume_identity = message_identity(
+            ota_authority_protocol::LEASE_CONSUME_DOMAIN_V1.as_bytes(),
+            &consume,
+        )
+        .expect("consume identity");
+        let consume_response = SignedBrokerMessage {
+            payload: LeaseConsumeResponsePayload {
+                message_kind: LEASE_CONSUME_RESPONSE.into(),
+                consume_request_identity: consume_identity.clone(),
+                binding_identity: consume.binding_identity.clone(),
+                lease_identity: lease_identity.clone(),
+                challenge_nonce_commitment: consume.challenge_nonce_commitment.clone(),
+                work_unit_identity: consume.work_unit_identity.clone(),
+                crossing_transaction_id: consume.crossing_transaction_id.clone(),
+                crossing_transaction_identity: consume.crossing_transaction_identity.clone(),
+                state: LeaseConsumeState::Consumed,
+                broker_revision: 2,
+                consumed_at: String::from("2026-08-12T00:00:01Z"),
+            },
+            key_id: String::from("broker-key"),
+            algorithm: String::from("ed25519"),
+            signature: String::from("consume-signature"),
+        };
+        let response_identity = message_identity(
+            ota_authority_protocol::LEASE_CONSUME_RESPONSE_DOMAIN_V1.as_bytes(),
+            &consume_response,
+        )
+        .expect("response identity");
+        let mut consumption_admission = LeaseConsumptionAdmissionV1 {
+            schema_version: 1,
+            identity: String::new(),
+            message_kind: ota_authority_protocol::LEASE_CONSUMPTION_ADMISSION.into(),
+            binding_identity: consume.binding_identity.clone(),
+            prepared_lease_identity: lease_identity,
+            consume_request_identity: consume_identity,
+            consume_response_identity: response_identity,
+            work_unit_identity: consume.work_unit_identity.clone(),
+            crossing_transaction_id: consume.crossing_transaction_id.clone(),
+            crossing_transaction_identity: consume.crossing_transaction_identity.clone(),
+        };
+        consumption_admission.identity =
+            lease_consumption_admission_v1_identity(&consumption_admission)
+                .expect("admission identity");
+
+        let (launcher_session, mut core) = UnixStream::pair().expect("core pair");
+        let (mut proxy, mut broker) = UnixStream::pair().expect("broker pair");
+        let broker_request = request.clone();
+        let broker_decision = decision.clone();
+        let broker_lease = lease.clone();
+        let broker_consume = consume.clone();
+        let broker_response = consume_response.clone();
+        let broker_thread = std::thread::spawn(move || {
+            assert_eq!(
+                read_json_frame::<AuthorizationRequest>(&mut broker, Duration::from_secs(1))
+                    .expect("request"),
+                broker_request
+            );
+            write_json_frame(&mut broker, &broker_decision, Duration::from_secs(1))
+                .expect("decision");
+            write_json_frame(&mut broker, &broker_lease, Duration::from_secs(1)).expect("lease");
+            assert_eq!(
+                read_json_frame::<LeaseConsumeRequest>(&mut broker, Duration::from_secs(1))
+                    .expect("consume"),
+                broker_consume
+            );
+            write_json_frame(&mut broker, &broker_response, Duration::from_secs(1))
+                .expect("response");
+        });
+        let core_decision = decision.clone();
+        let core_lease = lease.clone();
+        let core_consume = consume.clone();
+        let core_response = consume_response.clone();
+        let core_admission = consumption_admission.clone();
+        let core_thread = std::thread::spawn(move || {
+            assert_eq!(
+                read_json_frame::<SignedBrokerMessage<AuthorizationDecisionPayload>>(
+                    &mut core,
+                    Duration::from_secs(1)
+                )
+                .expect("decision"),
+                core_decision
+            );
+            write_json_frame(&mut core, &decision_admission, Duration::from_secs(1))
+                .expect("decision admission");
+            assert_eq!(
+                read_json_frame::<SignedBrokerMessage<PreparedLeasePayload>>(
+                    &mut core,
+                    Duration::from_secs(1)
+                )
+                .expect("lease"),
+                core_lease
+            );
+            write_json_frame(&mut core, &core_consume, Duration::from_secs(1)).expect("consume");
+            let intent_persistence: LeaseConsumptionIntentPersistenceV1 =
+                read_json_frame(&mut core, Duration::from_secs(1)).expect("intent persistence");
+            assert_eq!(
+                lease_consumption_intent_persistence_v1_identity(&intent_persistence)
+                    .expect("intent persistence identity"),
+                intent_persistence.identity
+            );
+            assert_eq!(
+                read_json_frame::<SignedBrokerMessage<LeaseConsumeResponsePayload>>(
+                    &mut core,
+                    Duration::from_secs(1)
+                )
+                .expect("response"),
+                core_response
+            );
+            write_json_frame(&mut core, &core_admission, Duration::from_secs(1))
+                .expect("consumption admission");
+            let persistence: LeaseConsumptionPersistenceV1 =
+                read_json_frame(&mut core, Duration::from_secs(1)).expect("persistence");
+            assert_eq!(
+                persistence.consumption_admission_identity,
+                core_admission.identity
+            );
+            assert_eq!(
+                lease_consumption_persistence_v1_identity(&persistence)
+                    .expect("persistence identity"),
+                persistence.identity
+            );
+        });
+        let mut child = PreparedChild {
+            pid: 0,
+            record: LauncherChildProcessV1 {
+                schema_version: 1,
+                identity: identity('9'),
+                invocation_id: String::from("invocation"),
+                request_identity: identity('a'),
+                pid: 41,
+                process_start_time_identity: identity('b'),
+                ota_binary_identity: identity('c'),
+                principal_mapping_identity: identity('d'),
+                working_directory_identity: identity('e'),
+            },
+            launcher_session,
+        };
+        let mut consumptions = Vec::new();
+        let result = child
+            .relay_v3_authorization_decisions(
+                &request,
+                &request_identity,
+                &mut proxy,
+                Duration::from_secs(1),
+                |_| Ok(()),
+                |evidence| {
+                    consumptions.push(evidence.clone());
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .expect("consumed lease relay");
+        assert_eq!(result.0, AuthorizationDecision::Allowed);
+        assert_eq!(result.1, consumptions.first().cloned());
+        assert_eq!(consumptions.len(), 1);
+        assert_eq!(
+            lease_consumption_relay_evidence_v1_identity(&consumptions[0]).expect("relay identity"),
+            consumptions[0].identity
+        );
+        core_thread.join().expect("core thread");
+        broker_thread.join().expect("broker thread");
     }
 
     #[test]

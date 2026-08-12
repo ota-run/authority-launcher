@@ -22,13 +22,14 @@
 
 //! Linux socket-activation admission for the planned protected launcher service.
 //!
-//! This foundation deliberately stops before lease issuance or selected execution. It proves the
+//! This foundation deliberately stops after one consumed lease and before selected execution. It proves the
 //! service can consume only the fixed listener, derive the connecting job principal through
 //! `SO_PEERCRED`, durably prepare an exact stopped Ota child, attach and verify its transient
 //! systemd scope, admit that child's exact bounded process-posture preface, and bridge one signed
-//! V3 attestation and one exact signed authorization decision. Lease consumption remains disabled
-//! and exact cleanup is still mandatory.
+//! V3 attestation, one exact signed authorization decision, and one transaction-bound consumed
+//! lease relay. Exact cleanup is still mandatory.
 
+use std::cell::RefCell;
 use std::env;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -91,6 +92,16 @@ const PRESSURE_EXIT_AFTER_DECISION_MARKER: &str =
     "/run/ota/authority-launcher-pressure-exit-after-decision";
 #[cfg(feature = "systemd-pressure-faults")]
 const PRESSURE_EXIT_AFTER_DECISION_CODE: i32 = 87;
+#[cfg(feature = "systemd-pressure-faults")]
+const PRESSURE_EXIT_AFTER_CONSUMPTION_MARKER: &str =
+    "/run/ota/authority-launcher-pressure-exit-after-consumption";
+#[cfg(feature = "systemd-pressure-faults")]
+const PRESSURE_EXIT_AFTER_CONSUMPTION_CODE: i32 = 88;
+#[cfg(feature = "systemd-pressure-faults")]
+const PRESSURE_EXIT_AFTER_INTENT_ACK_MARKER: &str =
+    "/run/ota/authority-launcher-pressure-exit-after-intent-ack";
+#[cfg(feature = "systemd-pressure-faults")]
+const PRESSURE_EXIT_AFTER_INTENT_ACK_CODE: i32 = 89;
 
 #[derive(Debug, Error)]
 pub(crate) enum SystemdServiceError {
@@ -210,7 +221,7 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
     );
 
     match child_boundary {
-        Ok((_prepared_child, decision)) => {
+        Ok((_prepared_child, decision, consumed)) => {
             // Lease issuance and execution remain disabled. Refusal is emitted only after the
             // prepared child was killed, reaped, and removed from the durable active-slot store.
             write_terminal(
@@ -219,6 +230,9 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
                 LauncherTerminalOutcomeV1::Refused,
                 Some(2),
                 Some(match decision {
+                    AuthorizationDecision::Allowed if consumed => {
+                        LauncherTerminalStageV1::LeaseConsumedBeforeExecutionDisabledBoundaryRemoved
+                    }
                     AuthorizationDecision::Allowed => {
                         LauncherTerminalStageV1::AuthorizationDecisionVerifiedBeforeLeaseBoundaryRemoved
                     }
@@ -286,6 +300,7 @@ fn prepare_disabled_child_boundary(
     (
         ota_authority_protocol::LauncherChildProcessV1,
         AuthorizationDecision,
+        bool,
     ),
     SystemdServiceError,
 > {
@@ -347,7 +362,8 @@ fn prepare_disabled_child_boundary(
                 config,
                 Duration::from_secs(config.maximum_terminal_wait_seconds),
             )?;
-            proxy.run_revalidated(|stream| {
+            let active_slot = RefCell::new(active_slot);
+            let (decision, lease_consumption) = proxy.run_revalidated(|stream| {
                 child
                     .relay_v3_authorization_decisions(
                         &authorization,
@@ -356,6 +372,7 @@ fn prepare_disabled_child_boundary(
                         Duration::from_secs(config.maximum_terminal_wait_seconds),
                         |evidence| {
                             active_slot
+                                .borrow_mut()
                                 .record_authorization_decision(evidence.clone())
                                 .map_err(|_| {
                                     PreparedChildError::AuthorizationDecisionBridgeUnavailable
@@ -364,9 +381,32 @@ fn prepare_disabled_child_boundary(
                                 PreparedChildError::AuthorizationDecisionBridgeUnavailable
                             })
                         },
+                        |evidence| {
+                            active_slot
+                                .borrow_mut()
+                                .record_lease_consumption(evidence.clone())
+                                .map_err(|_| {
+                                    PreparedChildError::AuthorizationDecisionBridgeUnavailable
+                                })?;
+                            pressure_exit_after_lease_consumption_recorded().map_err(|_| {
+                                PreparedChildError::AuthorizationDecisionBridgeUnavailable
+                            })
+                        },
+                        |evidence| {
+                            active_slot
+                                .borrow_mut()
+                                .record_lease_consumption_intent(evidence.clone())
+                                .map_err(|_| {
+                                    PreparedChildError::AuthorizationDecisionBridgeUnavailable
+                                })
+                        },
                     )
                     .map_err(map_prepared_child_error)
-            })
+            })?;
+            if lease_consumption.is_some() != active_slot.borrow().has_lease_consumption() {
+                return Err(SystemdServiceError::AuthorizationDecisionRefused);
+            }
+            Ok(decision)
         },
     )
 }
@@ -569,6 +609,7 @@ fn prepare_disabled_child_boundary_with_scope<F>(
     (
         ota_authority_protocol::LauncherChildProcessV1,
         AuthorizationDecision,
+        bool,
     ),
     SystemdServiceError,
 >
@@ -681,6 +722,8 @@ where
         return Err(error);
     }
     let posture_result = posture_gate(&mut child, &principal_mapping, &scope, &mut active_slot);
+    let retain_for_recovery = posture_result.is_err() && active_slot.has_lease_consumption_intent();
+    let consumed = active_slot.has_lease_consumption();
     let child_record = child.record.clone();
     scope_manager
         .stop_and_confirm_empty(
@@ -692,11 +735,13 @@ where
     child
         .terminate_and_reap()
         .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
-    active_slot
-        .finalize()
-        .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
+    if !retain_for_recovery {
+        active_slot
+            .finalize()
+            .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
+    }
     let decision = posture_result?;
-    Ok((child_record, decision))
+    Ok((child_record, decision, consumed))
 }
 
 #[cfg(feature = "systemd-pressure-faults")]
@@ -733,6 +778,43 @@ fn pressure_exit_after_authorization_decision_recorded() -> Result<(), SystemdSe
     // The durable decision envelope must survive this abrupt exit so startup recovery can prove
     // cleanup-only reconciliation without resuming the child or requesting a lease.
     unsafe { libc::_exit(PRESSURE_EXIT_AFTER_DECISION_CODE) }
+}
+
+#[cfg(feature = "systemd-pressure-faults")]
+fn pressure_exit_after_lease_consumption_recorded() -> Result<(), SystemdServiceError> {
+    if !consume_pressure_exit_marker(
+        Path::new(PRESSURE_EXIT_AFTER_CONSUMPTION_MARKER),
+        Path::new("/"),
+        0,
+    )? {
+        return Ok(());
+    }
+    unsafe { libc::_exit(PRESSURE_EXIT_AFTER_CONSUMPTION_CODE) }
+}
+
+#[cfg(feature = "systemd-pressure-faults")]
+pub(crate) fn pressure_exit_after_intent_persistence_acknowledged()
+-> Result<(), SystemdServiceError> {
+    if !consume_pressure_exit_marker(
+        Path::new(PRESSURE_EXIT_AFTER_INTENT_ACK_MARKER),
+        Path::new("/"),
+        0,
+    )? {
+        return Ok(());
+    }
+    // The intent is durable and acknowledged, but the broker has not received the consume request.
+    unsafe { libc::_exit(PRESSURE_EXIT_AFTER_INTENT_ACK_CODE) }
+}
+
+#[cfg(not(feature = "systemd-pressure-faults"))]
+pub(crate) fn pressure_exit_after_intent_persistence_acknowledged()
+-> Result<(), SystemdServiceError> {
+    Ok(())
+}
+
+#[cfg(not(feature = "systemd-pressure-faults"))]
+fn pressure_exit_after_lease_consumption_recorded() -> Result<(), SystemdServiceError> {
+    Ok(())
 }
 
 #[cfg(not(feature = "systemd-pressure-faults"))]
@@ -1115,6 +1197,127 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    fn test_identity(character: char) -> String {
+        format!("sha256:{}", character.to_string().repeat(64))
+    }
+
+    fn record_allowed_consumption_intent(active_slot: &mut ActiveSlot) {
+        use ota_authority_protocol::{
+            AUTHORIZATION_DECISION, AUTHORIZATION_DECISION_ADMISSION,
+            AUTHORIZATION_DECISION_DOMAIN_V1, AuthorizationDecisionAdmissionV1,
+            AuthorizationDecisionPayload, AuthorizationDecisionRelayEvidenceV1, LEASE_CONSUME,
+            LEASE_CONSUME_DOMAIN_V1, LEASE_ISSUANCE, LEASE_ISSUANCE_DOMAIN_V1, LeaseConsumeRequest,
+            LeaseConsumptionIntentRelayEvidenceV1, PreparedLeasePayload, SignedBrokerMessage,
+            authorization_decision_admission_v1_identity,
+            authorization_decision_relay_evidence_v1_identity,
+            lease_consumption_intent_relay_evidence_v1_identity, message_identity,
+        };
+
+        let request_identity = test_identity('1');
+        let decision = SignedBrokerMessage {
+            payload: AuthorizationDecisionPayload {
+                message_kind: AUTHORIZATION_DECISION.into(),
+                request_identity: request_identity.clone(),
+                binding_identity: test_identity('2'),
+                authority_id: String::from("release"),
+                attestation_identity: test_identity('3'),
+                challenge_nonce_commitment: test_identity('4'),
+                work_unit_identity: test_identity('5'),
+                contract_identity: test_identity('6'),
+                semantic_scope_identity: test_identity('7'),
+                decision: AuthorizationDecision::Allowed,
+                approval_reference: Some(String::from("approval:1")),
+                broker_revision: 1,
+                issued_at: String::from("2026-08-12T00:00:00Z"),
+                expires_at: String::from("2026-08-12T00:01:00Z"),
+            },
+            key_id: String::from("broker-key"),
+            algorithm: String::from("ed25519"),
+            signature: String::from("test-signature"),
+        };
+        let decision_identity =
+            message_identity(AUTHORIZATION_DECISION_DOMAIN_V1.as_bytes(), &decision)
+                .expect("decision identity");
+        let mut admission = AuthorizationDecisionAdmissionV1 {
+            schema_version: 1,
+            identity: String::new(),
+            message_kind: AUTHORIZATION_DECISION_ADMISSION.into(),
+            request_identity: request_identity.clone(),
+            authorization_decision_identity: decision_identity.clone(),
+            binding_identity: decision.payload.binding_identity.clone(),
+            attestation_identity: decision.payload.attestation_identity.clone(),
+            work_unit_identity: decision.payload.work_unit_identity.clone(),
+            contract_identity: decision.payload.contract_identity.clone(),
+            semantic_scope_identity: decision.payload.semantic_scope_identity.clone(),
+            decision: AuthorizationDecision::Allowed,
+        };
+        admission.identity = authorization_decision_admission_v1_identity(&admission)
+            .expect("decision admission identity");
+        let mut relay = AuthorizationDecisionRelayEvidenceV1 {
+            schema_version: 1,
+            identity: String::new(),
+            request_identity,
+            authorization_decision: decision.clone(),
+            authorization_decision_identity: decision_identity.clone(),
+            admission,
+        };
+        relay.identity = authorization_decision_relay_evidence_v1_identity(&relay)
+            .expect("decision relay identity");
+        active_slot
+            .record_authorization_decision(relay.clone())
+            .expect("durable allowed decision");
+
+        let lease = SignedBrokerMessage {
+            payload: PreparedLeasePayload {
+                message_kind: LEASE_ISSUANCE.into(),
+                authorization_decision_identity: decision_identity,
+                binding_identity: decision.payload.binding_identity.clone(),
+                authority_id: decision.payload.authority_id.clone(),
+                attestation_identity: decision.payload.attestation_identity.clone(),
+                challenge_nonce_commitment: decision.payload.challenge_nonce_commitment.clone(),
+                work_unit_identity: decision.payload.work_unit_identity.clone(),
+                contract_identity: decision.payload.contract_identity.clone(),
+                semantic_scope_identity: decision.payload.semantic_scope_identity.clone(),
+                runner_principal: test_identity('8'),
+                broker_revision: 1,
+                lease_sequence: 1,
+                issued_at: String::from("2026-08-12T00:00:00Z"),
+                expires_at: String::from("2026-08-12T00:01:00Z"),
+            },
+            key_id: String::from("broker-key"),
+            algorithm: String::from("ed25519"),
+            signature: String::from("lease-signature"),
+        };
+        let lease_identity =
+            message_identity(LEASE_ISSUANCE_DOMAIN_V1.as_bytes(), &lease).expect("lease identity");
+        let consume_request = LeaseConsumeRequest {
+            message_kind: LEASE_CONSUME.into(),
+            binding_identity: lease.payload.binding_identity.clone(),
+            lease_identity: lease_identity.clone(),
+            challenge_nonce_commitment: lease.payload.challenge_nonce_commitment.clone(),
+            work_unit_identity: lease.payload.work_unit_identity.clone(),
+            crossing_transaction_id: String::from("crossing-test"),
+            crossing_transaction_identity: test_identity('9'),
+        };
+        let consume_request_identity =
+            message_identity(LEASE_CONSUME_DOMAIN_V1.as_bytes(), &consume_request)
+                .expect("consume request identity");
+        let mut intent = LeaseConsumptionIntentRelayEvidenceV1 {
+            schema_version: 1,
+            identity: String::new(),
+            authorization_decision_relay_identity: relay.identity,
+            prepared_lease: lease,
+            prepared_lease_identity: lease_identity,
+            consume_request,
+            consume_request_identity,
+        };
+        intent.identity = lease_consumption_intent_relay_evidence_v1_identity(&intent)
+            .expect("consume intent identity");
+        active_slot
+            .record_lease_consumption_intent(intent)
+            .expect("durable consume intent");
+    }
 
     #[test]
     fn protected_broker_proxy_refuses_peer_exit_during_bridge() {
@@ -1549,7 +1752,7 @@ mod tests {
         let executable = std::fs::File::open("/bin/true").expect("test executable");
         let scope_boundary = RecordingScopeBoundary::default();
         let posture_gate_ran_after_scope = Cell::new(false);
-        let (child, decision) = prepare_disabled_child_boundary_with_scope(
+        let (child, decision, consumed) = prepare_disabled_child_boundary_with_scope(
             &config,
             &executable,
             &repository,
@@ -1581,6 +1784,7 @@ mod tests {
         )
         .expect("prepare and clean child boundary");
         assert_eq!(decision, AuthorizationDecision::Allowed);
+        assert!(!consumed);
         assert!(posture_gate_ran_after_scope.get());
         assert_eq!(scope_boundary.attached.borrow().len(), 1);
         assert_eq!(scope_boundary.stopped.borrow().len(), 1);
@@ -1612,6 +1816,41 @@ mod tests {
         assert_eq!(refused_scope.stopped.borrow().len(), 1);
         assert!(!PathBuf::from(format!("/proc/{}", refused_pid.get())).exists());
         assert_eq!(fs::read_dir(&active).expect("active directory").count(), 0);
+
+        let post_intent_failure_scope = RecordingScopeBoundary::default();
+        let post_intent_failure_pid = Cell::new(0_u32);
+        assert!(matches!(
+            prepare_disabled_child_boundary_with_scope(
+                &config,
+                &executable,
+                &repository,
+                &config.mappings[0],
+                &request,
+                "invocation-post-intent-failure",
+                &active,
+                0,
+                temporary.path(),
+                &post_intent_failure_scope,
+                |child, _principal_mapping, _scope, active_slot| {
+                    post_intent_failure_pid.set(child.record.pid);
+                    record_allowed_consumption_intent(active_slot);
+                    Err(SystemdServiceError::PreAuthorizationProtocolRefused)
+                },
+            ),
+            Err(SystemdServiceError::PreAuthorizationProtocolRefused)
+        ));
+        assert_eq!(post_intent_failure_scope.attached.borrow().len(), 1);
+        assert_eq!(post_intent_failure_scope.stopped.borrow().len(), 1);
+        assert!(!PathBuf::from(format!("/proc/{}", post_intent_failure_pid.get())).exists());
+        let mut retained_after_post_intent_failure =
+            ActiveSlot::load_all(&active, 0, temporary.path()).expect("load retained intent slot");
+        assert_eq!(retained_after_post_intent_failure.len(), 1);
+        assert!(retained_after_post_intent_failure[0].has_lease_consumption_intent());
+        retained_after_post_intent_failure
+            .pop()
+            .expect("retained post-intent slot")
+            .finalize()
+            .expect("post-intent failure test cleanup");
 
         assert!(matches!(
             prepare_disabled_child_boundary_with_scope(

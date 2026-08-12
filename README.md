@@ -61,9 +61,10 @@ and Ota process-access denial before relaying the independently verified signed 
 Core. Any missing or mismatched observation refuses. This establishes a real local V3 attestation
 bridge. The current execution-disabled decision slice additionally forwards Core's exact
 authorization request to one protected, installation-bound local broker proxy, relays only signed
-authorization decisions, requires Core's identity-bound verification acknowledgement, and durably
-records that exact relay before cleanup. It still does not obtain a lease, consume authority, or
-execute selected work.
+authorization decisions, then relays one exact prepared lease and consumption response. Core keeps
+the systemd transaction private and in memory while the launcher journals the full relay and
+acknowledges that journal back to Core. The launcher active-slot journal is the durable carrier
+record. The child is still cleaned up before selected work.
 
 The feature-gated `ota-authority-pressure-peer` binary is an exception for conformance testing
 only. It uses fixed public test keys and deterministic scenarios to exercise protocol v2 through a
@@ -255,10 +256,12 @@ bound by the installation manifest, consumes one private preface carrying kernel
 `SCM_CREDENTIALS` and `SCM_PIDFD` for the accepting service, and retains that exact process identity
 across relay traffic. This distinction is required because PID 1 owns a systemd-activated listener;
 `SO_PEERCRED` alone does not identify the service process that accepted the connection. The
-launcher then relays signed decisions back to Core. Core returns one
-identity-bound verification acknowledgement; the launcher journals the exact signed decision plus
-that acknowledgement before it kills the complete scope, confirms it absent and its cgroup empty
-or absent, kills/reaps the child, and removes the slot.
+launcher then relays signed decisions, the exact prepared lease, and one consumption response back
+to Core. Core returns an identity-bound decision acknowledgement and an identity-bound consumption
+admission after verifying the launcher's durable relay evidence. The launcher-owned active-slot
+journal is the durable authority record; Core's systemd transaction remains private in-memory state.
+The launcher returns a bounded persistence acknowledgement before it kills the complete scope, confirms it
+absent and its cgroup empty or absent, kills/reaps the child, and removes the slot.
 
 On startup, retained journals are reconciled before accepting a client. A valid child- or
 scope-bearing temporary journal is promoted rather than discarded. Intent-only state remains a
@@ -266,8 +269,8 @@ hard refusal because it cannot establish child absence. An exact pre-scope child
 through Linux `pidfd`; a scope-bearing journal additionally requires the exact unit and kernel
 cgroup to be stopped and observed empty. PID reuse, identity mismatch, unsupported cleanup, or any
 uncertain outcome retains the slot and fails closed.
-This path remains execution-disabled after signed V3 decision admission. It does **not** issue or
-consume a lease, execute repository work, or create crossing receipt/archive evidence. Only
+This path remains execution-disabled after signed V3 decision admission and one bounded consumed
+lease relay. It does **not** execute repository work or create crossing receipt/archive evidence. Only
 `ota-authority-attestor` receives the systemd-delivered
 signing credential; the launcher retains public verification truth only. Missing, malformed,
 oversized, self-inconsistent, or substituted posture, continuation, challenge, attestation, or
@@ -279,9 +282,11 @@ The feature-gated `ota-authority-systemd-pressure-client` is the unprivileged si
 kernel proof. It connects only to `/run/ota/authority-launcher.sock`, submits one bounded
 `LauncherInvocationRequestV1`, and accepts only the execution-disabled terminal refusal emitted
 with a caller-selected exact expected stage. Its default requires
-`authorization_decision_verified_before_lease_boundary_removed` after Core has verified one signed
-allowed decision and the service has confirmed exact scope and child cleanup. Pressure-only
-negative cases can instead require exact denied-decision or pre-authorization-protocol refusal;
+`lease_consumed_before_execution_disabled_boundary_removed` after Core and the launcher have
+durably reconciled one signed consumed lease and the service has confirmed exact scope and child
+cleanup. Pressure-only decision-only controls can instead require
+`authorization_decision_verified_before_lease_boundary_removed`; negative cases can instead
+require exact denied-decision or pre-authorization-protocol refusal;
 a posture-only, repository-open, or generic boundary failure cannot satisfy it. Before sending
 the request it requires the fixed socket and parent to have the protected root-owned posture and
 requires the connected Unix peer to be root-owned. It cannot select another socket, install
@@ -351,9 +356,9 @@ reconciliation to remove each exact slot, child, cgroup, and scope before a fres
 Artifact inspection independently re-verifies all eight public signed decisions and all five relay
 and admission identities. Fourteen complete before/after repository manifests are byte-identical,
 and no selected-work, `.ota`, lease, receipt, archive, private-key, or credential residue exists.
-This closes only execution-disabled signed-decision admission and cleanup pressure. One-use lease
-consumption, selected execution, crossing receipt/archive evidence, independently administered
-provider/launcher separation, and provider attestation remain open.
+This documents an unpressured local foundation only. Immutable Linux/x64 systemd pressure for the
+consumed-lease relay, selected execution, crossing receipt/archive evidence, independently
+administered provider/launcher separation, and provider attestation remain open.
 
 ## What belongs here
 

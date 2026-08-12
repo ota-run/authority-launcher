@@ -26,6 +26,13 @@
 
 ## Unreleased
 
+- Extend the execution-disabled protected systemd foundation through one exact prepared-lease and
+  consumed-response relay. The launcher durably journals the exact transaction-bound intent and
+  consumed relay, while Core verifies that protected persistence in private in-memory transaction
+  state before acknowledging it. The exact scope is still removed before selected work. This is
+  local foundation work only: it does not enable repository execution, crossing receipts/archives,
+  or immutable hosted pressure.
+
 - Derive ordinary CI and root-boundary source-identity assertions from the contract-selected setup
   result instead of duplicating a historical Core revision. Both lanes still require a clean source
   build and reconcile the installed binary's reported commit, while contract pin advances no longer

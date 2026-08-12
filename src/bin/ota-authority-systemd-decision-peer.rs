@@ -22,7 +22,8 @@
 
 //! Pressure-only signed authorization-decision peer for the execution-disabled systemd gate.
 //!
-//! This binary is not a production broker. It issues no lease and has no selected-work path.
+//! This binary is not a production broker. It relays one pressure-only consumed lease and has no
+//! selected-work path.
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -40,8 +41,11 @@ mod linux {
     use ota_authority_launcher::linux_observations::BROKER_PROXY_IDENTITY_PREFACE;
     use ota_authority_protocol::{
         AUTHORIZATION_DECISION, AUTHORIZATION_DECISION_DOMAIN_V1, AUTHORIZATION_REQUEST_DOMAIN_V1,
-        AuthorizationDecision, AuthorizationDecisionPayload, AuthorizationRequest, MAX_FRAME_BYTES,
-        SignedBrokerMessage, decode_frame, domain_separated, encode_frame, message_identity,
+        AuthorizationDecision, AuthorizationDecisionPayload, AuthorizationRequest, LEASE_CONSUME,
+        LEASE_CONSUME_DOMAIN_V1, LEASE_CONSUME_RESPONSE, LEASE_CONSUME_RESPONSE_DOMAIN_V1,
+        LEASE_ISSUANCE, LEASE_ISSUANCE_DOMAIN_V1, LeaseConsumeRequest, LeaseConsumeResponsePayload,
+        LeaseConsumeState, MAX_FRAME_BYTES, PreparedLeasePayload, SignedBrokerMessage,
+        decode_frame, domain_separated, encode_frame, message_identity,
     };
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
@@ -90,13 +94,13 @@ mod linux {
         let mut payload = AuthorizationDecisionPayload {
             message_kind: String::from(AUTHORIZATION_DECISION),
             request_identity,
-            binding_identity: request.binding_identity,
-            authority_id: request.authority_id,
-            attestation_identity: request.attestation_identity,
-            challenge_nonce_commitment: request.challenge_nonce_commitment,
-            work_unit_identity: request.work_unit_identity,
-            contract_identity: request.contract_identity,
-            semantic_scope_identity: request.semantic_scope_identity,
+            binding_identity: request.binding_identity.clone(),
+            authority_id: request.authority_id.clone(),
+            attestation_identity: request.attestation_identity.clone(),
+            challenge_nonce_commitment: request.challenge_nonce_commitment.clone(),
+            work_unit_identity: request.work_unit_identity.clone(),
+            contract_identity: request.contract_identity.clone(),
+            semantic_scope_identity: request.semantic_scope_identity.clone(),
             decision: AuthorizationDecision::Allowed,
             approval_reference: Some(String::from("pressure:decision-only")),
             broker_revision: 1,
@@ -125,6 +129,9 @@ mod linux {
         let first = sign(&key, payload.clone())?;
         write_frame(&mut stream, &first)?;
         log_decision_sent(&scenario, 1, &first)?;
+        if scenario == "allowed" {
+            relay_consumed_lease(&key, &mut stream, &request, &first)?;
+        }
         if scenario == "pending_timeout" {
             std::thread::sleep(Duration::from_secs(3));
             eprintln!(
@@ -216,20 +223,87 @@ mod linux {
         key: &SigningKey,
         payload: AuthorizationDecisionPayload,
     ) -> Result<SignedBrokerMessage<AuthorizationDecisionPayload>, String> {
+        sign_message(key, AUTHORIZATION_DECISION_DOMAIN_V1.as_bytes(), payload)
+    }
+
+    fn sign_message<T: serde::Serialize>(
+        key: &SigningKey,
+        domain: &[u8],
+        payload: T,
+    ) -> Result<SignedBrokerMessage<T>, String> {
         let canonical = serde_jcs::to_vec(&payload)
             .map_err(|_| String::from("decision peer canonicalization failed"))?;
         Ok(SignedBrokerMessage {
             payload,
             key_id: String::from(KEY_ID),
             algorithm: String::from("ed25519"),
-            signature: URL_SAFE_NO_PAD.encode(
-                key.sign(&domain_separated(
-                    AUTHORIZATION_DECISION_DOMAIN_V1.as_bytes(),
-                    &canonical,
-                ))
-                .to_bytes(),
-            ),
+            signature: URL_SAFE_NO_PAD
+                .encode(key.sign(&domain_separated(domain, &canonical)).to_bytes()),
         })
+    }
+
+    fn relay_consumed_lease(
+        key: &SigningKey,
+        stream: &mut UnixStream,
+        request: &AuthorizationRequest,
+        decision: &SignedBrokerMessage<AuthorizationDecisionPayload>,
+    ) -> Result<(), String> {
+        let decision_identity =
+            message_identity(AUTHORIZATION_DECISION_DOMAIN_V1.as_bytes(), decision)
+                .map_err(|_| String::from("decision peer decision identity failed"))?;
+        let lease = sign_message(
+            key,
+            LEASE_ISSUANCE_DOMAIN_V1.as_bytes(),
+            PreparedLeasePayload {
+                message_kind: LEASE_ISSUANCE.into(),
+                authorization_decision_identity: decision_identity,
+                binding_identity: decision.payload.binding_identity.clone(),
+                authority_id: decision.payload.authority_id.clone(),
+                attestation_identity: decision.payload.attestation_identity.clone(),
+                challenge_nonce_commitment: decision.payload.challenge_nonce_commitment.clone(),
+                work_unit_identity: decision.payload.work_unit_identity.clone(),
+                contract_identity: decision.payload.contract_identity.clone(),
+                semantic_scope_identity: decision.payload.semantic_scope_identity.clone(),
+                runner_principal: request.runner_principal.clone(),
+                broker_revision: 1,
+                lease_sequence: 1,
+                issued_at: decision.payload.issued_at.clone(),
+                expires_at: decision.payload.expires_at.clone(),
+            },
+        )?;
+        let lease_identity = message_identity(LEASE_ISSUANCE_DOMAIN_V1.as_bytes(), &lease)
+            .map_err(|_| String::from("decision peer lease identity failed"))?;
+        write_frame(stream, &lease)?;
+        let consume: LeaseConsumeRequest = read_frame(stream)?;
+        if consume.message_kind != LEASE_CONSUME
+            || consume.lease_identity != lease_identity
+            || consume.binding_identity != lease.payload.binding_identity
+            || consume.work_unit_identity != lease.payload.work_unit_identity
+        {
+            return Err(String::from("decision peer consume request is invalid"));
+        }
+        let consume_identity = message_identity(LEASE_CONSUME_DOMAIN_V1.as_bytes(), &consume)
+            .map_err(|_| String::from("decision peer consume identity failed"))?;
+        let response = sign_message(
+            key,
+            LEASE_CONSUME_RESPONSE_DOMAIN_V1.as_bytes(),
+            LeaseConsumeResponsePayload {
+                message_kind: LEASE_CONSUME_RESPONSE.into(),
+                consume_request_identity: consume_identity,
+                binding_identity: consume.binding_identity.clone(),
+                lease_identity,
+                challenge_nonce_commitment: consume.challenge_nonce_commitment.clone(),
+                work_unit_identity: consume.work_unit_identity.clone(),
+                crossing_transaction_id: consume.crossing_transaction_id.clone(),
+                crossing_transaction_identity: consume.crossing_transaction_identity.clone(),
+                state: LeaseConsumeState::Consumed,
+                broker_revision: 2,
+                consumed_at: decision.payload.issued_at.clone(),
+            },
+        )?;
+        write_frame(stream, &response)?;
+        eprintln!("ota-authority-systemd-decision-peer: bounded pressure lease_consumed_relayed");
+        Ok(())
     }
 
     fn read_frame<T: serde::de::DeserializeOwned>(stream: &mut impl Read) -> Result<T, String> {

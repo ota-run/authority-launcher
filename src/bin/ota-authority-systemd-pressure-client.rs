@@ -71,6 +71,7 @@ struct Cli {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ExpectedTerminal {
     AllowedDecision,
+    LeaseConsumedExecutionDisabled,
     DeniedDecision,
     ObservedDecisionOutcome,
     ProtocolRefusal,
@@ -156,29 +157,30 @@ fn validate_pressure_terminal(
     terminal: &LauncherTerminalFrameV1,
     expected: ExpectedTerminal,
 ) -> Result<(), String> {
-    let stage_matches = match (expected, terminal.stage) {
+    let stage_matches = matches!(
+        (expected, terminal.stage),
         (
             ExpectedTerminal::AllowedDecision,
             Some(LauncherTerminalStageV1::AuthorizationDecisionVerifiedBeforeLeaseBoundaryRemoved),
-        )
-        | (
+        ) | (
+            ExpectedTerminal::LeaseConsumedExecutionDisabled,
+            Some(LauncherTerminalStageV1::LeaseConsumedBeforeExecutionDisabledBoundaryRemoved),
+        ) | (
             ExpectedTerminal::DeniedDecision,
             Some(LauncherTerminalStageV1::AuthorityRefusedBoundaryRemoved),
-        )
-        | (
+        ) | (
             ExpectedTerminal::ProtocolRefusal,
             Some(LauncherTerminalStageV1::PreAuthorizationProtocolRefusedBoundaryRemoved),
-        ) => true,
-        (
+        ) | (
             ExpectedTerminal::ObservedDecisionOutcome,
             Some(
                 LauncherTerminalStageV1::AuthorizationDecisionVerifiedBeforeLeaseBoundaryRemoved
-                | LauncherTerminalStageV1::AuthorityRefusedBoundaryRemoved
-                | LauncherTerminalStageV1::PreAuthorizationProtocolRefusedBoundaryRemoved,
+                    | LauncherTerminalStageV1::LeaseConsumedBeforeExecutionDisabledBoundaryRemoved
+                    | LauncherTerminalStageV1::AuthorityRefusedBoundaryRemoved
+                    | LauncherTerminalStageV1::PreAuthorizationProtocolRefusedBoundaryRemoved,
             ),
-        ) => true,
-        _ => false,
-    };
+        )
+    );
     if terminal.outcome != LauncherTerminalOutcomeV1::Refused
         || terminal.exit_code != Some(2)
         || !stage_matches
