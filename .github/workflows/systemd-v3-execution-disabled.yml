@@ -363,7 +363,11 @@ jobs:
             sudo journalctl --no-pager --output=cat \
               --after-cursor "$cursor" \
               -u ota-authority-pressure-runner.service \
-              | tee "$EVIDENCE_DIR/$case_name.json" >/dev/null
+              | tee "$EVIDENCE_DIR/$case_name.client-journal.txt" >/dev/null
+            sed -n '/^{/,/^}$/p' \
+              "$EVIDENCE_DIR/$case_name.client-journal.txt" \
+              > "$EVIDENCE_DIR/$case_name.json"
+            test -s "$EVIDENCE_DIR/$case_name.json"
             case "$expected_terminal" in
               denied-decision)
                 expected_stage=authority_refused_boundary_removed
