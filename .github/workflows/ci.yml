@@ -57,9 +57,14 @@ jobs:
 
       - name: Verify exact Ota source identity
         env:
-          EXPECTED_OTA_REVISION: 787ac35f7d0195d2adae85e1113e26ce4a30acc2
-          OBSERVED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
-        run: test "$OBSERVED_OTA_REVISION" = "$EXPECTED_OTA_REVISION"
+          EXPECTED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_OTA_REVISION"
+          version_json=$(ota --version --json)
+          observed_commit=$(jq -er '.commit' <<<"$version_json")
+          jq -e '.source_build == true and .dirty == false' <<<"$version_json"
+          test "${EXPECTED_OTA_REVISION#"$observed_commit"}" != "$EXPECTED_OTA_REVISION"
 
       - name: Validate contract
         run: ota validate

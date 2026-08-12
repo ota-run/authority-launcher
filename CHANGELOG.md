@@ -26,6 +26,10 @@
 
 ## Unreleased
 
+- Derive ordinary CI and root-boundary source-identity assertions from the contract-selected setup
+  result instead of duplicating a historical Core revision. Both lanes still require a clean source
+  build and reconcile the installed binary's reported commit, while contract pin advances no longer
+  leave a contradictory workflow-owned pin behind.
 - Advance the protected systemd V3 path through execution-disabled signed authorization-decision
   admission. The installation manifest now binds the pressure broker executable and units; the
   launcher retains the protected broker peer, rechecks its manifest-bound live executable around
