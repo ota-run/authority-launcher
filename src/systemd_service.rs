@@ -335,6 +335,10 @@ fn execute_selected_boundary(
     let (completion, observed_exit_code) = match completion {
         Ok(completion) => completion,
         Err(error) => {
+            eprintln!(
+                "ota-authority-launcher: selected execution reconciliation refused reason={}",
+                prepared_child_error_reason(&error)
+            );
             return fail_selected_boundary(
                 config,
                 stream,
@@ -415,6 +419,16 @@ fn execute_selected_boundary(
         Some(finalization),
     )?;
     Ok(0)
+}
+
+fn prepared_child_error_reason(error: &PreparedChildError) -> &'static str {
+    match error {
+        PreparedChildError::ExecutionCompletionUnavailable => "completion_unavailable",
+        PreparedChildError::ExecutionCompletionMismatch => "completion_mismatch",
+        PreparedChildError::OutputBridgeUnavailable => "output_bridge_unavailable",
+        PreparedChildError::CleanupFailed => "child_reap_failed",
+        _ => "child_boundary_failed",
+    }
 }
 
 fn fail_selected_boundary(
