@@ -103,7 +103,11 @@ fn main() -> std::process::ExitCode {
         Ok(evidence) => match serde_json::to_string_pretty(&evidence) {
             Ok(encoded) => {
                 println!("{encoded}");
-                std::process::ExitCode::SUCCESS
+                if evidence.ok {
+                    std::process::ExitCode::SUCCESS
+                } else {
+                    std::process::ExitCode::FAILURE
+                }
             }
             Err(_) => std::process::ExitCode::FAILURE,
         },
@@ -148,9 +152,9 @@ fn run(cli: Cli) -> Result<PressureEvidence, String> {
         .write_all(frame.as_slice())
         .map_err(|_| String::from("the pressure request could not be sent"))?;
     let (output_frames, terminal) = read_session(&mut stream)?;
-    validate_pressure_terminal(&terminal, cli.expected_terminal)?;
+    let ok = validate_pressure_terminal(&terminal, cli.expected_terminal).is_ok();
     Ok(PressureEvidence {
-        ok: true,
+        ok,
         kind: "systemd_transient_scope_pressure",
         request_identity,
         output_frames,
