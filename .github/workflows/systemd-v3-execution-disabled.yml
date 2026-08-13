@@ -237,6 +237,7 @@ jobs:
           assert_terminal_clean() {
             local case_name=$1
             local selected=${2:-false}
+            local expected_execution_count=${3:-1}
             local slots scopes
             slots=$(sudo find /var/lib/ota/authority-launcher/active -mindepth 1 -maxdepth 1 -type f | wc -l)
             scopes=$(systemctl list-units 'ota-authority-invocation-*.scope' --all --no-legend --plain | wc -l)
@@ -245,7 +246,10 @@ jobs:
             test "$slots" -eq 0
             test "$scopes" -eq 0
             if test "$selected" = true; then
-              test "$(sudo cat "$PRESSURE_REPOSITORY/selected-work-executed")" = executed
+              test "$(sudo wc -l "$PRESSURE_REPOSITORY/selected-work-executed" \
+                | awk '{print $1}')" -eq "$expected_execution_count"
+              test "$(sudo grep -c '^executed$' \
+                "$PRESSURE_REPOSITORY/selected-work-executed")" -eq "$expected_execution_count"
               sudo test -d "$PRESSURE_REPOSITORY/.ota/receipts"
             else
               test ! -e "$PRESSURE_REPOSITORY/selected-work-executed"
@@ -567,7 +571,7 @@ jobs:
           fi
           capture_journal completion-crash-recovery "$case_cursor"
           test "$(sudo wc -l "$PRESSURE_REPOSITORY/selected-work-executed" | awk '{print $1}')" -eq 2
-          assert_terminal_clean completion-crash-recovery true
+          assert_terminal_clean completion-crash-recovery true 2
           test "$(sudo find /var/lib/ota/authority-launcher/active \
             -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 0
           sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
