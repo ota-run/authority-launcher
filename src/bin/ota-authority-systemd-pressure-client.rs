@@ -280,7 +280,7 @@ fn recover_finalization_session(
 
 #[cfg(target_os = "linux")]
 fn select_recoverable_archive(repository: &Path) -> Result<(PathBuf, Vec<u8>, String), String> {
-    let archive_dir = repository.join(".ota/receipts/archive");
+    let archive_dir = receipt_archive_dir(repository);
     let mut matches = Vec::new();
     for entry in std::fs::read_dir(&archive_dir)
         .map_err(|_| String::from("the receipt archive directory is unavailable"))?
@@ -556,7 +556,7 @@ fn attach_finalization_sidecar(
     context: &ArchiveContext<'_>,
     frame: &LauncherSignedExecutionFinalizationFrameV1,
 ) -> Result<PathBuf, String> {
-    let archive_dir = context.repository.join(".ota/receipts/archive");
+    let archive_dir = receipt_archive_dir(context.repository);
     let transaction_identity = &frame
         .signed_finalization
         .finalization
@@ -635,6 +635,11 @@ fn attach_finalization_sidecar(
         .map_err(|_| String::from("the launcher finalization persistence is invalid"))?;
     write_client_frame(stream, &persistence)?;
     Ok(sidecar_path)
+}
+
+#[cfg(target_os = "linux")]
+fn receipt_archive_dir(repository: &Path) -> PathBuf {
+    repository.join(".ota/receipts")
 }
 
 #[cfg(target_os = "linux")]
@@ -951,6 +956,15 @@ mod tests {
         sidecar.identity =
             launcher_finalization_archive_sidecar_v1_identity(&sidecar).expect("sidecar");
         sidecar
+    }
+
+    #[test]
+    fn receipt_archives_use_otas_canonical_receipt_directory() {
+        let repository = Path::new("/srv/ota-pressure");
+        assert_eq!(
+            receipt_archive_dir(repository),
+            repository.join(".ota/receipts")
+        );
     }
 
     #[test]
