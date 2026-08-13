@@ -40,7 +40,9 @@
   its protected mount namespace, inaccessible signing-key paths, explicit writable roots, and
   exact archive checks remain required. Every
   intermediate stage remains restart-readable, including reconnect before the client has received
-  finalization. Local regressions cover retained state and alias refusal;
+  finalization. Startup now promotes an exact execution-completion slot into the same durable
+  finalization intent before removing the active slot, so a launcher crash after selected work
+  cannot force a second work unit. Local regressions cover retained state and alias refusal;
   immutable PID 1 crash pressure and a production operator client remain required before shipment.
 
 - Enable the first bounded selected-execution path for `systemd_protected_launcher/v1`. Core keeps

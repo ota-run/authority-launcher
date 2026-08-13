@@ -47,18 +47,19 @@ use ota_authority_launcher::linux_observations::{
 };
 use ota_authority_protocol::{
     ATTESTATION_RESPONSE, AuthorizationDecision, LAUNCHER_TERMINAL, LauncherAttestationClaimsV3,
-    LauncherAttestationSigningRequestV1, LauncherExecutionFinalizationV1,
-    LauncherExecutionOutcomeV1, LauncherFinalizationArchivePersistenceV1,
-    LauncherFinalizationArchiveRequestV1, LauncherFinalizationArchiveResponseV1,
-    LauncherFinalizationArchiveSidecarV1, LauncherFinalizationArchiveSigningRequestV1,
-    LauncherFinalizationRecoveryRequestV1, LauncherFinalizationSigningRequestV1,
-    LauncherInvocationRequestV1, LauncherSignedExecutionFinalizationFrameV1,
-    LauncherTerminalFrameV1, LauncherTerminalOutcomeV1, LauncherTerminalPersistenceV1,
-    LauncherTerminalStageV1, LauncherWorkingDirectoryV1, LeaseConsumptionRelayEvidenceV1,
-    MAX_FRAME_BYTES, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1,
-    SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3, SystemdProtectedLauncherInstanceEvidenceV1,
-    decode_frame, encode_frame, launcher_attestation_claims_v3_identity,
-    launcher_attestation_signing_request_v1_identity, launcher_execution_finalization_v1_identity,
+    LauncherAttestationSigningRequestV1, LauncherExecutionCompletionV1,
+    LauncherExecutionFinalizationV1, LauncherExecutionOutcomeV1,
+    LauncherFinalizationArchivePersistenceV1, LauncherFinalizationArchiveRequestV1,
+    LauncherFinalizationArchiveResponseV1, LauncherFinalizationArchiveSidecarV1,
+    LauncherFinalizationArchiveSigningRequestV1, LauncherFinalizationRecoveryRequestV1,
+    LauncherFinalizationSigningRequestV1, LauncherInvocationRequestV1,
+    LauncherSignedExecutionFinalizationFrameV1, LauncherTerminalFrameV1, LauncherTerminalOutcomeV1,
+    LauncherTerminalPersistenceV1, LauncherTerminalStageV1, LauncherWorkingDirectoryV1,
+    LeaseConsumptionRelayEvidenceV1, MAX_FRAME_BYTES, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1,
+    SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1, SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3,
+    SystemdProtectedLauncherInstanceEvidenceV1, decode_frame, encode_frame,
+    launcher_attestation_claims_v3_identity, launcher_attestation_signing_request_v1_identity,
+    launcher_execution_finalization_v1_identity,
     launcher_finalization_archive_persistence_v1_identity,
     launcher_finalization_archive_request_v1_identity,
     launcher_finalization_archive_response_v1_identity,
@@ -464,8 +465,6 @@ fn execute_selected_boundary(
             SystemdServiceError::ScopeCleanupFailed,
         );
     }
-    let child_identity = boundary.child.record.identity.clone();
-    let scope_identity = boundary.scope.identity.clone();
     if boundary.active_slot.execution_completion() != Some(&completion) {
         return fail_selected_boundary(
             config,
@@ -475,10 +474,53 @@ fn execute_selected_boundary(
             SystemdServiceError::SelectedExecutionFailed,
         );
     }
+    let finalization = build_execution_finalization(
+        &boundary.active_slot,
+        completion.clone(),
+        observed_exit_code,
+    )?;
+    let mut finalization_journal = retain_finalization_intent(&boundary.active_slot, finalization)?;
+    eprintln!("ota-authority-launcher: portable finalization stage=intent_recorded");
+    boundary
+        .active_slot
+        .finalize()
+        .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
+    pressure_exit_after_finalization_intent_recorded()?;
+    let signed_finalization = sign_execution_finalization(
+        config,
+        installation,
+        &finalization_journal.journal().finalization,
+    )?;
+    finalization_journal
+        .record_signed_finalization(signed_finalization.clone())
+        .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
+    eprintln!("ota-authority-launcher: portable finalization stage=signed_recorded");
+    write_signed_finalization(stream, invocation_id, signed_finalization)?;
+    eprintln!("ota-authority-launcher: portable finalization stage=signed_sent");
+    complete_archive_attachment(stream, &mut finalization_journal, invocation_id, repository)?;
+    write_selected_terminal_and_finalize(stream, &mut finalization_journal)?;
+    Ok(0)
+}
+
+fn build_execution_finalization(
+    active_slot: &ActiveSlot,
+    completion: LauncherExecutionCompletionV1,
+    observed_exit_code: Option<i32>,
+) -> Result<LauncherExecutionFinalizationV1, SystemdServiceError> {
+    let child_identity = active_slot
+        .child()
+        .ok_or(SystemdServiceError::FinalizationUnavailable)?
+        .identity
+        .clone();
+    let scope_identity = active_slot
+        .scope()
+        .ok_or(SystemdServiceError::FinalizationUnavailable)?
+        .identity
+        .clone();
     let mut finalization = LauncherExecutionFinalizationV1 {
         schema_version: 1,
         identity: String::new(),
-        completion: completion.clone(),
+        completion,
         child_identity,
         scope_identity,
         observed_exit_code,
@@ -489,37 +531,38 @@ fn execute_selected_boundary(
     };
     finalization.identity = launcher_execution_finalization_v1_identity(&finalization)
         .map_err(|_| SystemdServiceError::SelectedExecutionFailed)?;
-    let principal_mapping_identity = boundary
-        .active_slot
-        .principal_mapping_identity()
-        .to_string();
-    let launcher_request_identity = boundary.active_slot.request_identity().to_string();
-    let working_directory = boundary.active_slot.working_directory().clone();
-    let mut finalization_journal = FinalizationJournal::begin(
+    Ok(finalization)
+}
+
+fn retain_finalization_intent(
+    active_slot: &ActiveSlot,
+    finalization: LauncherExecutionFinalizationV1,
+) -> Result<FinalizationJournal, SystemdServiceError> {
+    let principal_mapping_identity = active_slot.principal_mapping_identity();
+    if let Some(existing) = FinalizationJournal::load_for_principal(
         Path::new(FINALIZATION_DIRECTORY),
         0,
-        principal_mapping_identity.as_str(),
-        launcher_request_identity.as_str(),
-        working_directory,
-        finalization.clone(),
+        principal_mapping_identity,
     )
-    .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
-    eprintln!("ota-authority-launcher: portable finalization stage=intent_recorded");
-    boundary
-        .active_slot
-        .finalize()
-        .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
-    pressure_exit_after_finalization_intent_recorded()?;
-    let signed_finalization = sign_execution_finalization(config, installation, &finalization)?;
-    finalization_journal
-        .record_signed_finalization(signed_finalization.clone())
-        .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
-    eprintln!("ota-authority-launcher: portable finalization stage=signed_recorded");
-    write_signed_finalization(stream, invocation_id, signed_finalization)?;
-    eprintln!("ota-authority-launcher: portable finalization stage=signed_sent");
-    complete_archive_attachment(stream, &mut finalization_journal, invocation_id, repository)?;
-    write_selected_terminal_and_finalize(stream, &mut finalization_journal)?;
-    Ok(0)
+    .map_err(|_| SystemdServiceError::FinalizationUnavailable)?
+    {
+        if existing.journal().launcher_request_identity != active_slot.request_identity()
+            || existing.journal().working_directory != *active_slot.working_directory()
+            || existing.journal().finalization != finalization
+        {
+            return Err(SystemdServiceError::FinalizationUnavailable);
+        }
+        return Ok(existing);
+    }
+    FinalizationJournal::begin(
+        Path::new(FINALIZATION_DIRECTORY),
+        0,
+        principal_mapping_identity,
+        active_slot.request_identity(),
+        active_slot.working_directory().clone(),
+        finalization,
+    )
+    .map_err(|_| SystemdServiceError::FinalizationUnavailable)
 }
 
 fn prepared_child_error_reason(error: &PreparedChildError) -> &'static str {
@@ -1105,9 +1148,12 @@ fn pressure_exit_after_execution_completion_recorded() -> Result<(), SystemdServ
     )? {
         return Ok(());
     }
+    eprintln!(
+        "ota-authority-launcher: bounded pressure selected-execution crash stage=completion_recorded"
+    );
     // The exact Core completion is durable, but Core has not received its persistence
-    // acknowledgement. Restart recovery must clean this abandoned child and scope without
-    // resuming the completed work unit or turning the journal into a successful terminal.
+    // acknowledgement. Restart recovery must clean the exact child and scope, retain the same
+    // finalization intent, and resume attachment without executing another work unit.
     unsafe { libc::_exit(PRESSURE_EXIT_AFTER_EXECUTION_COMPLETION_CODE) }
 }
 
@@ -1270,13 +1316,30 @@ fn reconcile_active_slots(
     }
     let scope_manager =
         SystemdScopeManager::connect().map_err(|_| SystemdServiceError::ScopeCleanupFailed)?;
-    reconcile_loaded_slots(slots, &scope_manager, cleanup_timeout)
+    reconcile_loaded_slots_with_completion(slots, &scope_manager, cleanup_timeout, |slot| {
+        let Some(completion) = slot.execution_completion().cloned() else {
+            return Ok(());
+        };
+        let finalization =
+            build_execution_finalization(slot, completion.clone(), completion.exit_code)?;
+        retain_finalization_intent(slot, finalization).map(|_| ())
+    })
 }
 
+#[cfg(test)]
 fn reconcile_loaded_slots(
     slots: Vec<ActiveSlot>,
     scope_manager: &impl ScopeBoundary,
     cleanup_timeout: Duration,
+) -> Result<(), SystemdServiceError> {
+    reconcile_loaded_slots_with_completion(slots, scope_manager, cleanup_timeout, |_| Ok(()))
+}
+
+fn reconcile_loaded_slots_with_completion(
+    slots: Vec<ActiveSlot>,
+    scope_manager: &impl ScopeBoundary,
+    cleanup_timeout: Duration,
+    mut retain_completion: impl FnMut(&ActiveSlot) -> Result<(), SystemdServiceError>,
 ) -> Result<(), SystemdServiceError> {
     let mut failure = None;
     for slot in slots {
@@ -1292,6 +1355,10 @@ fn reconcile_loaded_slots(
                 Err(SystemdScopeError::ScopeAbsent) => {
                     match recorded_child_is_live_exact(child) {
                         Ok(false) => {
+                            if retain_completion(&slot).is_err() {
+                                failure = Some(SystemdServiceError::FinalizationUnavailable);
+                                continue;
+                            }
                             if slot.finalize().is_err() {
                                 failure = Some(SystemdServiceError::ChildCleanupFailed);
                             }
@@ -1324,6 +1391,10 @@ fn reconcile_loaded_slots(
         }
         if terminate_recorded_child(child, cleanup_timeout).is_err() {
             failure = Some(SystemdServiceError::ChildCleanupFailed);
+            continue;
+        }
+        if retain_completion(&slot).is_err() {
+            failure = Some(SystemdServiceError::FinalizationUnavailable);
             continue;
         }
         if slot.finalize().is_err() {

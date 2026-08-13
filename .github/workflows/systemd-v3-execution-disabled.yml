@@ -619,44 +619,35 @@ jobs:
           sudo test -f \
             /run/ota/authority-launcher-pressure-exit-after-execution-completion
           case_cursor=$(journal_cursor)
-          set +e
-          sudo systemctl start ota-authority-pressure-runner.service
-          completion_crash_status=$?
-          set -e
-          capture_journal completion-crash-first "$case_cursor"
-          if test "$completion_crash_status" -eq 0; then
-            echo 'post-completion crash injection unexpectedly completed' >&2
-            exit 1
-          fi
-          test "$(systemctl show ota-authority-launcher.service -p ExecMainStatus --value)" = 90
-          test "$(sudo wc -l "$PRESSURE_REPOSITORY/selected-work-executed" | awk '{print $1}')" -eq 1
-          completion_crash_slot=$(sudo find /var/lib/ota/authority-launcher/active \
-            -mindepth 1 -maxdepth 1 -type f -print -quit)
-          test -n "$completion_crash_slot"
-          sudo cp "$completion_crash_slot" \
-            "$EVIDENCE_DIR/completion-crash-first.active-slot.json"
-          sudo chown "$(id -u):$(id -g)" \
-            "$EVIDENCE_DIR/completion-crash-first.active-slot.json"
-          jq -e \
-            '.stage == "execution_completion_recorded"
-             and .lease_consumption.consume_response.payload.state == "consumed"
-             and .execution_completion.outcome == "completed"
-             and .execution_completion.exit_code == 0' \
-            "$EVIDENCE_DIR/completion-crash-first.active-slot.json"
-
-          sudo systemctl reset-failed
-          case_cursor=$(journal_cursor)
           if ! sudo systemctl start ota-authority-pressure-runner.service; then
             capture_journal completion-crash-recovery-start-failure "$case_cursor"
             exit 1
           fi
           capture_journal completion-crash-recovery "$case_cursor"
-          test "$(sudo wc -l "$PRESSURE_REPOSITORY/selected-work-executed" | awk '{print $1}')" -eq 2
-          assert_terminal_clean completion-crash-recovery true 2
-          assert_recorded_boundary_removed completion-crash-recovery \
-            "$EVIDENCE_DIR/completion-crash-first.active-slot.json"
-          test "$(sudo find /var/lib/ota/authority-launcher/active \
-            -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 0
+          grep -q 'bounded pressure selected-execution crash stage=completion_recorded' \
+            "$EVIDENCE_DIR/completion-crash-recovery.journal.txt"
+          test "$(sudo wc -l "$PRESSURE_REPOSITORY/selected-work-executed" | awk '{print $1}')" -eq 1
+          capture_client_json completion-crash-recovery "$case_cursor"
+          jq -e \
+            '.ok == true
+             and .terminal.stage == "selected_execution_completed_boundary_removed"
+             and .terminal.finalization.active_slot_removed == true
+             and .terminal.finalization.scope_removed == true
+             and .terminal.finalization.cgroup_empty_or_absent == true
+             and .terminal.finalization.child_reaped == true' \
+            "$EVIDENCE_DIR/completion-crash-recovery.json"
+          assert_terminal_clean completion-crash-recovery true
+          sudo sh -c \
+            'cd "$1" && /usr/lib/ota-authority/bin/ota receipt --history --json' \
+            sh "$PRESSURE_REPOSITORY" \
+            | tee "$EVIDENCE_DIR/completion-crash-recovery.receipt-history.json" >/dev/null
+          jq -e \
+            '.ok == true
+             and .summary.archive_count == 1
+             and .summary.invalid_archive_count == 0
+             and (.archives | length) == 1
+             and (.invalid_archives | length) == 0' \
+            "$EVIDENCE_DIR/completion-crash-recovery.receipt-history.json"
           sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
             "$PRESSURE_REPOSITORY/selected-work-executed"
           repository_content_manifest > "$EVIDENCE_DIR/completion-crash.repository.after.sha256"
