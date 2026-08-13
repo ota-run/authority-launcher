@@ -328,9 +328,9 @@ fn execute_selected_boundary(
                 boundary
                     .active_slot
                     .record_execution_completion(completion)
-                    .map_err(|_| PreparedChildError::ExecutionCompletionMismatch)?;
+                    .map_err(|_| PreparedChildError::ExecutionCompletionPersistenceFailed)?;
                 pressure_exit_after_execution_completion_recorded()
-                    .map_err(|_| PreparedChildError::ExecutionCompletionMismatch)
+                    .map_err(|_| PreparedChildError::ExecutionCompletionPersistenceFailed)
             });
     let (completion, observed_exit_code) = match completion {
         Ok(completion) => completion,
@@ -424,7 +424,9 @@ fn execute_selected_boundary(
 fn prepared_child_error_reason(error: &PreparedChildError) -> &'static str {
     match error {
         PreparedChildError::ExecutionCompletionUnavailable => "completion_unavailable",
-        PreparedChildError::ExecutionCompletionMismatch => "completion_mismatch",
+        PreparedChildError::ExecutionCompletionIdentityMismatch => "completion_identity_mismatch",
+        PreparedChildError::ExecutionCompletionPersistenceFailed => "completion_persistence_failed",
+        PreparedChildError::ExecutionCompletionExitMismatch => "completion_exit_mismatch",
         PreparedChildError::OutputBridgeUnavailable => "output_bridge_unavailable",
         PreparedChildError::CleanupFailed => "child_reap_failed",
         _ => "child_boundary_failed",

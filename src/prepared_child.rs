@@ -100,7 +100,11 @@ pub(crate) enum PreparedChildError {
     #[error("the protected Ota child execution completion is unavailable")]
     ExecutionCompletionUnavailable,
     #[error("the protected Ota child execution completion does not match the consumed lease")]
-    ExecutionCompletionMismatch,
+    ExecutionCompletionIdentityMismatch,
+    #[error("the protected Ota child execution completion could not be persisted")]
+    ExecutionCompletionPersistenceFailed,
+    #[error("the protected Ota child exit does not match its signed execution completion")]
+    ExecutionCompletionExitMismatch,
     #[error("the protected Ota child output bridge is unavailable")]
     OutputBridgeUnavailable,
 }
@@ -608,7 +612,7 @@ impl PreparedChild {
             || completion.pending_crossing_transaction_identity
                 != consumption.admission.crossing_transaction_identity
         {
-            return Err(PreparedChildError::ExecutionCompletionMismatch);
+            return Err(PreparedChildError::ExecutionCompletionIdentityMismatch);
         }
         persist_completion(completion.clone())?;
         let mut persistence = LauncherExecutionCompletionPersistenceV1 {
@@ -618,7 +622,7 @@ impl PreparedChild {
             completion_identity: completion.identity.clone(),
         };
         persistence.identity = launcher_execution_completion_persistence_v1_identity(&persistence)
-            .map_err(|_| PreparedChildError::ExecutionCompletionMismatch)?;
+            .map_err(|_| PreparedChildError::ExecutionCompletionIdentityMismatch)?;
         write_json_frame_blocking(&mut self.launcher_session, &persistence)
             .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
 
@@ -627,7 +631,7 @@ impl PreparedChild {
             return Err(PreparedChildError::OutputBridgeUnavailable);
         }
         if observed_exit_code != completion.exit_code {
-            return Err(PreparedChildError::ExecutionCompletionMismatch);
+            return Err(PreparedChildError::ExecutionCompletionExitMismatch);
         }
         Ok((completion, observed_exit_code))
     }
