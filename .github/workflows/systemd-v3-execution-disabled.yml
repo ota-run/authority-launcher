@@ -549,12 +549,18 @@ jobs:
           set_broker_scenario allowed
           sudo install -o root -g root -m 0600 /dev/null \
             /run/ota/authority-launcher-pressure-exit-after-execution-completion
+          sudo test -f \
+            /run/ota/authority-launcher-pressure-exit-after-execution-completion
           case_cursor=$(journal_cursor)
-          if sudo systemctl start ota-authority-pressure-runner.service; then
+          set +e
+          sudo systemctl start ota-authority-pressure-runner.service
+          completion_crash_status=$?
+          set -e
+          capture_journal completion-crash-first "$case_cursor"
+          if test "$completion_crash_status" -eq 0; then
             echo 'post-completion crash injection unexpectedly completed' >&2
             exit 1
           fi
-          capture_journal completion-crash-first "$case_cursor"
           test "$(systemctl show ota-authority-launcher.service -p ExecMainStatus --value)" = 90
           test "$(sudo wc -l "$PRESSURE_REPOSITORY/selected-work-executed" | awk '{print $1}')" -eq 1
           completion_crash_slot=$(sudo find /var/lib/ota/authority-launcher/active \
