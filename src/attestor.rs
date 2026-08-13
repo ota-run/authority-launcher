@@ -36,10 +36,21 @@ use ed25519_dalek::{Signer, SigningKey};
 use ota_authority_protocol::{
     ATTESTATION_RESPONSE_DOMAIN_V3, LauncherAttestationPayloadV3,
     LauncherAttestationProducerBindingV1, LauncherAttestationSigningRequestV1,
-    LauncherAttestationSigningResponseV1, SignedLauncherAttestationV3, domain_separated,
+    LauncherAttestationSigningResponseV1, LauncherFinalizationArchiveSigningRequestV1,
+    LauncherFinalizationArchiveSigningResponseV1, LauncherFinalizationSigningRequestV1,
+    LauncherFinalizationSigningResponseV1, SignedLauncherAttestationV3,
+    SignedLauncherExecutionFinalizationV1, SignedLauncherFinalizationArchiveV1, domain_separated,
     launcher_attestation_claims_v3, launcher_attestation_claims_v3_identity,
     launcher_attestation_producer_binding_v1_identity,
-    launcher_attestation_signing_response_v1_identity, sha256_identity,
+    launcher_attestation_signing_response_v1_identity,
+    launcher_execution_finalization_signature_bytes_v1,
+    launcher_finalization_archive_signature_bytes_v1,
+    launcher_finalization_archive_signing_request_v1_identity,
+    launcher_finalization_archive_signing_response_v1_identity,
+    launcher_finalization_signing_request_v1_identity,
+    launcher_finalization_signing_response_v1_identity, sha256_identity,
+    signed_launcher_execution_finalization_v1_identity,
+    signed_launcher_finalization_archive_v1_identity,
     validate_launcher_attestation_producer_binding_v1,
     validate_launcher_attestation_signing_request_v1,
 };
@@ -93,6 +104,24 @@ struct PersistedIssuanceV1 {
     request_identity: String,
     claims_identity: String,
     request: LauncherAttestationSigningRequestV1,
+    response_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PersistedFinalizationIssuanceV1 {
+    schema_version: u32,
+    request_identity: String,
+    request: LauncherFinalizationSigningRequestV1,
+    response_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PersistedFinalizationArchiveIssuanceV1 {
+    schema_version: u32,
+    request_identity: String,
+    request: LauncherFinalizationArchiveSigningRequestV1,
     response_bytes: Vec<u8>,
 }
 
@@ -341,6 +370,289 @@ impl AttestationIssuer {
             .map_err(|_| AttestorError::StateUnavailable)?;
         Ok(response_bytes)
     }
+
+    fn issue_finalization(
+        &self,
+        request: &LauncherFinalizationSigningRequestV1,
+        now: OffsetDateTime,
+    ) -> Result<LauncherFinalizationSigningResponseV1, AttestorError> {
+        if launcher_finalization_signing_request_v1_identity(request)
+            .map_err(|_| AttestorError::InvalidRequest)?
+            != request.request_identity
+            || request.producer_binding_identity != self.binding.identity
+            || request.launcher_service_binding_identity
+                != self.binding.launcher_service_binding_identity
+            || request.launcher_configuration_identity
+                != self.binding.launcher_configuration_identity
+            || request.launcher_executable_identity != self.binding.launcher_executable_identity
+            || request.launcher_profile_identity != self.binding.launcher_profile_identity
+        {
+            return Err(AttestorError::InvalidRequest);
+        }
+        let not_before = parse_timestamp(&self.binding.signing_key_not_before)?;
+        let not_after = parse_timestamp(&self.binding.signing_key_not_after)?;
+        let now = now
+            .replace_nanosecond(0)
+            .map_err(|_| AttestorError::InvalidFreshness)?;
+        if now < not_before || now >= not_after {
+            return Err(AttestorError::InvalidFreshness);
+        }
+        let issued_at = now
+            .format(&Rfc3339)
+            .map_err(|_| AttestorError::InvalidFreshness)?;
+        let signature_bytes = launcher_execution_finalization_signature_bytes_v1(
+            &request.finalization,
+            &request.producer_binding_identity,
+            &issued_at,
+        )
+        .map_err(|_| AttestorError::InvalidRequest)?;
+        let signature = self.signing_key.sign(&signature_bytes);
+        let mut signed = SignedLauncherExecutionFinalizationV1 {
+            schema_version: 1,
+            identity: String::new(),
+            finalization: request.finalization.clone(),
+            producer_binding_identity: request.producer_binding_identity.clone(),
+            issued_at,
+            key_id: self.binding.signing_key_id.clone(),
+            algorithm: String::from("ed25519"),
+            signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        };
+        signed.identity = signed_launcher_execution_finalization_v1_identity(&signed)
+            .map_err(|_| AttestorError::InvalidRequest)?;
+        let mut response = LauncherFinalizationSigningResponseV1 {
+            schema_version: 1,
+            message_kind: ota_authority_protocol::LAUNCHER_FINALIZATION_SIGNING_RESPONSE.into(),
+            request_identity: request.request_identity.clone(),
+            signed_finalization: signed,
+            response_identity: String::new(),
+        };
+        response.response_identity = launcher_finalization_signing_response_v1_identity(&response)
+            .map_err(|_| AttestorError::InvalidRequest)?;
+        Ok(response)
+    }
+
+    fn issue_finalization_durable<F>(
+        &self,
+        request: &LauncherFinalizationSigningRequestV1,
+        now: OffsetDateTime,
+        mut revalidate_peer: F,
+    ) -> Result<Vec<u8>, AttestorError>
+    where
+        F: FnMut() -> Result<(), AttestorError>,
+    {
+        let directory = Path::new(&self.binding.issuance_state_directory);
+        verify_protected_directory(directory)?;
+        let lock_path = directory.join("issuance.lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .map_err(|_| AttestorError::StateUnavailable)?;
+        verify_open_state_file(&lock)?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(AttestorError::StateUnavailable);
+        }
+        let suffix = request
+            .request_identity
+            .strip_prefix("sha256:")
+            .ok_or(AttestorError::InvalidRequest)?;
+        let state_path = directory.join(format!("finalization-{suffix}.json"));
+        if state_path.exists() {
+            let state_file = open_protected_regular_file(&state_path, 0)
+                .map_err(|_| AttestorError::StateUnavailable)?;
+            let persisted: PersistedFinalizationIssuanceV1 =
+                serde_json::from_reader(BufReader::new(state_file))
+                    .map_err(|_| AttestorError::StateUnavailable)?;
+            let response: LauncherFinalizationSigningResponseV1 =
+                serde_json::from_slice(&persisted.response_bytes)
+                    .map_err(|_| AttestorError::StateUnavailable)?;
+            if persisted.schema_version != 1
+                || persisted.request_identity != request.request_identity
+                || persisted.request != *request
+                || launcher_finalization_signing_response_v1_identity(&response)
+                    .ok()
+                    .as_deref()
+                    != Some(response.response_identity.as_str())
+            {
+                return Err(AttestorError::StateUnavailable);
+            }
+            revalidate_peer()?;
+            return Ok(persisted.response_bytes);
+        }
+        revalidate_peer()?;
+        let response = self.issue_finalization(request, now)?;
+        let response_bytes =
+            serde_jcs::to_vec(&response).map_err(|_| AttestorError::StateUnavailable)?;
+        let persisted = PersistedFinalizationIssuanceV1 {
+            schema_version: 1,
+            request_identity: request.request_identity.clone(),
+            request: request.clone(),
+            response_bytes: response_bytes.clone(),
+        };
+        let bytes = serde_jcs::to_vec(&persisted).map_err(|_| AttestorError::StateUnavailable)?;
+        let temporary_path =
+            directory.join(format!(".finalization-{suffix}.{}.tmp", std::process::id()));
+        let mut temporary = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&temporary_path)
+            .map_err(|_| AttestorError::StateUnavailable)?;
+        temporary
+            .write_all(&bytes)
+            .and_then(|()| temporary.sync_all())
+            .map_err(|_| AttestorError::StateUnavailable)?;
+        std::fs::rename(&temporary_path, &state_path)
+            .map_err(|_| AttestorError::StateUnavailable)?;
+        File::open(directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| AttestorError::StateUnavailable)?;
+        Ok(response_bytes)
+    }
+
+    fn issue_finalization_archive(
+        &self,
+        request: &LauncherFinalizationArchiveSigningRequestV1,
+        now: OffsetDateTime,
+    ) -> Result<LauncherFinalizationArchiveSigningResponseV1, AttestorError> {
+        if launcher_finalization_archive_signing_request_v1_identity(request)
+            .map_err(|_| AttestorError::InvalidRequest)?
+            != request.request_identity
+            || request.producer_binding_identity != self.binding.identity
+        {
+            return Err(AttestorError::InvalidRequest);
+        }
+        let not_before = parse_timestamp(&self.binding.signing_key_not_before)?;
+        let not_after = parse_timestamp(&self.binding.signing_key_not_after)?;
+        let now = now
+            .replace_nanosecond(0)
+            .map_err(|_| AttestorError::InvalidFreshness)?;
+        if now < not_before || now >= not_after {
+            return Err(AttestorError::InvalidFreshness);
+        }
+        let issued_at = now
+            .format(&Rfc3339)
+            .map_err(|_| AttestorError::InvalidFreshness)?;
+        let mut signed_archive = SignedLauncherFinalizationArchiveV1 {
+            schema_version: 1,
+            identity: String::new(),
+            signed_finalization_identity: request.signed_finalization.identity.clone(),
+            receipt_archive_identity: request.receipt_archive_identity.clone(),
+            crossing_transaction_identity: request.crossing_transaction_identity.clone(),
+            producer_binding_identity: request.producer_binding_identity.clone(),
+            issued_at,
+            key_id: self.binding.signing_key_id.clone(),
+            algorithm: String::from("ed25519"),
+            signature: String::new(),
+        };
+        let signature_bytes = launcher_finalization_archive_signature_bytes_v1(&signed_archive)
+            .map_err(|_| AttestorError::InvalidRequest)?;
+        signed_archive.signature =
+            URL_SAFE_NO_PAD.encode(self.signing_key.sign(&signature_bytes).to_bytes());
+        signed_archive.identity = signed_launcher_finalization_archive_v1_identity(&signed_archive)
+            .map_err(|_| AttestorError::InvalidRequest)?;
+        let mut response = LauncherFinalizationArchiveSigningResponseV1 {
+            schema_version: 1,
+            message_kind: ota_authority_protocol::LAUNCHER_FINALIZATION_ARCHIVE_SIGNING_RESPONSE
+                .into(),
+            request_identity: request.request_identity.clone(),
+            signed_archive,
+            response_identity: String::new(),
+        };
+        response.response_identity =
+            launcher_finalization_archive_signing_response_v1_identity(&response)
+                .map_err(|_| AttestorError::InvalidRequest)?;
+        Ok(response)
+    }
+
+    fn issue_finalization_archive_durable<F>(
+        &self,
+        request: &LauncherFinalizationArchiveSigningRequestV1,
+        now: OffsetDateTime,
+        mut revalidate_peer: F,
+    ) -> Result<Vec<u8>, AttestorError>
+    where
+        F: FnMut() -> Result<(), AttestorError>,
+    {
+        let directory = Path::new(&self.binding.issuance_state_directory);
+        verify_protected_directory(directory)?;
+        let lock_path = directory.join("issuance.lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .map_err(|_| AttestorError::StateUnavailable)?;
+        verify_open_state_file(&lock)?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(AttestorError::StateUnavailable);
+        }
+        let suffix = request
+            .request_identity
+            .strip_prefix("sha256:")
+            .ok_or(AttestorError::InvalidRequest)?;
+        let state_path = directory.join(format!("finalization-archive-{suffix}.json"));
+        if state_path.exists() {
+            let state_file = open_protected_regular_file(&state_path, 0)
+                .map_err(|_| AttestorError::StateUnavailable)?;
+            let persisted: PersistedFinalizationArchiveIssuanceV1 =
+                serde_json::from_reader(BufReader::new(state_file))
+                    .map_err(|_| AttestorError::StateUnavailable)?;
+            let response: LauncherFinalizationArchiveSigningResponseV1 =
+                serde_json::from_slice(&persisted.response_bytes)
+                    .map_err(|_| AttestorError::StateUnavailable)?;
+            if persisted.schema_version != 1
+                || persisted.request_identity != request.request_identity
+                || persisted.request != *request
+                || launcher_finalization_archive_signing_response_v1_identity(&response)
+                    .ok()
+                    .as_deref()
+                    != Some(response.response_identity.as_str())
+            {
+                return Err(AttestorError::StateUnavailable);
+            }
+            revalidate_peer()?;
+            return Ok(persisted.response_bytes);
+        }
+        revalidate_peer()?;
+        let response = self.issue_finalization_archive(request, now)?;
+        let response_bytes =
+            serde_jcs::to_vec(&response).map_err(|_| AttestorError::StateUnavailable)?;
+        let persisted = PersistedFinalizationArchiveIssuanceV1 {
+            schema_version: 1,
+            request_identity: request.request_identity.clone(),
+            request: request.clone(),
+            response_bytes: response_bytes.clone(),
+        };
+        let bytes = serde_jcs::to_vec(&persisted).map_err(|_| AttestorError::StateUnavailable)?;
+        let temporary_path = directory.join(format!(
+            ".finalization-archive-{suffix}.{}.tmp",
+            std::process::id()
+        ));
+        let mut temporary = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&temporary_path)
+            .map_err(|_| AttestorError::StateUnavailable)?;
+        temporary
+            .write_all(&bytes)
+            .and_then(|()| temporary.sync_all())
+            .map_err(|_| AttestorError::StateUnavailable)?;
+        std::fs::rename(&temporary_path, &state_path)
+            .map_err(|_| AttestorError::StateUnavailable)?;
+        File::open(directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| AttestorError::StateUnavailable)?;
+        Ok(response_bytes)
+    }
 }
 
 fn parse_timestamp(value: &str) -> Result<OffsetDateTime, AttestorError> {
@@ -511,10 +823,15 @@ fn serve_seqpacket_once(issuer: &AttestationIssuer) -> Result<(), AttestorError>
         "request_packet",
         receive_packet(&connection, issuer.binding.maximum_request_bytes),
     )?;
-    let request: LauncherAttestationSigningRequestV1 =
-        serde_json::from_slice(&request_bytes).map_err(|_| AttestorError::InvalidRequest)?;
-    validate_launcher_attestation_signing_request_v1(&request)
-        .map_err(|_| AttestorError::InvalidRequest)?;
+    let request_kind = serde_json::from_slice::<serde_json::Value>(&request_bytes)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message_kind")
+                .and_then(|kind| kind.as_str())
+                .map(str::to_owned)
+        })
+        .ok_or(AttestorError::InvalidRequest)?;
     pressure_attestor_stage(
         "queued_packet_before_issue",
         reject_queued_packet(&connection),
@@ -524,12 +841,46 @@ fn serve_seqpacket_once(issuer: &AttestationIssuer) -> Result<(), AttestorError>
         revalidate_peer(&connection, &peer, &issuer.binding),
     )?;
     pressure_attestor_stage("queued_packet_at_issue", reject_queued_packet(&connection))?;
-    let response = pressure_attestor_stage(
-        "durable_issue",
-        issuer.issue_durable(&request, OffsetDateTime::now_utc(), || {
-            revalidate_peer(&connection, &peer, &issuer.binding)
-        }),
-    )?;
+    let response = match request_kind.as_str() {
+        ota_authority_protocol::LAUNCHER_ATTESTATION_SIGNING_REQUEST => {
+            let request: LauncherAttestationSigningRequestV1 =
+                serde_json::from_slice(&request_bytes)
+                    .map_err(|_| AttestorError::InvalidRequest)?;
+            validate_launcher_attestation_signing_request_v1(&request)
+                .map_err(|_| AttestorError::InvalidRequest)?;
+            pressure_attestor_stage(
+                "durable_issue",
+                issuer.issue_durable(&request, OffsetDateTime::now_utc(), || {
+                    revalidate_peer(&connection, &peer, &issuer.binding)
+                }),
+            )?
+        }
+        ota_authority_protocol::LAUNCHER_FINALIZATION_SIGNING_REQUEST => {
+            let request: LauncherFinalizationSigningRequestV1 =
+                serde_json::from_slice(&request_bytes)
+                    .map_err(|_| AttestorError::InvalidRequest)?;
+            pressure_attestor_stage(
+                "durable_finalization_issue",
+                issuer.issue_finalization_durable(&request, OffsetDateTime::now_utc(), || {
+                    revalidate_peer(&connection, &peer, &issuer.binding)
+                }),
+            )?
+        }
+        ota_authority_protocol::LAUNCHER_FINALIZATION_ARCHIVE_SIGNING_REQUEST => {
+            let request: LauncherFinalizationArchiveSigningRequestV1 =
+                serde_json::from_slice(&request_bytes)
+                    .map_err(|_| AttestorError::InvalidRequest)?;
+            pressure_attestor_stage(
+                "durable_finalization_archive_issue",
+                issuer.issue_finalization_archive_durable(
+                    &request,
+                    OffsetDateTime::now_utc(),
+                    || revalidate_peer(&connection, &peer, &issuer.binding),
+                ),
+            )?
+        }
+        _ => return Err(AttestorError::InvalidRequest),
+    };
     pressure_attestor_stage(
         "peer_before_response",
         revalidate_peer(&connection, &peer, &issuer.binding),
@@ -1051,6 +1402,7 @@ mod tests {
     use ota_authority_protocol::{
         ATTESTATION_RESPONSE, BrokerChallenge, CHALLENGE_REQUEST, LauncherAttestationClaimsV3,
         LauncherAttestationProducerBindingV1, LauncherAttestationSigningRequestV1,
+        LauncherExecutionCompletionV1, LauncherExecutionFinalizationV1, LauncherExecutionOutcomeV1,
         LauncherPrincipalMappingV1, OtaProcessPostureV1, PROTOCOL_VERSION_V1,
         RuntimeBoundaryObservationState, SYSTEMD_ATTESTOR_SERVICE_UNIT_V1,
         SYSTEMD_ATTESTOR_SOCKET_PATH_V1, SYSTEMD_LAUNCHER_SERVICE_UNIT_V1,
@@ -1059,10 +1411,12 @@ mod tests {
         SystemdProtectedLauncherInstanceEvidenceV1, SystemdProtectedLauncherInstanceEvidenceV2,
         UnixPrincipalIdentity, domain_separated, launcher_attestation_claims_v3,
         launcher_attestation_claims_v3_identity, launcher_attestation_producer_binding_v1_identity,
-        launcher_attestation_signing_request_v1_identity, launcher_principal_mapping_identity,
-        ota_process_posture_identity, sha256_identity, systemd_job_principal_profile_identity,
-        systemd_job_principal_profile_v2, systemd_launcher_profile_identity,
-        systemd_launcher_profile_v3, systemd_protected_launcher_instance_v2_identity,
+        launcher_attestation_signing_request_v1_identity,
+        launcher_execution_completion_v1_identity, launcher_execution_finalization_v1_identity,
+        launcher_principal_mapping_identity, ota_process_posture_identity, sha256_identity,
+        systemd_job_principal_profile_identity, systemd_job_principal_profile_v2,
+        systemd_launcher_profile_identity, systemd_launcher_profile_v3,
+        systemd_protected_launcher_instance_v2_identity,
         systemd_protected_launcher_instance_v3_foundation_identity,
     };
     #[test]
@@ -1223,6 +1577,116 @@ mod tests {
             require_peer_close(&receiver),
             Err(AttestorError::TransportUnavailable)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn producer_durably_signs_one_exact_finalization_archive_association() {
+        let state = tempfile::tempdir_in("/root").expect("protected temporary state");
+        std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("state permissions");
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let mut binding = producer_binding(state.path(), &signing_key);
+        binding.identity = launcher_attestation_producer_binding_v1_identity(&binding)
+            .expect("producer binding identity");
+        let issuer = AttestationIssuer::new(binding.clone(), signing_key.clone()).expect("issuer");
+        let mut completion = LauncherExecutionCompletionV1 {
+            schema_version: 1,
+            identity: String::new(),
+            message_kind: ota_authority_protocol::LAUNCHER_EXECUTION_COMPLETION.into(),
+            invocation_id: String::from("invocation-0123456789abcdef0123456789abcdef"),
+            lease_consumption_admission_identity: identity('1'),
+            work_unit_identity: identity('2'),
+            crossing_transaction_id: String::from("transaction-1"),
+            pending_crossing_transaction_identity: identity('3'),
+            crossing_transaction_identity: identity('4'),
+            outcome: LauncherExecutionOutcomeV1::Completed,
+            exit_code: Some(0),
+            receipt_status: String::from("passed"),
+        };
+        completion.identity =
+            launcher_execution_completion_v1_identity(&completion).expect("completion identity");
+        let mut finalization = LauncherExecutionFinalizationV1 {
+            schema_version: 1,
+            identity: String::new(),
+            completion,
+            child_identity: identity('5'),
+            scope_identity: identity('6'),
+            observed_exit_code: Some(0),
+            child_reaped: true,
+            scope_removed: true,
+            cgroup_empty_or_absent: true,
+            active_slot_removed: true,
+        };
+        finalization.identity =
+            launcher_execution_finalization_v1_identity(&finalization).expect("finalization");
+        let now = OffsetDateTime::parse("2026-08-10T12:00:00Z", &Rfc3339).expect("fixed test time");
+        let mut finalization_request = LauncherFinalizationSigningRequestV1 {
+            schema_version: 1,
+            message_kind: ota_authority_protocol::LAUNCHER_FINALIZATION_SIGNING_REQUEST.into(),
+            request_identity: String::new(),
+            finalization,
+            launcher_service_binding_identity: binding.launcher_service_binding_identity.clone(),
+            launcher_configuration_identity: binding.launcher_configuration_identity.clone(),
+            launcher_executable_identity: binding.launcher_executable_identity.clone(),
+            launcher_profile_identity: binding.launcher_profile_identity.clone(),
+            producer_binding_identity: binding.identity.clone(),
+        };
+        finalization_request.request_identity =
+            launcher_finalization_signing_request_v1_identity(&finalization_request)
+                .expect("finalization request");
+        let signed_finalization: LauncherFinalizationSigningResponseV1 = serde_json::from_slice(
+            &issuer
+                .issue_finalization_durable(&finalization_request, now, || Ok(()))
+                .expect("signed finalization"),
+        )
+        .expect("finalization response");
+        let mut request = LauncherFinalizationArchiveSigningRequestV1 {
+            schema_version: 1,
+            message_kind: ota_authority_protocol::LAUNCHER_FINALIZATION_ARCHIVE_SIGNING_REQUEST
+                .into(),
+            request_identity: String::new(),
+            signed_finalization: signed_finalization.signed_finalization,
+            receipt_archive_identity: identity('8'),
+            crossing_transaction_identity: identity('4'),
+            producer_binding_identity: binding.identity,
+        };
+        request.request_identity =
+            launcher_finalization_archive_signing_request_v1_identity(&request)
+                .expect("archive request");
+        let first = issuer
+            .issue_finalization_archive_durable(&request, now, || Ok(()))
+            .expect("first exact archive signature");
+        let replay = issuer
+            .issue_finalization_archive_durable(&request, now + time::Duration::seconds(10), || {
+                Ok(())
+            })
+            .expect("idempotent exact archive signature");
+        assert_eq!(first, replay);
+        let response: LauncherFinalizationArchiveSigningResponseV1 =
+            serde_json::from_slice(&first).expect("archive response");
+        assert_eq!(
+            response.signed_archive.receipt_archive_identity,
+            request.receipt_archive_identity
+        );
+        assert_eq!(
+            response.signed_archive.crossing_transaction_identity,
+            request.crossing_transaction_identity
+        );
+        let signature = Signature::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(&response.signed_archive.signature)
+                .expect("signature encoding"),
+        )
+        .expect("signature");
+        signing_key
+            .verifying_key()
+            .verify(
+                &launcher_finalization_archive_signature_bytes_v1(&response.signed_archive)
+                    .expect("signed bytes"),
+                &signature,
+            )
+            .expect("archive signature verifies");
     }
 
     #[cfg(target_os = "linux")]

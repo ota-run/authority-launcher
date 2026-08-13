@@ -278,8 +278,11 @@ uncertain outcome retains the slot and fails closed.
 This path permits selected execution only after signed V3 admission and one bounded consumed
 lease. The selected Ota command creates its ordinary transaction-bound crossing receipt/archive;
 launcher terminal evidence separately binds Core's completion to exact child, scope, cgroup, and
-slot cleanup. Portable archive reconciliation of that post-process launcher finalization remains a
-separate open V11.7 boundary. Only
+slot cleanup. The current candidate persists a protected finalization journal before deleting the
+active slot, asks the producer to sign the cleanup record and a separate exact archive attachment,
+and removes that journal only after the client durably acknowledges the sidecar. This is locally
+tested candidate code; immutable PID 1 crash pressure and a production operator client remain open
+before Ota receipt history can require the attachment. Only
 `ota-authority-attestor` receives the systemd-delivered
 signing credential; the launcher retains public verification truth only. Missing, malformed,
 oversized, self-inconsistent, or substituted posture, continuation, challenge, attestation, or
@@ -287,8 +290,8 @@ authorization decision/admission fails closed and enters the same exact cleanup 
 and selected-execution paths have passed immutable Linux/x64 PID 1 systemd pressure in
 [run 31664495937](https://github.com/ota-run/authority-launcher/actions/runs/31664495937),
 including completed, failed, interrupted, replay-refused, and crash-recovered execution. The run
-does not establish provider-attested separation, and portable Ota archives still do not embed the
-launcher-authored post-process finalization.
+does not establish provider-attested separation or the newer portable launcher-finalization
+attachment candidate.
 
 The feature-gated `ota-authority-systemd-pressure-client` is the unprivileged side of that positive
 kernel proof. It connects only to `/run/ota/authority-launcher.sock`, submits one bounded

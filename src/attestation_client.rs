@@ -33,10 +33,18 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use ota_authority_protocol::{
     ATTESTATION_RESPONSE_DOMAIN_V3, LauncherAttestationProducerBindingV1,
-    LauncherAttestationSigningRequestV1, LauncherAttestationSigningResponseV1, domain_separated,
+    LauncherAttestationSigningRequestV1, LauncherAttestationSigningResponseV1,
+    LauncherFinalizationArchiveSigningRequestV1, LauncherFinalizationArchiveSigningResponseV1,
+    LauncherFinalizationSigningRequestV1, LauncherFinalizationSigningResponseV1, domain_separated,
     launcher_attestation_claims_v3, launcher_attestation_claims_v3_identity,
     launcher_attestation_producer_binding_v1_identity,
-    launcher_attestation_signing_response_v1_identity, sha256_identity,
+    launcher_attestation_signing_response_v1_identity,
+    launcher_execution_finalization_signature_bytes_v1,
+    launcher_finalization_archive_signature_bytes_v1,
+    launcher_finalization_archive_signing_request_v1_identity,
+    launcher_finalization_archive_signing_response_v1_identity,
+    launcher_finalization_signing_request_v1_identity,
+    launcher_finalization_signing_response_v1_identity, sha256_identity,
     validate_launcher_attestation_producer_binding_v1,
     validate_launcher_attestation_signing_request_v1,
     validate_launcher_attestation_signing_response_v1,
@@ -127,6 +135,112 @@ pub fn request_attestation(
     if unsafe { libc::shutdown(connection.as_raw_fd(), libc::SHUT_RDWR) } != 0 {
         return Err(AttestationClientError::TransportUnavailable);
     }
+    Ok(response)
+}
+
+pub fn request_finalization(
+    binding: &LauncherAttestationProducerBindingV1,
+    request: &LauncherFinalizationSigningRequestV1,
+) -> Result<LauncherFinalizationSigningResponseV1, AttestationClientError> {
+    if launcher_finalization_signing_request_v1_identity(request)
+        .map_err(|_| AttestationClientError::InvalidResponse)?
+        != request.request_identity
+        || request.producer_binding_identity != binding.identity
+    {
+        return Err(AttestationClientError::InvalidResponse);
+    }
+    let connection = connect_seqpacket(binding)?;
+    let request_bytes =
+        serde_jcs::to_vec(request).map_err(|_| AttestationClientError::InvalidResponse)?;
+    send_packet(&connection, &request_bytes)?;
+    let response_bytes = receive_packet(&connection, binding.maximum_request_bytes)?;
+    let producer = observe_producer(binding)?;
+    revalidate_producer(&producer, binding)?;
+    reject_queued_packet(&connection)?;
+    let response: LauncherFinalizationSigningResponseV1 =
+        serde_json::from_slice(&response_bytes)
+            .map_err(|_| AttestationClientError::InvalidResponse)?;
+    if serde_jcs::to_vec(&response).map_err(|_| AttestationClientError::InvalidResponse)?
+        != response_bytes
+        || launcher_finalization_signing_response_v1_identity(&response)
+            .map_err(|_| AttestationClientError::InvalidResponse)?
+            != response.response_identity
+        || response.request_identity != request.request_identity
+        || response.signed_finalization.finalization != request.finalization
+        || response.signed_finalization.producer_binding_identity != binding.identity
+        || response.signed_finalization.key_id != binding.signing_key_id
+        || response.signed_finalization.algorithm != "ed25519"
+    {
+        return Err(AttestationClientError::InvalidResponse);
+    }
+    let signature = URL_SAFE_NO_PAD
+        .decode(&response.signed_finalization.signature)
+        .ok()
+        .and_then(|bytes| Signature::from_slice(&bytes).ok())
+        .ok_or(AttestationClientError::InvalidResponse)?;
+    let signed_bytes = launcher_execution_finalization_signature_bytes_v1(
+        &response.signed_finalization.finalization,
+        &response.signed_finalization.producer_binding_identity,
+        &response.signed_finalization.issued_at,
+    )
+    .map_err(|_| AttestationClientError::InvalidResponse)?;
+    decode_verifying_key(binding)?
+        .verify(&signed_bytes, &signature)
+        .map_err(|_| AttestationClientError::InvalidResponse)?;
+    revalidate_producer(&producer, binding)?;
+    Ok(response)
+}
+
+pub fn request_finalization_archive(
+    binding: &LauncherAttestationProducerBindingV1,
+    request: &LauncherFinalizationArchiveSigningRequestV1,
+) -> Result<LauncherFinalizationArchiveSigningResponseV1, AttestationClientError> {
+    if launcher_finalization_archive_signing_request_v1_identity(request)
+        .map_err(|_| AttestationClientError::InvalidResponse)?
+        != request.request_identity
+        || request.producer_binding_identity != binding.identity
+    {
+        return Err(AttestationClientError::InvalidResponse);
+    }
+    let connection = connect_seqpacket(binding)?;
+    let request_bytes =
+        serde_jcs::to_vec(request).map_err(|_| AttestationClientError::InvalidResponse)?;
+    send_packet(&connection, &request_bytes)?;
+    let response_bytes = receive_packet(&connection, binding.maximum_request_bytes)?;
+    let producer = observe_producer(binding)?;
+    revalidate_producer(&producer, binding)?;
+    reject_queued_packet(&connection)?;
+    let response: LauncherFinalizationArchiveSigningResponseV1 =
+        serde_json::from_slice(&response_bytes)
+            .map_err(|_| AttestationClientError::InvalidResponse)?;
+    if serde_jcs::to_vec(&response).map_err(|_| AttestationClientError::InvalidResponse)?
+        != response_bytes
+        || launcher_finalization_archive_signing_response_v1_identity(&response)
+            .map_err(|_| AttestationClientError::InvalidResponse)?
+            != response.response_identity
+        || response.request_identity != request.request_identity
+        || response.signed_archive.signed_finalization_identity
+            != request.signed_finalization.identity
+        || response.signed_archive.receipt_archive_identity != request.receipt_archive_identity
+        || response.signed_archive.crossing_transaction_identity
+            != request.crossing_transaction_identity
+        || response.signed_archive.producer_binding_identity != binding.identity
+        || response.signed_archive.key_id != binding.signing_key_id
+        || response.signed_archive.algorithm != "ed25519"
+    {
+        return Err(AttestationClientError::InvalidResponse);
+    }
+    let signature = URL_SAFE_NO_PAD
+        .decode(&response.signed_archive.signature)
+        .ok()
+        .and_then(|bytes| Signature::from_slice(&bytes).ok())
+        .ok_or(AttestationClientError::InvalidResponse)?;
+    let signed_bytes = launcher_finalization_archive_signature_bytes_v1(&response.signed_archive)
+        .map_err(|_| AttestationClientError::InvalidResponse)?;
+    decode_verifying_key(binding)?
+        .verify(&signed_bytes, &signature)
+        .map_err(|_| AttestationClientError::InvalidResponse)?;
+    revalidate_producer(&producer, binding)?;
     Ok(response)
 }
 

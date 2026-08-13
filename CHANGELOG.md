@@ -26,6 +26,14 @@
 
 ## Unreleased
 
+- Add the candidate durable post-cleanup finalization carrier. Before deleting the active-slot
+  journal, the launcher fsyncs a separate protected finalization intent. The attestor signs both
+  exact cleanup evidence and a distinct attachment binding that evidence to the exact receipt
+  archive and crossing transaction. Every intermediate stage remains restart-readable, and the
+  protected journal is removed only after the client durably persists and acknowledges the exact
+  sidecar. Local regressions cover every retained stage; immutable PID 1 crash pressure and a
+  production operator client remain required before shipment.
+
 - Enable the first bounded selected-execution path for `systemd_protected_launcher/v1`. Core keeps
   the private launcher session through terminal transaction finalization and sends one completion
   binding the consumed lease, work unit, pending transaction, terminal transaction, outcome, and

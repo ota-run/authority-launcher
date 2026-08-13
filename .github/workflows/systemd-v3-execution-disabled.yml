@@ -250,12 +250,16 @@ jobs:
             local case_name=$1
             local selected=${2:-false}
             local expected_execution_count=${3:-1}
-            local slots scopes
+            local slots finalizations scopes
             slots=$(sudo find /var/lib/ota/authority-launcher/active -mindepth 1 -maxdepth 1 -type f | wc -l)
+            finalizations=$(sudo find /var/lib/ota/authority-launcher/finalization \
+              -mindepth 1 -maxdepth 1 -type f | wc -l)
             scopes=$(systemctl list-units 'ota-authority-invocation-*.scope' --all --no-legend --plain | wc -l)
-            printf 'active_slots=%s\nscopes=%s\n' "$slots" "$scopes" \
+            printf 'active_slots=%s\nfinalization_journals=%s\nscopes=%s\n' \
+              "$slots" "$finalizations" "$scopes" \
               > "$EVIDENCE_DIR/$case_name.boundary.txt"
             test "$slots" -eq 0
+            test "$finalizations" -eq 0
             test "$scopes" -eq 0
             if test "$selected" = true; then
               test "$(sudo wc -l "$PRESSURE_REPOSITORY/selected-work-executed" \
@@ -551,8 +555,28 @@ jobs:
              and .terminal.finalization.scope_removed == true
              and .terminal.finalization.cgroup_empty_or_absent == true
              and .terminal.finalization.active_slot_removed == true
-             and .terminal.finalization.completion.outcome == "completed"' \
+             and .terminal.finalization.completion.outcome == "completed"
+             and (.finalization_sidecar | endswith(".launcher-finalization"))' \
             "$EVIDENCE_DIR/positive.json"
+          sidecar=$(jq -er '.finalization_sidecar' "$EVIDENCE_DIR/positive.json")
+          sudo test -f "$sidecar"
+          sudo jq -e \
+            '.schema_version == 1
+             and (.identity | startswith("sha256:"))
+             and (.signed_archive.receipt_archive_identity | startswith("sha256:"))
+             and .signed_finalization.algorithm == "ed25519"
+             and .signed_archive.algorithm == "ed25519"
+             and .signed_archive.signed_finalization_identity == .signed_finalization.identity
+             and .signed_archive.crossing_transaction_identity
+               == .signed_finalization.finalization.completion.crossing_transaction_identity
+             and .signed_archive.producer_binding_identity
+               == .signed_finalization.producer_binding_identity
+             and .signed_archive.key_id == .signed_finalization.key_id
+             and .signed_finalization.finalization.child_reaped == true
+             and .signed_finalization.finalization.scope_removed == true
+             and .signed_finalization.finalization.cgroup_empty_or_absent == true
+             and .signed_finalization.finalization.active_slot_removed == true' \
+            "$sidecar"
           sudo find "$PRESSURE_REPOSITORY" -printf '%M %u %g %p\n' \
             | sort > "$EVIDENCE_DIR/positive.repository-tree.txt"
           assert_terminal_clean positive true
@@ -639,6 +663,54 @@ jobs:
           diff -u "$EVIDENCE_DIR/completion-crash.repository.before.sha256" \
             "$EVIDENCE_DIR/completion-crash.repository.after.sha256"
 
+          repository_content_manifest \
+            > "$EVIDENCE_DIR/finalization-crash.repository.before.sha256"
+          reset_services
+          set_broker_scenario allowed
+          sudo install -o root -g root -m 0600 /dev/null \
+            /run/ota/authority-launcher-pressure-exit-after-finalization-intent
+          case_cursor=$(journal_cursor)
+          if ! sudo systemctl start ota-authority-pressure-runner.service; then
+            capture_journal finalization-crash-recovery-start-failure "$case_cursor"
+            exit 1
+          fi
+          capture_journal finalization-crash-recovery "$case_cursor"
+          grep -q 'bounded pressure finalization crash stage=intent_recorded' \
+            "$EVIDENCE_DIR/finalization-crash-recovery.journal.txt"
+          capture_client_json finalization-crash-recovery "$case_cursor"
+          jq -e \
+            '.ok == true
+             and .terminal.stage == "selected_execution_completed_boundary_removed"
+             and .terminal.outcome == "completed"
+             and .terminal.exit_code == 0
+             and (.finalization_sidecar | endswith(".launcher-finalization"))' \
+            "$EVIDENCE_DIR/finalization-crash-recovery.json"
+          test "$(sudo wc -l "$PRESSURE_REPOSITORY/selected-work-executed" \
+            | awk '{print $1}')" -eq 1
+          assert_terminal_clean finalization-crash-recovery true
+          set +e
+          sudo sh -c \
+            'cd "$1" && /usr/lib/ota-authority/bin/ota receipt --history --json' \
+            sh "$PRESSURE_REPOSITORY" \
+            2> >(tee "$EVIDENCE_DIR/finalization-crash-recovery.receipt-history.stderr.txt" >&2) \
+            | tee "$EVIDENCE_DIR/finalization-crash-recovery.receipt-history.json"
+          finalization_history_status=${PIPESTATUS[0]}
+          set -e
+          test "$finalization_history_status" -eq 0
+          jq -e \
+            '.ok == true
+             and .summary.archive_count == 1
+             and .summary.invalid_archive_count == 0
+             and (.archives | length) == 1
+             and (.invalid_archives | length) == 0' \
+            "$EVIDENCE_DIR/finalization-crash-recovery.receipt-history.json"
+          sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
+            "$PRESSURE_REPOSITORY/selected-work-executed"
+          repository_content_manifest \
+            > "$EVIDENCE_DIR/finalization-crash.repository.after.sha256"
+          diff -u "$EVIDENCE_DIR/finalization-crash.repository.before.sha256" \
+            "$EVIDENCE_DIR/finalization-crash.repository.after.sha256"
+
           repository_content_manifest > "$EVIDENCE_DIR/selected-failure.repository.before.sha256"
           sudo cp "$PRESSURE_REPOSITORY/ota.yaml" \
             "$EVIDENCE_DIR/selected-failure.original-ota.yaml"
@@ -662,7 +734,8 @@ jobs:
              and .terminal.finalization.scope_removed == true
              and .terminal.finalization.cgroup_empty_or_absent == true
              and .terminal.finalization.active_slot_removed == true
-             and .terminal.finalization.completion.outcome == "failed"' \
+             and .terminal.finalization.completion.outcome == "failed"
+             and (.finalization_sidecar | endswith(".launcher-finalization"))' \
             "$EVIDENCE_DIR/selected-failure.json"
           test ! -e "$PRESSURE_REPOSITORY/selected-work-executed"
           sudo test -d "$PRESSURE_REPOSITORY/.ota/receipts"
@@ -759,7 +832,8 @@ jobs:
              and .terminal.finalization.scope_removed == true
              and .terminal.finalization.cgroup_empty_or_absent == true
              and .terminal.finalization.active_slot_removed == true
-             and .terminal.finalization.completion.outcome == "interrupted"' \
+             and .terminal.finalization.completion.outcome == "interrupted"
+             and (.finalization_sidecar | endswith(".launcher-finalization"))' \
             "$EVIDENCE_DIR/selected-interruption.json"
           test ! -e "$PRESSURE_REPOSITORY/selected-work-executed"
           sudo test -d "$PRESSURE_REPOSITORY/.ota/receipts"

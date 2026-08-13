@@ -27,6 +27,8 @@ mod closed_profile_observations;
 #[cfg(unix)]
 mod config;
 #[cfg(target_os = "linux")]
+mod finalization_journal;
+#[cfg(target_os = "linux")]
 mod installation_manifest;
 #[cfg(target_os = "linux")]
 mod prepared_child;

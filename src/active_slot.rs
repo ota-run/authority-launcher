@@ -260,6 +260,14 @@ impl ActiveSlot {
         self.journal.child.as_ref()
     }
 
+    pub(crate) fn principal_mapping_identity(&self) -> &str {
+        self.journal.principal_mapping_identity.as_str()
+    }
+
+    pub(crate) fn request_identity(&self) -> &str {
+        self.journal.request_identity.as_str()
+    }
+
     pub(crate) fn record_scope(
         &mut self,
         scope: LauncherSystemdScopeV1,

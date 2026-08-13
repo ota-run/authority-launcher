@@ -77,6 +77,7 @@ const BROKER_SCENARIO: &str = "/run/ota/authority-broker-pressure-scenario";
 const ISSUANCE_STATE: &str = "/var/lib/ota/authority-attestor";
 const LAUNCHER_STATE: &str = "/var/lib/ota/authority-launcher";
 const ACTIVE_SLOT_STATE: &str = "/var/lib/ota/authority-launcher/active";
+const FINALIZATION_STATE: &str = "/var/lib/ota/authority-launcher/finalization";
 const LAUNCHER_RUNTIME: &str = "/run/ota/authority-launcher";
 const LAUNCHER_SOCKET: &str = "/run/ota/authority-launcher.sock";
 const ATTESTOR_SOCKET: &str = "/run/ota/authority-attestor.sock";
@@ -654,7 +655,7 @@ fn polkit_deny_rule(job: &Account, execution: &Account) -> Result<String, String
     ))
 }
 
-fn protected_directories() -> [(&'static str, u32); 8] {
+fn protected_directories() -> [(&'static str, u32); 9] {
     [
         (ETC_OTA, 0o755),
         (STATE_ROOT, 0o755),
@@ -662,6 +663,7 @@ fn protected_directories() -> [(&'static str, u32); 8] {
         (ISSUANCE_STATE, 0o700),
         (LAUNCHER_STATE, 0o700),
         (ACTIVE_SLOT_STATE, 0o700),
+        (FINALIZATION_STATE, 0o700),
         (BROKER_STATE, 0o700),
         (LAUNCHER_RUNTIME, 0o700),
     ]
