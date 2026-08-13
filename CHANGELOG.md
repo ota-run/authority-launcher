@@ -32,9 +32,13 @@
   receipt status. The launcher fsyncs that completion before acknowledgement, relays bounded
   sequenced output, reconciles the actual child exit, and emits terminal evidence only after exact
   scope removal, empty or absent cgroup confirmation, child reaping, and active-slot removal.
-  Refusal and uncertain-cleanup paths remain fail-closed. Immutable Linux/x64 PID 1 pressure and
-  portable archive binding of launcher finalization remain required before this boundary is
-  complete.
+  Refusal and uncertain-cleanup paths remain fail-closed. Immutable Linux/x64 PID 1 pressure run
+  [31663366909](https://github.com/ota-run/authority-launcher/actions/runs/31663366909)
+  proves completed, failed, interrupted, replay-refused, and crash-recovered selected execution
+  against Launcher `cf82b240e96cdab7c8cdbe26bb673bf430358447`, Core
+  `06976f3eb4919a0bddaa318ed0824a6b9448aaaf`, and Protocol
+  `9fb00a4ab0f1b4c635dbab67c2e6b140b8eade9c`. Portable archive binding of
+  launcher finalization remains open.
 
 - Extend the execution-disabled protected systemd foundation through one exact prepared-lease and
   consumed-response relay. The launcher durably journals the exact transaction-bound intent and
