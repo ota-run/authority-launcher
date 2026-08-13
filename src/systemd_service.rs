@@ -504,6 +504,7 @@ fn execute_selected_boundary(
         finalization.clone(),
     )
     .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
+    eprintln!("ota-authority-launcher: portable finalization stage=intent_recorded");
     boundary
         .active_slot
         .finalize()
@@ -513,7 +514,9 @@ fn execute_selected_boundary(
     finalization_journal
         .record_signed_finalization(signed_finalization.clone())
         .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
+    eprintln!("ota-authority-launcher: portable finalization stage=signed_recorded");
     write_signed_finalization(stream, invocation_id, signed_finalization)?;
+    eprintln!("ota-authority-launcher: portable finalization stage=signed_sent");
     complete_archive_attachment(stream, &mut finalization_journal, invocation_id, repository)?;
     write_selected_terminal_and_finalize(stream, &mut finalization_journal)?;
     Ok(0)
@@ -1584,6 +1587,7 @@ fn complete_archive_attachment(
     repository: &crate::target_directory::OpenedRepositoryDirectory,
 ) -> Result<(), SystemdServiceError> {
     let request: LauncherFinalizationArchiveRequestV1 = receive_typed_frame(stream)?;
+    eprintln!("ota-authority-launcher: portable finalization stage=archive_request_received");
     complete_archive_attachment_for_request(stream, journal, invocation_id, repository, request)
 }
 
@@ -1606,7 +1610,11 @@ fn complete_archive_attachment_for_request(
         request.receipt_archive_identity.as_str(),
         request.crossing_transaction_identity.as_str(),
     )
-    .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
+    .map_err(|error| {
+        eprintln!("ota-authority-launcher: portable finalization archive refused: {error}");
+        SystemdServiceError::FinalizationUnavailable
+    })?;
+    eprintln!("ota-authority-launcher: portable finalization stage=archive_located");
     match journal.journal().stage {
         FinalizationJournalStageV1::SignedFinalization => journal
             .record_archive_request(request.clone())
