@@ -280,9 +280,16 @@ lease. The selected Ota command creates its ordinary transaction-bound crossing 
 launcher terminal evidence separately binds Core's completion to exact child, scope, cgroup, and
 slot cleanup. The current candidate persists a protected finalization journal before deleting the
 active slot, asks the producer to sign the cleanup record and a separate exact archive attachment,
-and removes that journal only after the client durably acknowledges the sidecar. This is locally
-tested candidate code; immutable PID 1 crash pressure and a production operator client remain open
-before Ota receipt history can require the attachment. Only
+reopens the private archive through the execution-principal repository descriptor, and verifies its
+owner, content identity, and transaction before atomically publishing a root-owned sidecar. Both
+`.ota` and `.ota/receipts` must be owned by the execution principal with mode `0700`; the job
+principal never reads the private receipt directory and only acknowledges the exact signed result.
+The protected journal then retains the exact terminal frame until the client acknowledges that
+terminal identity. Reconnect recovery starts from retained launcher state rather than scanning
+repository files. Administrative receipt-history inspection can use the protected execution or
+root context; a production least-privilege operator attachment/history client remains open. This is
+locally tested candidate code; immutable PID 1 crash pressure remains open before Ota receipt
+history can require the attachment. Only
 `ota-authority-attestor` receives the systemd-delivered
 signing credential; the launcher retains public verification truth only. Missing, malformed,
 oversized, self-inconsistent, or substituted posture, continuation, challenge, attestation, or

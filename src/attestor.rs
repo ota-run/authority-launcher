@@ -1600,6 +1600,7 @@ mod tests {
             crossing_transaction_id: String::from("transaction-1"),
             pending_crossing_transaction_identity: identity('3'),
             crossing_transaction_identity: identity('4'),
+            receipt_archive_identity: Some(identity('5')),
             outcome: LauncherExecutionOutcomeV1::Completed,
             exit_code: Some(0),
             receipt_status: String::from("passed"),
@@ -1647,7 +1648,7 @@ mod tests {
                 .into(),
             request_identity: String::new(),
             signed_finalization: signed_finalization.signed_finalization,
-            receipt_archive_identity: identity('8'),
+            receipt_archive_identity: identity('5'),
             crossing_transaction_identity: identity('4'),
             producer_binding_identity: binding.identity,
         };

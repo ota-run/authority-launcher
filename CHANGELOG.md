@@ -29,10 +29,15 @@
 - Add the candidate durable post-cleanup finalization carrier. Before deleting the active-slot
   journal, the launcher fsyncs a separate protected finalization intent. The attestor signs both
   exact cleanup evidence and a distinct attachment binding that evidence to the exact receipt
-  archive and crossing transaction. Every intermediate stage remains restart-readable, and the
-  protected journal is removed only after the client durably persists and acknowledges the exact
-  sidecar. Local regressions cover every retained stage; immutable PID 1 crash pressure and a
-  production operator client remain required before shipment.
+  archive and crossing transaction. The root launcher reopens the exact private archive through the
+  execution-principal repository descriptor, verifies its owner, content identity, and transaction,
+  then atomically publishes the root-owned sidecar. The job principal can only acknowledge that
+  exact signed result. The launcher retains the exact terminal frame until a separate
+  identity-bound terminal acknowledgement, so a lost terminal response remains replayable. The
+  `.ota` and receipt directories must be execution-principal-owned and mode `0700`. Every
+  intermediate stage remains restart-readable, including reconnect before the client has received
+  finalization. Local regressions cover retained state and alias refusal;
+  immutable PID 1 crash pressure and a production operator client remain required before shipment.
 
 - Enable the first bounded selected-execution path for `systemd_protected_launcher/v1`. Core keeps
   the private launcher session through terminal transaction finalization and sends one completion

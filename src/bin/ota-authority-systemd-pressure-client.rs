@@ -23,15 +23,7 @@
 //! Feature-gated unprivileged client for the protected systemd pressure boundary.
 
 #[cfg(target_os = "linux")]
-use std::ffi::CString;
-#[cfg(target_os = "linux")]
-use std::fs::File;
-#[cfg(target_os = "linux")]
 use std::io::{Read, Write};
-#[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, FromRawFd};
-#[cfg(target_os = "linux")]
-use std::os::unix::ffi::OsStrExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(target_os = "linux")]
@@ -48,22 +40,23 @@ use clap::{Parser, ValueEnum};
 #[cfg(target_os = "linux")]
 use ota_authority_protocol::{
     LAUNCHER_FINALIZATION_ARCHIVE_PERSISTENCE, LAUNCHER_FINALIZATION_ARCHIVE_REQUEST,
-    LAUNCHER_INVOCATION_REQUEST, LAUNCHER_OUTPUT, LAUNCHER_SIGNED_EXECUTION_FINALIZATION,
-    LAUNCHER_TERMINAL, LauncherFinalizationArchivePersistenceV1,
-    LauncherFinalizationArchiveRequestV1, LauncherFinalizationArchiveResponseV1,
+    LAUNCHER_FINALIZATION_RECOVERY_REQUEST, LAUNCHER_INVOCATION_REQUEST, LAUNCHER_OUTPUT,
+    LAUNCHER_SIGNED_EXECUTION_FINALIZATION, LAUNCHER_TERMINAL, LAUNCHER_TERMINAL_PERSISTENCE,
+    LauncherFinalizationArchivePersistenceV1, LauncherFinalizationArchiveRequestV1,
+    LauncherFinalizationArchiveResponseV1, LauncherFinalizationRecoveryRequestV1,
     LauncherInvocationRequestV1, LauncherOutputFrameV1, LauncherSignedExecutionFinalizationFrameV1,
-    LauncherTerminalFrameV1, LauncherTerminalOutcomeV1, LauncherTerminalStageV1, MAX_FRAME_BYTES,
-    SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, decode_frame, encode_frame,
-    launcher_finalization_archive_persistence_v1_identity,
+    LauncherTerminalFrameV1, LauncherTerminalOutcomeV1, LauncherTerminalPersistenceV1,
+    LauncherTerminalStageV1, MAX_FRAME_BYTES, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, decode_frame,
+    encode_frame, launcher_finalization_archive_persistence_v1_identity,
     launcher_finalization_archive_request_v1_identity,
-    launcher_finalization_archive_response_v1_identity, launcher_invocation_request_identity,
+    launcher_finalization_archive_response_v1_identity,
+    launcher_finalization_recovery_request_v1_identity, launcher_invocation_request_identity,
+    launcher_terminal_frame_v1_identity, launcher_terminal_persistence_v1_identity,
     validate_launcher_invocation_request_v1, validate_launcher_output_frame_v1,
     validate_launcher_signed_execution_finalization_frame_v1, validate_launcher_terminal_frame_v1,
 };
 #[cfg(target_os = "linux")]
 use serde::Serialize;
-#[cfg(target_os = "linux")]
-use sha2::{Digest, Sha256};
 
 #[cfg(target_os = "linux")]
 const SYSTEMD_LAUNCHER_SOCKET: &str = "/run/ota/authority-launcher.sock";
@@ -214,20 +207,14 @@ fn recover_finalization_session(
     authority_id: &str,
     launcher_request_identity: &str,
 ) -> Result<SessionEvidence, String> {
-    let (archive_path, archive_bytes, crossing_transaction_identity) =
-        select_recoverable_archive(repository)?;
-    let archive_identity = format!("sha256:{:x}", Sha256::digest(&archive_bytes));
-    let mut request = LauncherFinalizationArchiveRequestV1 {
+    let mut recovery = LauncherFinalizationRecoveryRequestV1 {
         schema_version: 1,
-        message_kind: LAUNCHER_FINALIZATION_ARCHIVE_REQUEST.into(),
+        message_kind: LAUNCHER_FINALIZATION_RECOVERY_REQUEST.into(),
         request_identity: String::new(),
         authority_id: authority_id.into(),
         launcher_request_identity: launcher_request_identity.into(),
-        receipt_archive_identity: archive_identity,
-        crossing_transaction_identity,
-        signed_finalization_identity: None,
     };
-    request.request_identity = launcher_finalization_archive_request_v1_identity(&request)
+    recovery.request_identity = launcher_finalization_recovery_request_v1_identity(&recovery)
         .map_err(|_| String::from("the launcher finalization recovery request is invalid"))?;
     verify_socket_path(Path::new(SYSTEMD_LAUNCHER_SOCKET))?;
     let mut stream = UnixStream::connect(SYSTEMD_LAUNCHER_SOCKET)
@@ -237,83 +224,21 @@ fn recover_finalization_session(
         .set_read_timeout(Some(IO_TIMEOUT))
         .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
         .map_err(|_| String::from("the pressure session timeout could not be applied"))?;
-    write_client_frame(&mut stream, &request)?;
-    let response: LauncherFinalizationArchiveResponseV1 = read_client_frame(&mut stream)?;
-    if launcher_finalization_archive_response_v1_identity(&response)
-        .map_err(|_| String::from("the launcher finalization recovery response is invalid"))?
-        != response.response_identity
-        || response.request_identity != request.request_identity
-        || response.sidecar.signed_archive.receipt_archive_identity
-            != request.receipt_archive_identity
-        || response
-            .sidecar
-            .signed_archive
-            .crossing_transaction_identity
-            != request.crossing_transaction_identity
-    {
-        return Err(String::from(
-            "the launcher finalization recovery response is invalid",
-        ));
-    }
-    let sidecar_path = persist_sidecar(&archive_path, &response.sidecar)?;
-    let mut persistence = LauncherFinalizationArchivePersistenceV1 {
-        schema_version: 1,
-        message_kind: LAUNCHER_FINALIZATION_ARCHIVE_PERSISTENCE.into(),
-        identity: String::new(),
-        request_identity: request.request_identity,
-        sidecar_identity: response.sidecar.identity.clone(),
+    write_client_frame(&mut stream, &recovery)?;
+    let signed_frame: LauncherSignedExecutionFinalizationFrameV1 = read_client_frame(&mut stream)?;
+    validate_launcher_signed_execution_finalization_frame_v1(&signed_frame)
+        .map_err(|_| String::from("the recovered launcher finalization is invalid"))?;
+    let context = ArchiveContext {
+        repository,
+        authority_id,
+        launcher_request_identity,
     };
-    persistence.identity = launcher_finalization_archive_persistence_v1_identity(&persistence)
-        .map_err(|_| String::from("the launcher finalization persistence is invalid"))?;
-    write_client_frame(&mut stream, &persistence)?;
+    let sidecar_path = attach_finalization_sidecar(&mut stream, &context, &signed_frame)?;
     let terminal: LauncherTerminalFrameV1 = read_client_frame(&mut stream)?;
     validate_launcher_terminal_frame_v1(&terminal)
         .map_err(|_| String::from("the recovered launcher terminal is invalid"))?;
-    let signed_frame = LauncherSignedExecutionFinalizationFrameV1 {
-        message_kind: LAUNCHER_SIGNED_EXECUTION_FINALIZATION.into(),
-        protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
-        invocation_id: response.invocation_id,
-        signed_finalization: response.sidecar.signed_finalization,
-    };
+    acknowledge_selected_terminal(&mut stream, &terminal)?;
     Ok((Vec::new(), Some(signed_frame), Some(sidecar_path), terminal))
-}
-
-#[cfg(target_os = "linux")]
-fn select_recoverable_archive(repository: &Path) -> Result<(PathBuf, Vec<u8>, String), String> {
-    let archive_dir = receipt_archive_dir(repository);
-    let mut matches = Vec::new();
-    for entry in std::fs::read_dir(&archive_dir)
-        .map_err(|_| String::from("the receipt archive directory is unavailable"))?
-    {
-        let path = entry
-            .map_err(|_| String::from("the receipt archive directory is unreadable"))?
-            .path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json")
-            || path.with_extension("launcher-finalization").exists()
-        {
-            continue;
-        }
-        let bytes =
-            std::fs::read(&path).map_err(|_| String::from("a receipt archive is unreadable"))?;
-        let value: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|_| String::from("a receipt archive is invalid"))?;
-        let required = value
-            .pointer("/receipt/crossing/authority/archive_evidence/portable_launcher_finalization_required")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
-        let transaction = value
-            .pointer("/receipt/crossing/authority/archive_evidence/transaction/identity")
-            .and_then(serde_json::Value::as_str);
-        if required && let Some(transaction) = transaction {
-            matches.push((path, bytes, transaction.to_string()));
-        }
-    }
-    if matches.len() != 1 {
-        return Err(String::from(
-            "the exact recoverable receipt archive is unavailable or ambiguous",
-        ));
-    }
-    Ok(matches.pop().expect("one recoverable archive"))
 }
 
 #[cfg(target_os = "linux")]
@@ -513,6 +438,7 @@ fn read_session(
                         "the launcher portable finalization record is missing or unexpected",
                     ));
                 }
+                acknowledge_selected_terminal(stream, &terminal)?;
                 return Ok((
                     output_frames,
                     signed_finalization,
@@ -543,6 +469,27 @@ fn read_session(
 }
 
 #[cfg(target_os = "linux")]
+fn acknowledge_selected_terminal(
+    stream: &mut UnixStream,
+    terminal: &LauncherTerminalFrameV1,
+) -> Result<(), String> {
+    if terminal.finalization.is_none() {
+        return Ok(());
+    }
+    let mut persistence = LauncherTerminalPersistenceV1 {
+        schema_version: 1,
+        message_kind: LAUNCHER_TERMINAL_PERSISTENCE.into(),
+        identity: String::new(),
+        invocation_id: terminal.invocation_id.clone(),
+        terminal_identity: launcher_terminal_frame_v1_identity(terminal)
+            .map_err(|_| String::from("the launcher terminal identity is invalid"))?,
+    };
+    persistence.identity = launcher_terminal_persistence_v1_identity(&persistence)
+        .map_err(|_| String::from("the launcher terminal persistence is invalid"))?;
+    write_client_frame(stream, &persistence)
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 struct ArchiveContext<'a> {
     repository: &'a Path,
@@ -556,40 +503,11 @@ fn attach_finalization_sidecar(
     context: &ArchiveContext<'_>,
     frame: &LauncherSignedExecutionFinalizationFrameV1,
 ) -> Result<PathBuf, String> {
-    let archive_dir = receipt_archive_dir(context.repository);
-    let transaction_identity = &frame
-        .signed_finalization
-        .finalization
-        .completion
-        .crossing_transaction_identity;
-    let mut matches = Vec::new();
-    for entry in std::fs::read_dir(&archive_dir)
-        .map_err(|_| String::from("the receipt archive directory is unavailable"))?
-    {
-        let path = entry
-            .map_err(|_| String::from("the receipt archive directory is unreadable"))?
-            .path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        let bytes =
-            std::fs::read(&path).map_err(|_| String::from("a receipt archive is unreadable"))?;
-        let value: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|_| String::from("a receipt archive is invalid"))?;
-        let archived_transaction = value
-            .pointer("/receipt/crossing/authority/archive_evidence/transaction/identity")
-            .and_then(serde_json::Value::as_str);
-        if archived_transaction == Some(transaction_identity.as_str()) {
-            matches.push((path, bytes));
-        }
-    }
-    if matches.len() != 1 {
-        return Err(String::from(
-            "the exact receipt archive for launcher finalization is unavailable or ambiguous",
-        ));
-    }
-    let (archive_path, archive_bytes) = matches.pop().expect("one archive match");
-    let archive_identity = format!("sha256:{:x}", Sha256::digest(&archive_bytes));
+    let completion = &frame.signed_finalization.finalization.completion;
+    let transaction_identity = &completion.crossing_transaction_identity;
+    let archive_identity = completion.receipt_archive_identity.clone().ok_or_else(|| {
+        String::from("the launcher completion omits its receipt archive identity")
+    })?;
     let mut request = LauncherFinalizationArchiveRequestV1 {
         schema_version: 1,
         message_kind: LAUNCHER_FINALIZATION_ARCHIVE_REQUEST.into(),
@@ -622,8 +540,12 @@ fn attach_finalization_sidecar(
             "the launcher finalization archive response is invalid",
         ));
     }
+    let sidecar_file_name = response
+        .sidecar_file_name
+        .clone()
+        .ok_or_else(|| String::from("the launcher finalization sidecar path is unavailable"))?;
     let sidecar = response.sidecar;
-    let sidecar_path = persist_sidecar(&archive_path, &sidecar)?;
+    let sidecar_path = receipt_archive_dir(context.repository).join(sidecar_file_name);
     let mut persistence = LauncherFinalizationArchivePersistenceV1 {
         schema_version: 1,
         message_kind: LAUNCHER_FINALIZATION_ARCHIVE_PERSISTENCE.into(),
@@ -640,192 +562,6 @@ fn attach_finalization_sidecar(
 #[cfg(target_os = "linux")]
 fn receipt_archive_dir(repository: &Path) -> PathBuf {
     repository.join(".ota/receipts")
-}
-
-#[cfg(target_os = "linux")]
-fn persist_sidecar(
-    archive_path: &Path,
-    sidecar: &ota_authority_protocol::LauncherFinalizationArchiveSidecarV1,
-) -> Result<PathBuf, String> {
-    persist_sidecar_with_hook(archive_path, sidecar, |_| Ok(()))
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SidecarPersistenceStage {
-    TemporaryCreated,
-    BytesWritten,
-    TemporarySynced,
-    Published,
-}
-
-#[cfg(target_os = "linux")]
-fn persist_sidecar_with_hook<F>(
-    archive_path: &Path,
-    sidecar: &ota_authority_protocol::LauncherFinalizationArchiveSidecarV1,
-    mut after_stage: F,
-) -> Result<PathBuf, String>
-where
-    F: FnMut(SidecarPersistenceStage) -> Result<(), String>,
-{
-    let sidecar_path = archive_path.with_extension("launcher-finalization");
-    let bytes = serde_jcs::to_vec(&sidecar)
-        .map_err(|_| String::from("the launcher finalization sidecar cannot be encoded"))?;
-    let parent = sidecar_path
-        .parent()
-        .ok_or_else(|| String::from("the launcher finalization sidecar parent is unavailable"))?;
-    let final_name = sidecar_path
-        .file_name()
-        .ok_or_else(|| String::from("the launcher finalization sidecar name is unavailable"))?;
-    let parent_c = CString::new(parent.as_os_str().as_bytes())
-        .map_err(|_| String::from("the launcher finalization sidecar parent is invalid"))?;
-    let final_name_c = CString::new(final_name.as_bytes())
-        .map_err(|_| String::from("the launcher finalization sidecar name is invalid"))?;
-    let directory_fd = unsafe {
-        libc::open(
-            parent_c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if directory_fd < 0 {
-        return Err(String::from(
-            "the launcher finalization sidecar parent is unavailable",
-        ));
-    }
-    let directory = unsafe { File::from_raw_fd(directory_fd) };
-
-    if existing_sidecar_matches(&directory, &final_name_c, &bytes)? {
-        return Ok(sidecar_path);
-    }
-
-    let mut random_suffix = [0_u8; 16];
-    getrandom::getrandom(&mut random_suffix).map_err(|_| {
-        String::from("the launcher finalization temporary name cannot be generated")
-    })?;
-    let random_suffix = random_suffix
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let temporary_name = format!(".{}.{}.tmp", final_name.to_string_lossy(), random_suffix);
-    let temporary_name_c = CString::new(temporary_name)
-        .map_err(|_| String::from("the launcher finalization temporary name is invalid"))?;
-    let temporary_fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            temporary_name_c.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            0o600,
-        )
-    };
-    if temporary_fd < 0 {
-        return Err(String::from(
-            "the launcher finalization temporary sidecar cannot be created",
-        ));
-    }
-    if unsafe { libc::fchmod(temporary_fd, 0o600) } != 0 {
-        unsafe {
-            libc::close(temporary_fd);
-            libc::unlinkat(directory.as_raw_fd(), temporary_name_c.as_ptr(), 0);
-        }
-        return Err(String::from(
-            "the launcher finalization temporary sidecar cannot be protected",
-        ));
-    }
-    let mut temporary = unsafe { File::from_raw_fd(temporary_fd) };
-    let mut published = false;
-    let result = (|| {
-        after_stage(SidecarPersistenceStage::TemporaryCreated)?;
-        temporary
-            .write_all(&bytes)
-            .map_err(|_| String::from("the launcher finalization sidecar cannot be persisted"))?;
-        after_stage(SidecarPersistenceStage::BytesWritten)?;
-        temporary
-            .sync_all()
-            .map_err(|_| String::from("the launcher finalization sidecar cannot be persisted"))?;
-        after_stage(SidecarPersistenceStage::TemporarySynced)?;
-        let renamed = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                directory.as_raw_fd(),
-                temporary_name_c.as_ptr(),
-                directory.as_raw_fd(),
-                final_name_c.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        };
-        if renamed != 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST)
-                && existing_sidecar_matches(&directory, &final_name_c, &bytes)?
-            {
-                return Ok(());
-            }
-            return Err(String::from(
-                "the launcher finalization sidecar cannot be published",
-            ));
-        }
-        published = true;
-        directory
-            .sync_all()
-            .map_err(|_| String::from("the launcher finalization sidecar cannot be persisted"))?;
-        after_stage(SidecarPersistenceStage::Published)
-    })();
-    if !published {
-        unsafe {
-            libc::unlinkat(directory.as_raw_fd(), temporary_name_c.as_ptr(), 0);
-        }
-    }
-    result?;
-    Ok(sidecar_path)
-}
-
-#[cfg(target_os = "linux")]
-fn existing_sidecar_matches(
-    directory: &File,
-    final_name: &CString,
-    expected: &[u8],
-) -> Result<bool, String> {
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            final_name.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if fd < 0 {
-        return match std::io::Error::last_os_error().raw_os_error() {
-            Some(libc::ENOENT) => Ok(false),
-            _ => Err(String::from(
-                "the existing launcher finalization sidecar is unsafe or unreadable",
-            )),
-        };
-    }
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    let metadata = file
-        .metadata()
-        .map_err(|_| String::from("the existing launcher finalization sidecar is unreadable"))?;
-    if !metadata.file_type().is_file()
-        || metadata.nlink() != 1
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o777 != 0o600
-        || metadata.len() != expected.len() as u64
-    {
-        return Err(String::from(
-            "the existing launcher finalization sidecar has unsafe metadata",
-        ));
-    }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|_| String::from("the existing launcher finalization sidecar is unreadable"))?;
-    directory
-        .sync_all()
-        .map_err(|_| String::from("the existing launcher finalization sidecar is unreadable"))?;
-    if bytes != expected {
-        return Err(String::from(
-            "the existing launcher finalization sidecar does not match this execution",
-        ));
-    }
-    Ok(true)
 }
 
 #[cfg(target_os = "linux")]
@@ -874,89 +610,8 @@ fn read_frame_payload(stream: &mut UnixStream) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     use ota_authority_protocol::{
-        LAUNCHER_EXECUTION_COMPLETION, LAUNCHER_TERMINAL, LauncherExecutionCompletionV1,
-        LauncherExecutionFinalizationV1, LauncherExecutionOutcomeV1,
-        LauncherFinalizationArchiveSidecarV1, LauncherTerminalOutcomeV1, LauncherTerminalStageV1,
-        SignedLauncherExecutionFinalizationV1, SignedLauncherFinalizationArchiveV1,
-        launcher_execution_completion_v1_identity, launcher_execution_finalization_v1_identity,
-        launcher_finalization_archive_sidecar_v1_identity,
-        signed_launcher_execution_finalization_v1_identity,
-        signed_launcher_finalization_archive_v1_identity,
+        LAUNCHER_TERMINAL, LauncherTerminalOutcomeV1, LauncherTerminalStageV1,
     };
-    use tempfile::tempdir;
-
-    fn identity(character: char) -> String {
-        format!("sha256:{}", character.to_string().repeat(64))
-    }
-
-    fn sidecar(receipt_archive_identity: String) -> LauncherFinalizationArchiveSidecarV1 {
-        let mut completion = LauncherExecutionCompletionV1 {
-            schema_version: 1,
-            identity: String::new(),
-            message_kind: LAUNCHER_EXECUTION_COMPLETION.into(),
-            invocation_id: String::from("invocation-0123456789abcdef0123456789abcdef"),
-            lease_consumption_admission_identity: identity('1'),
-            work_unit_identity: identity('2'),
-            crossing_transaction_id: String::from("transaction-1"),
-            pending_crossing_transaction_identity: identity('3'),
-            crossing_transaction_identity: identity('4'),
-            outcome: LauncherExecutionOutcomeV1::Completed,
-            exit_code: Some(0),
-            receipt_status: String::from("passed"),
-        };
-        completion.identity =
-            launcher_execution_completion_v1_identity(&completion).expect("completion identity");
-        let mut finalization = LauncherExecutionFinalizationV1 {
-            schema_version: 1,
-            identity: String::new(),
-            completion,
-            child_identity: identity('5'),
-            scope_identity: identity('6'),
-            observed_exit_code: Some(0),
-            child_reaped: true,
-            scope_removed: true,
-            cgroup_empty_or_absent: true,
-            active_slot_removed: true,
-        };
-        finalization.identity =
-            launcher_execution_finalization_v1_identity(&finalization).expect("finalization");
-        let mut signed_finalization = SignedLauncherExecutionFinalizationV1 {
-            schema_version: 1,
-            identity: String::new(),
-            finalization,
-            producer_binding_identity: identity('7'),
-            issued_at: String::from("2026-08-13T12:00:00Z"),
-            key_id: String::from("attestor-1"),
-            algorithm: String::from("ed25519"),
-            signature: String::from("cleanup-signature"),
-        };
-        signed_finalization.identity =
-            signed_launcher_execution_finalization_v1_identity(&signed_finalization)
-                .expect("signed finalization");
-        let mut signed_archive = SignedLauncherFinalizationArchiveV1 {
-            schema_version: 1,
-            identity: String::new(),
-            signed_finalization_identity: signed_finalization.identity.clone(),
-            receipt_archive_identity,
-            crossing_transaction_identity: identity('4'),
-            producer_binding_identity: identity('7'),
-            issued_at: String::from("2026-08-13T12:00:01Z"),
-            key_id: String::from("attestor-1"),
-            algorithm: String::from("ed25519"),
-            signature: String::from("archive-signature"),
-        };
-        signed_archive.identity = signed_launcher_finalization_archive_v1_identity(&signed_archive)
-            .expect("signed archive");
-        let mut sidecar = LauncherFinalizationArchiveSidecarV1 {
-            schema_version: 1,
-            identity: String::new(),
-            signed_finalization,
-            signed_archive,
-        };
-        sidecar.identity =
-            launcher_finalization_archive_sidecar_v1_identity(&sidecar).expect("sidecar");
-        sidecar
-    }
 
     #[test]
     fn receipt_archives_use_otas_canonical_receipt_directory() {
@@ -1022,101 +677,6 @@ mod tests {
             read_session(&mut client, None).expect("read session"),
             (vec![output], None, None, terminal)
         );
-    }
-
-    #[test]
-    fn sidecar_persistence_is_create_new_idempotent_and_conflict_refusing() {
-        let root = tempdir().expect("archive root");
-        let archive = root.path().join("receipt.json");
-        std::fs::write(&archive, b"{}").expect("archive");
-        let expected_sidecar = sidecar(identity('8'));
-        let path = persist_sidecar(&archive, &expected_sidecar).expect("first persistence");
-        assert_eq!(
-            serde_json::from_slice::<LauncherFinalizationArchiveSidecarV1>(
-                &std::fs::read(&path).expect("sidecar bytes")
-            )
-            .expect("sidecar JSON"),
-            expected_sidecar
-        );
-        assert_eq!(
-            persist_sidecar(&archive, &expected_sidecar).expect("idempotent persistence"),
-            path
-        );
-        assert!(persist_sidecar(&archive, &sidecar(identity('9'))).is_err());
-    }
-
-    #[test]
-    fn sidecar_persistence_recovers_across_each_publication_boundary() {
-        for interrupted_stage in [
-            SidecarPersistenceStage::TemporaryCreated,
-            SidecarPersistenceStage::BytesWritten,
-            SidecarPersistenceStage::TemporarySynced,
-        ] {
-            let root = tempdir().expect("archive root");
-            let archive = root.path().join("receipt.json");
-            std::fs::write(&archive, b"{}").expect("archive");
-            let expected = sidecar(identity('8'));
-            assert!(
-                persist_sidecar_with_hook(&archive, &expected, |stage| {
-                    if stage == interrupted_stage {
-                        Err(String::from("injected interruption"))
-                    } else {
-                        Ok(())
-                    }
-                })
-                .is_err()
-            );
-            assert!(!archive.with_extension("launcher-finalization").exists());
-            persist_sidecar(&archive, &expected).expect("reconnect persistence");
-        }
-
-        let root = tempdir().expect("archive root");
-        let archive = root.path().join("receipt.json");
-        std::fs::write(&archive, b"{}").expect("archive");
-        let expected = sidecar(identity('8'));
-        assert!(
-            persist_sidecar_with_hook(&archive, &expected, |stage| {
-                if stage == SidecarPersistenceStage::Published {
-                    Err(String::from("injected interruption"))
-                } else {
-                    Ok(())
-                }
-            })
-            .is_err()
-        );
-        assert!(archive.with_extension("launcher-finalization").exists());
-        persist_sidecar(&archive, &expected).expect("published reconnect persistence");
-    }
-
-    #[test]
-    fn sidecar_persistence_rejects_symlink_and_conflicting_metadata() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempdir().expect("archive root");
-        let archive = root.path().join("receipt.json");
-        std::fs::write(&archive, b"{}").expect("archive");
-        let sidecar_path = archive.with_extension("launcher-finalization");
-        let target = root.path().join("target");
-        std::fs::write(&target, b"unchanged").expect("target");
-        symlink(&target, &sidecar_path).expect("sidecar symlink");
-        assert!(persist_sidecar(&archive, &sidecar(identity('8'))).is_err());
-        assert_eq!(std::fs::read(&target).expect("target bytes"), b"unchanged");
-
-        std::fs::remove_file(&sidecar_path).expect("remove symlink");
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
-            .expect("target mode");
-        std::fs::hard_link(&target, &sidecar_path).expect("sidecar hardlink");
-        assert!(persist_sidecar(&archive, &sidecar(identity('8'))).is_err());
-
-        std::fs::remove_file(&sidecar_path).expect("remove hardlink");
-        std::fs::write(
-            &sidecar_path,
-            serde_jcs::to_vec(&sidecar(identity('8'))).unwrap(),
-        )
-        .expect("sidecar bytes");
-        std::fs::set_permissions(&sidecar_path, std::fs::Permissions::from_mode(0o644))
-            .expect("unsafe mode");
-        assert!(persist_sidecar(&archive, &sidecar(identity('8'))).is_err());
     }
 
     #[test]

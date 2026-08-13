@@ -30,11 +30,13 @@ use std::path::{Path, PathBuf};
 use ota_authority_protocol::{
     LauncherExecutionFinalizationV1, LauncherFinalizationArchivePersistenceV1,
     LauncherFinalizationArchiveRequestV1, LauncherFinalizationArchiveSidecarV1,
+    LauncherTerminalFrameV1, LauncherTerminalPersistenceV1, LauncherWorkingDirectoryV1,
     SignedLauncherExecutionFinalizationV1, launcher_execution_finalization_v1_identity,
     launcher_finalization_archive_persistence_v1_identity,
     launcher_finalization_archive_request_v1_identity,
-    launcher_finalization_archive_sidecar_v1_identity, message_identity,
-    signed_launcher_execution_finalization_v1_identity,
+    launcher_finalization_archive_sidecar_v1_identity, launcher_terminal_frame_v1_identity,
+    launcher_terminal_persistence_v1_identity, launcher_working_directory_identity,
+    message_identity, signed_launcher_execution_finalization_v1_identity,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -50,6 +52,8 @@ pub(crate) enum FinalizationJournalStageV1 {
     SignedFinalization,
     ArchiveRequested,
     SidecarIssued,
+    SidecarAcknowledged,
+    TerminalIssued,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -61,6 +65,7 @@ pub(crate) struct FinalizationJournalV1 {
     pub invocation_id: String,
     pub principal_mapping_identity: String,
     pub launcher_request_identity: String,
+    pub working_directory: LauncherWorkingDirectoryV1,
     pub finalization: LauncherExecutionFinalizationV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_finalization: Option<SignedLauncherExecutionFinalizationV1>,
@@ -68,6 +73,10 @@ pub(crate) struct FinalizationJournalV1 {
     pub archive_request: Option<LauncherFinalizationArchiveRequestV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar: Option<LauncherFinalizationArchiveSidecarV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_persistence: Option<LauncherFinalizationArchivePersistenceV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<LauncherTerminalFrameV1>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -94,6 +103,7 @@ impl FinalizationJournal {
         expected_owner_uid: u32,
         principal_mapping_identity: &str,
         launcher_request_identity: &str,
+        working_directory: LauncherWorkingDirectoryV1,
         finalization: LauncherExecutionFinalizationV1,
     ) -> Result<Self, FinalizationJournalError> {
         verify_store(directory, expected_owner_uid)?;
@@ -105,10 +115,13 @@ impl FinalizationJournal {
             invocation_id: finalization.completion.invocation_id.clone(),
             principal_mapping_identity: principal_mapping_identity.into(),
             launcher_request_identity: launcher_request_identity.into(),
+            working_directory,
             finalization,
             signed_finalization: None,
             archive_request: None,
             sidecar: None,
+            sidecar_persistence: None,
+            terminal: None,
         };
         journal.identity = finalization_journal_identity(&journal)?;
         write_new(&path, &journal).map_err(|error| {
@@ -191,6 +204,13 @@ impl FinalizationJournal {
                     .finalization
                     .completion
                     .crossing_transaction_identity
+            || self
+                .journal
+                .finalization
+                .completion
+                .receipt_archive_identity
+                .as_deref()
+                != Some(request.receipt_archive_identity.as_str())
             || request
                 .signed_finalization_identity
                 .as_deref()
@@ -229,12 +249,12 @@ impl FinalizationJournal {
         self.persist()
     }
 
-    pub(crate) fn acknowledge_and_finalize(
+    pub(crate) fn record_sidecar_persistence(
         &mut self,
-        persistence: &LauncherFinalizationArchivePersistenceV1,
+        persistence: LauncherFinalizationArchivePersistenceV1,
     ) -> Result<(), FinalizationJournalError> {
         if self.journal.stage != FinalizationJournalStageV1::SidecarIssued
-            || launcher_finalization_archive_persistence_v1_identity(persistence)
+            || launcher_finalization_archive_persistence_v1_identity(&persistence)
                 .ok()
                 .as_deref()
                 != Some(persistence.identity.as_str())
@@ -248,6 +268,49 @@ impl FinalizationJournal {
                 .sidecar
                 .as_ref()
                 .is_none_or(|sidecar| sidecar.identity != persistence.sidecar_identity)
+        {
+            return Err(FinalizationJournalError::InvalidJournal);
+        }
+        self.journal.stage = FinalizationJournalStageV1::SidecarAcknowledged;
+        self.journal.sidecar_persistence = Some(persistence);
+        self.persist()
+    }
+
+    pub(crate) fn record_terminal(
+        &mut self,
+        terminal: LauncherTerminalFrameV1,
+    ) -> Result<(), FinalizationJournalError> {
+        if self.journal.stage != FinalizationJournalStageV1::SidecarAcknowledged
+            || launcher_terminal_frame_v1_identity(&terminal).is_err()
+            || terminal.invocation_id != self.journal.invocation_id
+            || terminal.finalization.as_ref() != Some(&self.journal.finalization)
+        {
+            return Err(FinalizationJournalError::InvalidJournal);
+        }
+        self.journal.stage = FinalizationJournalStageV1::TerminalIssued;
+        self.journal.terminal = Some(terminal);
+        self.persist()
+    }
+
+    pub(crate) fn acknowledge_terminal_and_finalize(
+        &mut self,
+        persistence: &LauncherTerminalPersistenceV1,
+    ) -> Result<(), FinalizationJournalError> {
+        let terminal = self
+            .journal
+            .terminal
+            .as_ref()
+            .ok_or(FinalizationJournalError::InvalidJournal)?;
+        if self.journal.stage != FinalizationJournalStageV1::TerminalIssued
+            || launcher_terminal_persistence_v1_identity(persistence)
+                .ok()
+                .as_deref()
+                != Some(persistence.identity.as_str())
+            || persistence.invocation_id != self.journal.invocation_id
+            || launcher_terminal_frame_v1_identity(terminal)
+                .ok()
+                .as_deref()
+                != Some(persistence.terminal_identity.as_str())
         {
             return Err(FinalizationJournalError::InvalidJournal);
         }
@@ -272,6 +335,10 @@ pub(crate) fn finalization_journal_identity(
         || !journal.invocation_id.starts_with("invocation-")
         || !journal.principal_mapping_identity.starts_with("sha256:")
         || !journal.launcher_request_identity.starts_with("sha256:")
+        || launcher_working_directory_identity(&journal.working_directory)
+            .ok()
+            .as_deref()
+            != Some(journal.working_directory.identity.as_str())
         || launcher_execution_finalization_v1_identity(&journal.finalization)
             .ok()
             .as_deref()
@@ -306,6 +373,12 @@ fn stage_is_valid(journal: &FinalizationJournalV1) -> bool {
                     .finalization
                     .completion
                     .crossing_transaction_identity
+            && journal
+                .finalization
+                .completion
+                .receipt_archive_identity
+                .as_deref()
+                == Some(request.receipt_archive_identity.as_str())
             && request
                 .signed_finalization_identity
                 .as_deref()
@@ -329,19 +402,71 @@ fn stage_is_valid(journal: &FinalizationJournalV1) -> bool {
                         == request.crossing_transaction_identity
             })
     });
+    let sidecar_persistence_valid =
+        journal
+            .sidecar_persistence
+            .as_ref()
+            .is_some_and(|persistence| {
+                launcher_finalization_archive_persistence_v1_identity(persistence)
+                    .ok()
+                    .as_deref()
+                    == Some(persistence.identity.as_str())
+                    && journal.archive_request.as_ref().is_some_and(|request| {
+                        request.request_identity == persistence.request_identity
+                    })
+                    && journal
+                        .sidecar
+                        .as_ref()
+                        .is_some_and(|sidecar| sidecar.identity == persistence.sidecar_identity)
+            });
+    let terminal_valid = journal.terminal.as_ref().is_some_and(|terminal| {
+        launcher_terminal_frame_v1_identity(terminal).is_ok()
+            && terminal.invocation_id == journal.invocation_id
+            && terminal.finalization.as_ref() == Some(&journal.finalization)
+    });
     match journal.stage {
         FinalizationJournalStageV1::Intent => {
             journal.signed_finalization.is_none()
                 && journal.archive_request.is_none()
                 && journal.sidecar.is_none()
+                && journal.sidecar_persistence.is_none()
+                && journal.terminal.is_none()
         }
         FinalizationJournalStageV1::SignedFinalization => {
-            signed_valid && journal.archive_request.is_none() && journal.sidecar.is_none()
+            signed_valid
+                && journal.archive_request.is_none()
+                && journal.sidecar.is_none()
+                && journal.sidecar_persistence.is_none()
+                && journal.terminal.is_none()
         }
         FinalizationJournalStageV1::ArchiveRequested => {
-            signed_valid && request_valid && journal.sidecar.is_none()
+            signed_valid
+                && request_valid
+                && journal.sidecar.is_none()
+                && journal.sidecar_persistence.is_none()
+                && journal.terminal.is_none()
         }
-        FinalizationJournalStageV1::SidecarIssued => signed_valid && request_valid && sidecar_valid,
+        FinalizationJournalStageV1::SidecarIssued => {
+            signed_valid
+                && request_valid
+                && sidecar_valid
+                && journal.sidecar_persistence.is_none()
+                && journal.terminal.is_none()
+        }
+        FinalizationJournalStageV1::SidecarAcknowledged => {
+            signed_valid
+                && request_valid
+                && sidecar_valid
+                && sidecar_persistence_valid
+                && journal.terminal.is_none()
+        }
+        FinalizationJournalStageV1::TerminalIssued => {
+            signed_valid
+                && request_valid
+                && sidecar_valid
+                && sidecar_persistence_valid
+                && terminal_valid
+        }
     }
 }
 
@@ -419,8 +544,9 @@ fn sync_directory(directory: &Path) -> Result<(), FinalizationJournalError> {
 mod tests {
     use ota_authority_protocol::{
         LAUNCHER_EXECUTION_COMPLETION, LAUNCHER_FINALIZATION_ARCHIVE_PERSISTENCE,
-        LAUNCHER_FINALIZATION_ARCHIVE_REQUEST, LauncherExecutionCompletionV1,
-        LauncherExecutionOutcomeV1, SignedLauncherFinalizationArchiveV1,
+        LAUNCHER_FINALIZATION_ARCHIVE_REQUEST, LAUNCHER_TERMINAL, LAUNCHER_TERMINAL_PERSISTENCE,
+        LauncherExecutionCompletionV1, LauncherExecutionOutcomeV1, LauncherTerminalOutcomeV1,
+        LauncherTerminalStageV1, SignedLauncherFinalizationArchiveV1,
         launcher_execution_completion_v1_identity,
         launcher_finalization_archive_persistence_v1_identity,
         launcher_finalization_archive_request_v1_identity,
@@ -447,6 +573,7 @@ mod tests {
             crossing_transaction_id: String::from("transaction-1"),
             pending_crossing_transaction_identity: identity('3'),
             crossing_transaction_identity: identity('4'),
+            receipt_archive_identity: Some(identity('5')),
             outcome: LauncherExecutionOutcomeV1::Completed,
             exit_code: Some(0),
             receipt_status: String::from("passed"),
@@ -470,8 +597,21 @@ mod tests {
         finalization
     }
 
+    fn working_directory() -> LauncherWorkingDirectoryV1 {
+        let mut working_directory = LauncherWorkingDirectoryV1 {
+            schema_version: 1,
+            identity: String::new(),
+            logical_path: String::from("/srv/repository"),
+            device: 1,
+            inode: 2,
+        };
+        working_directory.identity = launcher_working_directory_identity(&working_directory)
+            .expect("working directory identity");
+        working_directory
+    }
+
     #[test]
-    fn finalization_state_survives_every_restart_until_exact_sidecar_acknowledgement() {
+    fn finalization_state_survives_every_restart_until_exact_terminal_acknowledgement() {
         let root = tempdir().expect("state root");
         let directory = root.path().join("finalization");
         fs::create_dir(&directory).expect("state directory");
@@ -486,6 +626,7 @@ mod tests {
             owner,
             &principal,
             &launcher_request,
+            working_directory(),
             finalization.clone(),
         )
         .expect("durable intent");
@@ -517,7 +658,7 @@ mod tests {
             request_identity: String::new(),
             authority_id: String::from("authority-1"),
             launcher_request_identity: launcher_request,
-            receipt_archive_identity: identity('a'),
+            receipt_archive_identity: identity('5'),
             crossing_transaction_identity: identity('4'),
             signed_finalization_identity: Some(signed_finalization.identity.clone()),
         };
@@ -569,8 +710,45 @@ mod tests {
         persistence.identity = launcher_finalization_archive_persistence_v1_identity(&persistence)
             .expect("persistence identity");
         recovered
-            .acknowledge_and_finalize(&persistence)
-            .expect("finalize after acknowledgement");
+            .record_sidecar_persistence(persistence)
+            .expect("persist sidecar acknowledgement");
+        let terminal = LauncherTerminalFrameV1 {
+            message_kind: LAUNCHER_TERMINAL.into(),
+            protocol_version: ota_authority_protocol::SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
+            invocation_id: recovered.journal().invocation_id.clone(),
+            outcome: LauncherTerminalOutcomeV1::Completed,
+            exit_code: Some(0),
+            stage: Some(LauncherTerminalStageV1::SelectedExecutionCompletedBoundaryRemoved),
+            finalization: Some(recovered.journal().finalization.clone()),
+        };
+        recovered
+            .record_terminal(terminal.clone())
+            .expect("persist terminal");
+        drop(recovered);
+
+        let mut recovered = FinalizationJournal::load_for_principal(&directory, owner, &principal)
+            .expect("load terminal")
+            .expect("terminal state exists");
+        assert_eq!(recovered.journal().terminal.as_ref(), Some(&terminal));
+        let mut terminal_persistence = LauncherTerminalPersistenceV1 {
+            schema_version: 1,
+            message_kind: LAUNCHER_TERMINAL_PERSISTENCE.into(),
+            identity: String::new(),
+            invocation_id: terminal.invocation_id.clone(),
+            terminal_identity: launcher_terminal_frame_v1_identity(&terminal)
+                .expect("terminal identity"),
+        };
+        terminal_persistence.identity =
+            launcher_terminal_persistence_v1_identity(&terminal_persistence)
+                .expect("terminal persistence identity");
+        let mut wrong = terminal_persistence.clone();
+        wrong.terminal_identity = identity('f');
+        wrong.identity =
+            launcher_terminal_persistence_v1_identity(&wrong).expect("wrong persistence identity");
+        assert!(recovered.acknowledge_terminal_and_finalize(&wrong).is_err());
+        recovered
+            .acknowledge_terminal_and_finalize(&terminal_persistence)
+            .expect("finalize after terminal acknowledgement");
         assert!(
             FinalizationJournal::load_for_principal(&directory, owner, &principal)
                 .expect("load finalized state")

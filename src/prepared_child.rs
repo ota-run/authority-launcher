@@ -2228,6 +2228,7 @@ mod tests {
                 .crossing_transaction_identity
                 .clone(),
             crossing_transaction_identity: identity('f'),
+            receipt_archive_identity: Some(identity('e')),
             outcome: ota_authority_protocol::LauncherExecutionOutcomeV1::Completed,
             exit_code: Some(0),
             receipt_status: String::from("archived"),
@@ -2414,6 +2415,7 @@ mod tests {
             descriptor: repository_file.into(),
             device: metadata.dev(),
             inode: metadata.ino(),
+            owner_uid: metadata.uid(),
         };
         let executable = File::open("/bin/true").expect("test executable");
         let config = SystemdLauncherServiceConfigV1 {

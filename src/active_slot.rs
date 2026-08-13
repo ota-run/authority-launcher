@@ -268,6 +268,10 @@ impl ActiveSlot {
         self.journal.request_identity.as_str()
     }
 
+    pub(crate) fn working_directory(&self) -> &LauncherWorkingDirectoryV1 {
+        &self.journal.working_directory
+    }
+
     pub(crate) fn record_scope(
         &mut self,
         scope: LauncherSystemdScopeV1,

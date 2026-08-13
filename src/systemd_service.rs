@@ -51,8 +51,9 @@ use ota_authority_protocol::{
     LauncherExecutionOutcomeV1, LauncherFinalizationArchivePersistenceV1,
     LauncherFinalizationArchiveRequestV1, LauncherFinalizationArchiveResponseV1,
     LauncherFinalizationArchiveSidecarV1, LauncherFinalizationArchiveSigningRequestV1,
-    LauncherFinalizationSigningRequestV1, LauncherInvocationRequestV1,
-    LauncherSignedExecutionFinalizationFrameV1, LauncherTerminalFrameV1, LauncherTerminalOutcomeV1,
+    LauncherFinalizationRecoveryRequestV1, LauncherFinalizationSigningRequestV1,
+    LauncherInvocationRequestV1, LauncherSignedExecutionFinalizationFrameV1,
+    LauncherTerminalFrameV1, LauncherTerminalOutcomeV1, LauncherTerminalPersistenceV1,
     LauncherTerminalStageV1, LauncherWorkingDirectoryV1, LeaseConsumptionRelayEvidenceV1,
     MAX_FRAME_BYTES, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1,
     SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3, SystemdProtectedLauncherInstanceEvidenceV1,
@@ -63,15 +64,18 @@ use ota_authority_protocol::{
     launcher_finalization_archive_response_v1_identity,
     launcher_finalization_archive_sidecar_v1_identity,
     launcher_finalization_archive_signing_request_v1_identity,
+    launcher_finalization_recovery_request_v1_identity,
     launcher_finalization_signing_request_v1_identity, launcher_invocation_request_identity,
-    launcher_working_directory_identity, systemd_job_principal_profile_identity,
-    systemd_job_principal_profile_v2, systemd_launcher_profile_identity,
-    systemd_launcher_profile_v3, systemd_protected_launcher_instance_v3_foundation_identity,
+    launcher_terminal_persistence_v1_identity, launcher_working_directory_identity,
+    systemd_job_principal_profile_identity, systemd_job_principal_profile_v2,
+    systemd_launcher_profile_identity, systemd_launcher_profile_v3,
+    systemd_protected_launcher_instance_v3_foundation_identity,
     validate_launcher_invocation_request_v1, validate_launcher_terminal_frame_v1,
 };
 use thiserror::Error;
 
 use crate::active_slot::{ActiveSlot, ActiveSlotError};
+use crate::archive_attachment::{locate_archive, persist_sidecar};
 #[cfg(test)]
 use crate::config::SessionPeer;
 use crate::config::{
@@ -189,6 +193,7 @@ enum BoundaryAdmission {
 enum InitialClientRequest {
     Invocation(LauncherInvocationRequestV1),
     FinalizationArchive(LauncherFinalizationArchiveRequestV1),
+    FinalizationRecovery(LauncherFinalizationRecoveryRequestV1),
 }
 
 pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
@@ -223,6 +228,23 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
     let peer =
         observe_connected_peer(&stream).map_err(|_| SystemdServiceError::PeerPostureUnavailable)?;
     let initial_request = receive_initial_request(&mut stream, config.maximum_request_bytes)?;
+    if let InitialClientRequest::FinalizationRecovery(request) = &initial_request {
+        let mapping = select_mapping_for_authority(config, request.authority_id.as_str(), &peer)?;
+        reconcile_connected_peer(&peer, mapping.job_peer.uid, mapping.job_peer.gid)
+            .map_err(|_| SystemdServiceError::PeerPostureUnavailable)?;
+        verify_peer_process_status(&peer)
+            .map_err(|_| SystemdServiceError::PeerPostureUnavailable)?;
+        let principal_mapping = systemd_principal_mapping(config, mapping)
+            .map_err(|_| SystemdServiceError::PeerUnmapped)?;
+        return serve_finalization_recovery_start(
+            config,
+            &installation,
+            &mut stream,
+            mapping,
+            principal_mapping.identity.as_str(),
+            request.clone(),
+        );
+    }
     if let InitialClientRequest::FinalizationArchive(request) = initial_request {
         let mapping = select_mapping_for_authority(config, request.authority_id.as_str(), &peer)?;
         reconcile_connected_peer(&peer, mapping.job_peer.uid, mapping.job_peer.gid)
@@ -235,6 +257,7 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
             config,
             &installation,
             &mut stream,
+            mapping,
             principal_mapping.identity.as_str(),
             request,
         );
@@ -329,6 +352,7 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
             &installation,
             &mut stream,
             invocation_id.as_str(),
+            &repository,
             *boundary,
         ),
         Err(
@@ -378,6 +402,7 @@ fn execute_selected_boundary(
     installation: &ProtectedInstallationManifestV1,
     stream: &mut UnixStream,
     invocation_id: &str,
+    repository: &crate::target_directory::OpenedRepositoryDirectory,
     mut boundary: SelectedBoundary,
 ) -> Result<u8, SystemdServiceError> {
     let completion =
@@ -407,6 +432,15 @@ fn execute_selected_boundary(
             );
         }
     };
+    if completion.receipt_archive_identity.is_none() {
+        return fail_selected_boundary(
+            config,
+            stream,
+            invocation_id,
+            boundary,
+            SystemdServiceError::FinalizationUnavailable,
+        );
+    }
 
     let scope_manager = SystemdScopeManager::connect().map_err(map_systemd_scope_error)?;
     if scope_manager
@@ -455,11 +489,13 @@ fn execute_selected_boundary(
         .principal_mapping_identity()
         .to_string();
     let launcher_request_identity = boundary.active_slot.request_identity().to_string();
+    let working_directory = boundary.active_slot.working_directory().clone();
     let mut finalization_journal = FinalizationJournal::begin(
         Path::new(FINALIZATION_DIRECTORY),
         0,
         principal_mapping_identity.as_str(),
         launcher_request_identity.as_str(),
+        working_directory,
         finalization.clone(),
     )
     .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
@@ -473,29 +509,8 @@ fn execute_selected_boundary(
         .record_signed_finalization(signed_finalization.clone())
         .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
     write_signed_finalization(stream, invocation_id, signed_finalization)?;
-    complete_archive_attachment(stream, &mut finalization_journal, invocation_id)?;
-    let (outcome, stage) = match completion.outcome {
-        LauncherExecutionOutcomeV1::Completed => (
-            LauncherTerminalOutcomeV1::Completed,
-            LauncherTerminalStageV1::SelectedExecutionCompletedBoundaryRemoved,
-        ),
-        LauncherExecutionOutcomeV1::Failed => (
-            LauncherTerminalOutcomeV1::Failed,
-            LauncherTerminalStageV1::SelectedExecutionFailedBoundaryRemoved,
-        ),
-        LauncherExecutionOutcomeV1::Interrupted => (
-            LauncherTerminalOutcomeV1::Cancelled,
-            LauncherTerminalStageV1::SelectedExecutionInterruptedBoundaryRemoved,
-        ),
-    };
-    write_terminal(
-        stream,
-        invocation_id,
-        outcome,
-        observed_exit_code,
-        Some(stage),
-        Some(finalization),
-    )?;
+    complete_archive_attachment(stream, &mut finalization_journal, invocation_id, repository)?;
+    write_selected_terminal_and_finalize(stream, &mut finalization_journal)?;
     Ok(0)
 }
 
@@ -1408,6 +1423,17 @@ fn receive_initial_request(
             }
             Ok(InitialClientRequest::FinalizationArchive(request))
         }
+        Some(ota_authority_protocol::LAUNCHER_FINALIZATION_RECOVERY_REQUEST) => {
+            let request: LauncherFinalizationRecoveryRequestV1 =
+                serde_json::from_value(value).map_err(|_| SystemdServiceError::InvalidRequest)?;
+            if launcher_finalization_recovery_request_v1_identity(&request)
+                .map_err(|_| SystemdServiceError::InvalidRequest)?
+                != request.request_identity
+            {
+                return Err(SystemdServiceError::InvalidRequest);
+            }
+            Ok(InitialClientRequest::FinalizationRecovery(request))
+        }
         _ => Err(SystemdServiceError::InvalidRequest),
     }
 }
@@ -1528,15 +1554,17 @@ fn complete_archive_attachment(
     stream: &mut UnixStream,
     journal: &mut FinalizationJournal,
     invocation_id: &str,
+    repository: &crate::target_directory::OpenedRepositoryDirectory,
 ) -> Result<(), SystemdServiceError> {
     let request: LauncherFinalizationArchiveRequestV1 = receive_typed_frame(stream)?;
-    complete_archive_attachment_for_request(stream, journal, invocation_id, request)
+    complete_archive_attachment_for_request(stream, journal, invocation_id, repository, request)
 }
 
 fn complete_archive_attachment_for_request(
     stream: &mut UnixStream,
     journal: &mut FinalizationJournal,
     invocation_id: &str,
+    repository: &crate::target_directory::OpenedRepositoryDirectory,
     request: LauncherFinalizationArchiveRequestV1,
 ) -> Result<(), SystemdServiceError> {
     if launcher_finalization_archive_request_v1_identity(&request)
@@ -1545,12 +1573,21 @@ fn complete_archive_attachment_for_request(
     {
         return Err(SystemdServiceError::FinalizationUnavailable);
     }
+    let target = locate_archive(
+        repository.descriptor.as_raw_fd(),
+        repository.owner_uid,
+        request.receipt_archive_identity.as_str(),
+        request.crossing_transaction_identity.as_str(),
+    )
+    .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
     match journal.journal().stage {
         FinalizationJournalStageV1::SignedFinalization => journal
             .record_archive_request(request.clone())
             .map_err(|_| SystemdServiceError::FinalizationUnavailable)?,
         FinalizationJournalStageV1::ArchiveRequested
         | FinalizationJournalStageV1::SidecarIssued
+        | FinalizationJournalStageV1::SidecarAcknowledged
+        | FinalizationJournalStageV1::TerminalIssued
             if journal.journal().archive_request.as_ref() == Some(&request) => {}
         _ => return Err(SystemdServiceError::FinalizationUnavailable),
     }
@@ -1598,12 +1635,14 @@ fn complete_archive_attachment_for_request(
             .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
         sidecar
     };
+    persist_sidecar(&target, &sidecar).map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
     let mut response = LauncherFinalizationArchiveResponseV1 {
         schema_version: 1,
         message_kind: ota_authority_protocol::LAUNCHER_FINALIZATION_ARCHIVE_RESPONSE.into(),
         response_identity: String::new(),
         request_identity: request.request_identity.clone(),
         invocation_id: invocation_id.into(),
+        sidecar_file_name: Some(target.sidecar_file_name.clone()),
         sidecar,
     };
     response.response_identity = launcher_finalization_archive_response_v1_identity(&response)
@@ -1616,15 +1655,76 @@ fn complete_archive_attachment_for_request(
     {
         return Err(SystemdServiceError::FinalizationUnavailable);
     }
-    journal
-        .acknowledge_and_finalize(&persistence)
-        .map_err(|_| SystemdServiceError::FinalizationUnavailable)
+    persist_sidecar(&target, &response.sidecar)
+        .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
+    match journal.journal().stage {
+        FinalizationJournalStageV1::SidecarIssued => journal
+            .record_sidecar_persistence(persistence)
+            .map_err(|_| SystemdServiceError::FinalizationUnavailable),
+        FinalizationJournalStageV1::SidecarAcknowledged
+        | FinalizationJournalStageV1::TerminalIssued
+            if journal.journal().sidecar_persistence.as_ref() == Some(&persistence) =>
+        {
+            Ok(())
+        }
+        _ => Err(SystemdServiceError::FinalizationUnavailable),
+    }
+}
+
+fn serve_finalization_recovery_start(
+    config: &SystemdLauncherServiceConfigV1,
+    installation: &ProtectedInstallationManifestV1,
+    stream: &mut UnixStream,
+    mapping: &crate::config::SystemdPrincipalMappingV1,
+    principal_mapping_identity: &str,
+    recovery: LauncherFinalizationRecoveryRequestV1,
+) -> Result<u8, SystemdServiceError> {
+    if launcher_finalization_recovery_request_v1_identity(&recovery)
+        .map_err(|_| SystemdServiceError::FinalizationUnavailable)?
+        != recovery.request_identity
+    {
+        return Err(SystemdServiceError::FinalizationUnavailable);
+    }
+    let mut journal = FinalizationJournal::load_for_principal(
+        Path::new(FINALIZATION_DIRECTORY),
+        0,
+        principal_mapping_identity,
+    )
+    .map_err(|_| SystemdServiceError::FinalizationUnavailable)?
+    .ok_or(SystemdServiceError::FinalizationUnavailable)?;
+    if journal.journal().launcher_request_identity != recovery.launcher_request_identity {
+        return Err(SystemdServiceError::FinalizationUnavailable);
+    }
+    if journal.journal().stage == FinalizationJournalStageV1::Intent {
+        let signed =
+            sign_execution_finalization(config, installation, &journal.journal().finalization)?;
+        journal
+            .record_signed_finalization(signed)
+            .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
+    }
+    let signed = journal
+        .journal()
+        .signed_finalization
+        .clone()
+        .ok_or(SystemdServiceError::FinalizationUnavailable)?;
+    let invocation_id = journal.journal().invocation_id.clone();
+    write_signed_finalization(stream, invocation_id.as_str(), signed)?;
+    let request: LauncherFinalizationArchiveRequestV1 = receive_typed_frame(stream)?;
+    serve_finalization_recovery(
+        config,
+        installation,
+        stream,
+        mapping,
+        principal_mapping_identity,
+        request,
+    )
 }
 
 fn serve_finalization_recovery(
     config: &SystemdLauncherServiceConfigV1,
     installation: &ProtectedInstallationManifestV1,
     stream: &mut UnixStream,
+    mapping: &crate::config::SystemdPrincipalMappingV1,
     principal_mapping_identity: &str,
     request: LauncherFinalizationArchiveRequestV1,
 ) -> Result<u8, SystemdServiceError> {
@@ -1638,6 +1738,17 @@ fn serve_finalization_recovery(
     if journal.journal().launcher_request_identity != request.launcher_request_identity {
         return Err(SystemdServiceError::FinalizationUnavailable);
     }
+    let working_directory = journal.journal().working_directory.clone();
+    let repository = open_repository_directory(
+        config,
+        &mapping.execution,
+        working_directory.logical_path.as_str(),
+    )
+    .map_err(map_target_directory_error)?;
+    if repository.device != working_directory.device || repository.inode != working_directory.inode
+    {
+        return Err(SystemdServiceError::FinalizationUnavailable);
+    }
     if journal.journal().stage == FinalizationJournalStageV1::Intent {
         let signed =
             sign_execution_finalization(config, installation, &journal.journal().finalization)?;
@@ -1646,8 +1757,18 @@ fn serve_finalization_recovery(
             .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
     }
     let invocation_id = journal.journal().invocation_id.clone();
-    let finalization = journal.journal().finalization.clone();
-    complete_archive_attachment_for_request(stream, &mut journal, invocation_id.as_str(), request)?;
+    complete_archive_attachment_for_request(
+        stream,
+        &mut journal,
+        invocation_id.as_str(),
+        &repository,
+        request,
+    )?;
+    write_selected_terminal_and_finalize(stream, &mut journal)?;
+    Ok(0)
+}
+
+fn selected_terminal(finalization: LauncherExecutionFinalizationV1) -> LauncherTerminalFrameV1 {
     let (outcome, stage) = match finalization.completion.outcome {
         LauncherExecutionOutcomeV1::Completed => (
             LauncherTerminalOutcomeV1::Completed,
@@ -1662,15 +1783,45 @@ fn serve_finalization_recovery(
             LauncherTerminalStageV1::SelectedExecutionInterruptedBoundaryRemoved,
         ),
     };
-    write_terminal(
-        stream,
-        invocation_id.as_str(),
+    LauncherTerminalFrameV1 {
+        message_kind: LAUNCHER_TERMINAL.into(),
+        protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
+        invocation_id: finalization.completion.invocation_id.clone(),
         outcome,
-        finalization.observed_exit_code,
-        Some(stage),
-        Some(finalization),
-    )?;
-    Ok(0)
+        exit_code: finalization.observed_exit_code,
+        stage: Some(stage),
+        finalization: Some(finalization),
+    }
+}
+
+fn write_selected_terminal_and_finalize(
+    stream: &mut UnixStream,
+    journal: &mut FinalizationJournal,
+) -> Result<(), SystemdServiceError> {
+    if journal.journal().stage == FinalizationJournalStageV1::SidecarAcknowledged {
+        let terminal = selected_terminal(journal.journal().finalization.clone());
+        validate_launcher_terminal_frame_v1(&terminal)
+            .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
+        journal
+            .record_terminal(terminal)
+            .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
+    }
+    let terminal = journal
+        .journal()
+        .terminal
+        .clone()
+        .ok_or(SystemdServiceError::FinalizationUnavailable)?;
+    write_typed_frame(stream, &terminal)?;
+    let persistence: LauncherTerminalPersistenceV1 = receive_typed_frame(stream)?;
+    if launcher_terminal_persistence_v1_identity(&persistence)
+        .map_err(|_| SystemdServiceError::FinalizationUnavailable)?
+        != persistence.identity
+    {
+        return Err(SystemdServiceError::FinalizationUnavailable);
+    }
+    journal
+        .acknowledge_terminal_and_finalize(&persistence)
+        .map_err(|_| SystemdServiceError::FinalizationUnavailable)
 }
 
 fn receive_typed_frame<T: serde::de::DeserializeOwned>(
@@ -2318,6 +2469,7 @@ mod tests {
             descriptor: repository_file.into(),
             device: repository_metadata.dev(),
             inode: repository_metadata.ino(),
+            owner_uid: repository_metadata.uid(),
         };
         let identity = |character: char| format!("sha256:{}", character.to_string().repeat(64));
         let config = SystemdLauncherServiceConfigV1 {

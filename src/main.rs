@@ -23,6 +23,8 @@
 #[cfg(target_os = "linux")]
 mod active_slot;
 #[cfg(target_os = "linux")]
+mod archive_attachment;
+#[cfg(target_os = "linux")]
 mod closed_profile_observations;
 #[cfg(unix)]
 mod config;

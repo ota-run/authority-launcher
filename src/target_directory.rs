@@ -84,6 +84,7 @@ pub(crate) struct OpenedRepositoryDirectory {
     pub descriptor: OwnedFd,
     pub device: u64,
     pub inode: u64,
+    pub owner_uid: u32,
 }
 
 pub(crate) fn open_repository_directory(
@@ -148,6 +149,7 @@ pub(crate) fn open_repository_directory(
         descriptor,
         device: metadata.st_dev,
         inode: metadata.st_ino,
+        owner_uid: execution.uid,
     })
 }
 
