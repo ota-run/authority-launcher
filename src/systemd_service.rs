@@ -129,6 +129,11 @@ const PRESSURE_EXIT_AFTER_FINALIZATION_INTENT_MARKER: &str =
     "/run/ota/authority-launcher-pressure-exit-after-finalization-intent";
 #[cfg(feature = "systemd-pressure-faults")]
 const PRESSURE_EXIT_AFTER_FINALIZATION_INTENT_CODE: i32 = 91;
+#[cfg(feature = "systemd-pressure-faults")]
+const PRESSURE_EXIT_AFTER_TERMINAL_RECORDED_MARKER: &str =
+    "/run/ota/authority-launcher-pressure-exit-after-terminal-recorded";
+#[cfg(feature = "systemd-pressure-faults")]
+const PRESSURE_EXIT_AFTER_TERMINAL_RECORDED_CODE: i32 = 92;
 
 #[derive(Debug, Error)]
 pub(crate) enum SystemdServiceError {
@@ -1119,6 +1124,23 @@ fn pressure_exit_after_finalization_intent_recorded() -> Result<(), SystemdServi
 }
 
 #[cfg(feature = "systemd-pressure-faults")]
+fn pressure_exit_after_terminal_recorded() -> Result<(), SystemdServiceError> {
+    if !consume_pressure_exit_marker(
+        Path::new(PRESSURE_EXIT_AFTER_TERMINAL_RECORDED_MARKER),
+        Path::new("/"),
+        0,
+    )? {
+        return Ok(());
+    }
+    eprintln!(
+        "ota-authority-launcher: bounded pressure finalization crash stage=terminal_recorded"
+    );
+    // Cleanup and archive attachment are complete and the exact terminal is durable. Recovery
+    // must replay that terminal without executing the selected work unit again.
+    unsafe { libc::_exit(PRESSURE_EXIT_AFTER_TERMINAL_RECORDED_CODE) }
+}
+
+#[cfg(feature = "systemd-pressure-faults")]
 pub(crate) fn pressure_exit_after_intent_persistence_acknowledged()
 -> Result<(), SystemdServiceError> {
     if !consume_pressure_exit_marker(
@@ -1150,6 +1172,11 @@ fn pressure_exit_after_execution_completion_recorded() -> Result<(), SystemdServ
 
 #[cfg(not(feature = "systemd-pressure-faults"))]
 fn pressure_exit_after_finalization_intent_recorded() -> Result<(), SystemdServiceError> {
+    Ok(())
+}
+
+#[cfg(not(feature = "systemd-pressure-faults"))]
+fn pressure_exit_after_terminal_recorded() -> Result<(), SystemdServiceError> {
     Ok(())
 }
 
@@ -1806,6 +1833,7 @@ fn write_selected_terminal_and_finalize(
             .record_terminal(terminal)
             .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
     }
+    pressure_exit_after_terminal_recorded()?;
     let terminal = journal
         .journal()
         .terminal

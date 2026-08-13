@@ -58,7 +58,7 @@ jobs:
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/systemd-v3-evidence
           EXPECTED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
-          EXPECTED_PROTOCOL_REVISION: b7c4c4017a5441d77a631c4a1c0b05733b464010
+          EXPECTED_PROTOCOL_REVISION: 866bb2a4f9b5a9e9658cf80a1b6a2e2150ebedfb
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR"
@@ -710,6 +710,54 @@ jobs:
             > "$EVIDENCE_DIR/finalization-crash.repository.after.sha256"
           diff -u "$EVIDENCE_DIR/finalization-crash.repository.before.sha256" \
             "$EVIDENCE_DIR/finalization-crash.repository.after.sha256"
+
+          repository_content_manifest \
+            > "$EVIDENCE_DIR/terminal-crash.repository.before.sha256"
+          reset_services
+          set_broker_scenario allowed
+          sudo install -o root -g root -m 0600 /dev/null \
+            /run/ota/authority-launcher-pressure-exit-after-terminal-recorded
+          case_cursor=$(journal_cursor)
+          if ! sudo systemctl start ota-authority-pressure-runner.service; then
+            capture_journal terminal-crash-recovery-start-failure "$case_cursor"
+            exit 1
+          fi
+          capture_journal terminal-crash-recovery "$case_cursor"
+          grep -q 'bounded pressure finalization crash stage=terminal_recorded' \
+            "$EVIDENCE_DIR/terminal-crash-recovery.journal.txt"
+          capture_client_json terminal-crash-recovery "$case_cursor"
+          jq -e \
+            '.ok == true
+             and .terminal.stage == "selected_execution_completed_boundary_removed"
+             and .terminal.outcome == "completed"
+             and .terminal.exit_code == 0
+             and (.finalization_sidecar | endswith(".launcher-finalization"))' \
+            "$EVIDENCE_DIR/terminal-crash-recovery.json"
+          test "$(sudo wc -l "$PRESSURE_REPOSITORY/selected-work-executed" \
+            | awk '{print $1}')" -eq 1
+          assert_terminal_clean terminal-crash-recovery true
+          set +e
+          sudo sh -c \
+            'cd "$1" && /usr/lib/ota-authority/bin/ota receipt --history --json' \
+            sh "$PRESSURE_REPOSITORY" \
+            2> >(tee "$EVIDENCE_DIR/terminal-crash-recovery.receipt-history.stderr.txt" >&2) \
+            | tee "$EVIDENCE_DIR/terminal-crash-recovery.receipt-history.json"
+          terminal_history_status=${PIPESTATUS[0]}
+          set -e
+          test "$terminal_history_status" -eq 0
+          jq -e \
+            '.ok == true
+             and .summary.archive_count == 1
+             and .summary.invalid_archive_count == 0
+             and (.archives | length) == 1
+             and (.invalid_archives | length) == 0' \
+            "$EVIDENCE_DIR/terminal-crash-recovery.receipt-history.json"
+          sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
+            "$PRESSURE_REPOSITORY/selected-work-executed"
+          repository_content_manifest \
+            > "$EVIDENCE_DIR/terminal-crash.repository.after.sha256"
+          diff -u "$EVIDENCE_DIR/terminal-crash.repository.before.sha256" \
+            "$EVIDENCE_DIR/terminal-crash.repository.after.sha256"
 
           repository_content_manifest > "$EVIDENCE_DIR/selected-failure.repository.before.sha256"
           sudo cp "$PRESSURE_REPOSITORY/ota.yaml" \
