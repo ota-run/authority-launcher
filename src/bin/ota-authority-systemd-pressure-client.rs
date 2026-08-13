@@ -229,8 +229,9 @@ fn validate_pressure_terminal(
         && terminal.exit_code == Some(2)
         && refusal_stage_matches;
     if !refusal_matches && !selected_matches {
-        return Err(String::from(
-            "the launcher did not confirm the expected bounded terminal outcome",
+        return Err(format!(
+            "the launcher did not confirm the expected bounded terminal outcome: outcome={:?}, stage={:?}, exit_code={:?}",
+            terminal.outcome, terminal.stage, terminal.exit_code
         ));
     }
     Ok(())
