@@ -972,7 +972,7 @@ jobs:
           sudo mv /var/lib/ota/authority-attestor-signing-key.unavailable \
             /var/lib/ota/authority-attestor-signing-key
 
-          repository_manifest > "$EVIDENCE_DIR/crash-first.repository.before.sha256"
+          repository_content_manifest > "$EVIDENCE_DIR/crash-first.repository.before.sha256"
           reset_services
           sudo install -d -o root -g root -m 0755 /run/ota
           sudo install -o root -g root -m 0600 /dev/null \
@@ -1014,12 +1014,14 @@ jobs:
           capture_journal crash-recovery "$case_cursor"
           grep -q 'bounded pressure v3 stage=authorization_received' \
             "$EVIDENCE_DIR/crash-recovery.journal.txt"
-          assert_terminal_clean crash-recovery
-          repository_manifest > "$EVIDENCE_DIR/crash-first.repository.after.sha256"
+          assert_terminal_clean crash-recovery true
+          sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
+            "$PRESSURE_REPOSITORY/selected-work-executed"
+          repository_content_manifest > "$EVIDENCE_DIR/crash-first.repository.after.sha256"
           diff -u "$EVIDENCE_DIR/crash-first.repository.before.sha256" \
             "$EVIDENCE_DIR/crash-first.repository.after.sha256"
 
-          repository_manifest > "$EVIDENCE_DIR/decision-crash.repository.before.sha256"
+          repository_content_manifest > "$EVIDENCE_DIR/decision-crash.repository.before.sha256"
           reset_services
           set_broker_scenario allowed
           sudo install -o root -g root -m 0600 /dev/null \
@@ -1087,12 +1089,14 @@ jobs:
             "$EVIDENCE_DIR/decision-crash-recovery.relay-evidence.jsonl")
           test "$fresh_request" != "$crashed_request"
           test "$fresh_scope" = "$crashed_scope"
-          assert_terminal_clean decision-crash-recovery
-          repository_manifest > "$EVIDENCE_DIR/decision-crash.repository.after.sha256"
+          assert_terminal_clean decision-crash-recovery true
+          sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
+            "$PRESSURE_REPOSITORY/selected-work-executed"
+          repository_content_manifest > "$EVIDENCE_DIR/decision-crash.repository.after.sha256"
           diff -u "$EVIDENCE_DIR/decision-crash.repository.before.sha256" \
             "$EVIDENCE_DIR/decision-crash.repository.after.sha256"
 
-          repository_manifest > "$EVIDENCE_DIR/intent-ack-crash.repository.before.sha256"
+          repository_content_manifest > "$EVIDENCE_DIR/intent-ack-crash.repository.before.sha256"
           reset_services
           set_broker_scenario allowed
           sudo install -o root -g root -m 0600 /dev/null \
@@ -1134,7 +1138,7 @@ jobs:
             exit 1
           fi
           capture_journal intent-ack-crash-recovery "$case_cursor"
-          assert_terminal_clean intent-ack-crash-recovery
+          assert_terminal_clean intent-ack-crash-recovery true
           assert_count 1 'bounded pressure v3 stage=lease_consume_forwarded' \
             "$EVIDENCE_DIR/intent-ack-crash-recovery.journal.txt"
           extract_consumption_relay_evidence intent-ack-crash-recovery 1
@@ -1146,11 +1150,13 @@ jobs:
           test "$retry_consume" != "$abandoned_intent_consume"
           test "$(sudo find /var/lib/ota/authority-launcher/active \
             -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 0
-          repository_manifest > "$EVIDENCE_DIR/intent-ack-crash.repository.after.sha256"
+          sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
+            "$PRESSURE_REPOSITORY/selected-work-executed"
+          repository_content_manifest > "$EVIDENCE_DIR/intent-ack-crash.repository.after.sha256"
           diff -u "$EVIDENCE_DIR/intent-ack-crash.repository.before.sha256" \
             "$EVIDENCE_DIR/intent-ack-crash.repository.after.sha256"
 
-          repository_manifest > "$EVIDENCE_DIR/consumption-crash.repository.before.sha256"
+          repository_content_manifest > "$EVIDENCE_DIR/consumption-crash.repository.before.sha256"
           reset_services
           set_broker_scenario allowed
           sudo install -o root -g root -m 0600 /dev/null \
@@ -1203,7 +1209,7 @@ jobs:
             exit 1
           fi
           capture_journal consumption-crash-recovery "$case_cursor"
-          assert_terminal_clean consumption-crash-recovery
+          assert_terminal_clean consumption-crash-recovery true
           # Recovery consumes no additional frame for the crashed work unit. The accepted retry is
           # a fresh invocation with a different request identity and its own bounded consumption.
           assert_count 1 'bounded pressure v3 stage=lease_consume_forwarded' \
@@ -1214,7 +1220,9 @@ jobs:
           fresh_consume=$(jq -r '.consume_request_identity' \
             "$EVIDENCE_DIR/consumption-crash-recovery.lease-relay-evidence.jsonl")
           test "$fresh_consume" != "$crashed_consume"
-          repository_manifest > "$EVIDENCE_DIR/consumption-crash.repository.after.sha256"
+          sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
+            "$PRESSURE_REPOSITORY/selected-work-executed"
+          repository_content_manifest > "$EVIDENCE_DIR/consumption-crash.repository.after.sha256"
           diff -u "$EVIDENCE_DIR/consumption-crash.repository.before.sha256" \
             "$EVIDENCE_DIR/consumption-crash.repository.after.sha256"
 
