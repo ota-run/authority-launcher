@@ -1554,13 +1554,21 @@ mod tests {
         assert!(peer_pid >= 0, "fork must succeed");
         if peer_pid == 0 {
             drop(listener);
-            let result = UnixStream::connect(&socket_path).and_then(|mut stream| {
-                stream.write_all(
-                    ota_authority_launcher::linux_observations::BROKER_PROXY_IDENTITY_PREFACE,
-                )?;
-                unsafe { libc::pause() };
-                Ok(())
-            });
+            let result =
+                UnixStream::connect(&socket_path).and_then(|mut stream| {
+                    let mut challenge = [0_u8; 1];
+                    stream.read_exact(&mut challenge)?;
+                    if challenge.as_slice()
+                    != ota_authority_launcher::linux_observations::BROKER_PROXY_IDENTITY_CHALLENGE
+                {
+                    return Err(std::io::Error::other("unexpected broker identity challenge"));
+                }
+                    stream.write_all(
+                        ota_authority_launcher::linux_observations::BROKER_PROXY_IDENTITY_PREFACE,
+                    )?;
+                    unsafe { libc::pause() };
+                    Ok(())
+                });
             unsafe { libc::_exit(if result.is_ok() { 0 } else { 90 }) };
         }
 
@@ -1617,18 +1625,26 @@ mod tests {
         assert!(peer_pid >= 0, "fork must succeed");
         if peer_pid == 0 {
             drop(listener);
-            let result = UnixStream::connect(&socket_path).and_then(|mut stream| {
-                stream.write_all(
-                    ota_authority_launcher::linux_observations::BROKER_PROXY_IDENTITY_PREFACE,
-                )?;
-                let mut unexpected = [0_u8; 1];
-                match stream.read(&mut unexpected)? {
-                    0 => Ok(()),
-                    _ => Err(std::io::Error::other(
-                        "unexpected launcher data after broker operation",
-                    )),
+            let result =
+                UnixStream::connect(&socket_path).and_then(|mut stream| {
+                    let mut challenge = [0_u8; 1];
+                    stream.read_exact(&mut challenge)?;
+                    if challenge.as_slice()
+                    != ota_authority_launcher::linux_observations::BROKER_PROXY_IDENTITY_CHALLENGE
+                {
+                    return Err(std::io::Error::other("unexpected broker identity challenge"));
                 }
-            });
+                    stream.write_all(
+                        ota_authority_launcher::linux_observations::BROKER_PROXY_IDENTITY_PREFACE,
+                    )?;
+                    let mut unexpected = [0_u8; 1];
+                    match stream.read(&mut unexpected)? {
+                        0 => Ok(()),
+                        _ => Err(std::io::Error::other(
+                            "unexpected launcher data after broker operation",
+                        )),
+                    }
+                });
             unsafe { libc::_exit(if result.is_ok() { 0 } else { 90 }) };
         }
 

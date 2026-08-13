@@ -32,6 +32,8 @@
   receipt status. The launcher fsyncs that completion before acknowledgement, relays bounded
   sequenced output, reconciles the actual child exit, and emits terminal evidence only after exact
   scope removal, empty or absent cgroup confirmation, child reaping, and active-slot removal.
+  A launcher readiness challenge ensures credential and pidfd ancillary capture is enabled before
+  the broker proxy sends its authenticated identity preface.
   Refusal and uncertain-cleanup paths remain fail-closed. Immutable Linux/x64 PID 1 pressure run
   [31663366909](https://github.com/ota-run/authority-launcher/actions/runs/31663366909)
   proves completed, failed, interrupted, replay-refused, and crash-recovered selected execution

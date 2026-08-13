@@ -28,7 +28,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
@@ -37,6 +37,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const MAX_PROC_STATUS_BYTES: u64 = 64 * 1024;
+pub const BROKER_PROXY_IDENTITY_CHALLENGE: &[u8] = b"I";
 pub const BROKER_PROXY_IDENTITY_PREFACE: &[u8] = b"O";
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -108,6 +109,11 @@ pub fn receive_authenticated_peer_preface(
             return Err(LinuxObservationError::PeerCredentialsUnavailable);
         }
     }
+
+    let mut stream = stream;
+    stream
+        .write_all(BROKER_PROXY_IDENTITY_CHALLENGE)
+        .map_err(|_| LinuxObservationError::PeerCredentialsUnavailable)?;
 
     let mut preface = [0_u8; 1];
     let mut iov = libc::iovec {
@@ -413,7 +419,6 @@ fn parse_hex(value: &str) -> Result<u64, LinuxObservationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
 
