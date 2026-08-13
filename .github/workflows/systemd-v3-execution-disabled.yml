@@ -1142,16 +1142,22 @@ jobs:
             echo 'crash injection reached authorization unexpectedly' >&2
             exit 1
           fi
-          test "$(systemctl show ota-authority-launcher.service -p ExecMainStatus --value)" = 86
+          grep -q 'status=86' "$EVIDENCE_DIR/crash-first.journal.txt"
+          grep -q 'portable finalization is unavailable' \
+            "$EVIDENCE_DIR/crash-first.journal.txt"
           crash_slots=$(sudo find /var/lib/ota/authority-launcher/active -mindepth 1 -maxdepth 1 -type f | wc -l)
-          printf 'active_slots=%s\n' "$crash_slots" > "$EVIDENCE_DIR/crash-first.boundary.txt"
-          test "$crash_slots" -eq 1
-          crash_slot=$(sudo find /var/lib/ota/authority-launcher/active -mindepth 1 -maxdepth 1 -type f -print -quit)
-          sudo cp "$crash_slot" "$EVIDENCE_DIR/crash-first.active-slot.json"
-          sudo chown "$(id -u):$(id -g)" "$EVIDENCE_DIR/crash-first.active-slot.json"
-          jq -e '.stage == "scope_attached" and .child != null and .scope != null' \
-            "$EVIDENCE_DIR/crash-first.active-slot.json"
+          crash_finalizations=$(sudo find /var/lib/ota/authority-launcher/finalization \
+            -mindepth 1 -maxdepth 1 -type f | wc -l)
+          crash_scopes=$(systemctl list-units 'ota-authority-invocation-*.scope' \
+            --all --no-legend --plain | wc -l)
+          printf 'active_slots=%s\nfinalization_journals=%s\nscopes=%s\n' \
+            "$crash_slots" "$crash_finalizations" "$crash_scopes" \
+            > "$EVIDENCE_DIR/crash-first.boundary.txt"
+          test "$crash_slots" -eq 0
+          test "$crash_finalizations" -eq 0
+          test "$crash_scopes" -eq 0
           test ! -e "$PRESSURE_REPOSITORY/selected-work-executed"
+          test ! -e "$PRESSURE_REPOSITORY/.ota"
 
           sudo systemctl reset-failed
           case_cursor=$(journal_cursor)
@@ -1169,8 +1175,6 @@ jobs:
           grep -q 'bounded pressure v3 stage=authorization_received' \
             "$EVIDENCE_DIR/crash-recovery.journal.txt"
           assert_terminal_clean crash-recovery true
-          assert_recorded_boundary_removed crash-recovery \
-            "$EVIDENCE_DIR/crash-first.active-slot.json"
           sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
             "$PRESSURE_REPOSITORY/selected-work-executed"
           repository_content_manifest > "$EVIDENCE_DIR/crash-first.repository.after.sha256"
