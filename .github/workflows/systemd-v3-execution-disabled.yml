@@ -648,11 +648,18 @@ jobs:
           test -n "$selected_child"
           sudo kill -INT "$selected_child"
           for _ in $(seq 1 100); do
-            test "$(systemctl is-active ota-authority-pressure-runner.service || true)" != activating \
-              && break
+            selected_service_state=$(systemctl is-active \
+              ota-authority-pressure-runner.service || true)
+            case "$selected_service_state" in
+              active|activating) ;;
+              *) break ;;
+            esac
             sleep 0.1
           done
-          test "$(systemctl is-active ota-authority-pressure-runner.service || true)" != activating
+          selected_service_state=$(systemctl is-active \
+            ota-authority-pressure-runner.service || true)
+          test "$selected_service_state" != active
+          test "$selected_service_state" != activating
           capture_journal selected-interruption "$case_cursor"
           capture_client_json selected-interruption "$case_cursor"
           jq -e \
