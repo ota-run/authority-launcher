@@ -627,7 +627,7 @@ jobs:
           repository_content_manifest > "$EVIDENCE_DIR/selected-interruption.repository.before.sha256"
           sudo cp "$PRESSURE_REPOSITORY/ota.yaml" \
             "$EVIDENCE_DIR/selected-interruption.original-ota.yaml"
-          sudo sed -i '/from pathlib/c\                  - "import time; time.sleep(60)"' \
+          sudo sed -i '/from pathlib/c\                  - "from pathlib import Path; Path(\x27selected-work-started\x27).write_text(\x27started\x27); import time; time.sleep(60)"' \
             "$PRESSURE_REPOSITORY/ota.yaml"
           reset_services
           set_broker_scenario allowed
@@ -635,9 +635,9 @@ jobs:
           sudo systemctl start --no-block ota-authority-pressure-runner.service
           selected_child=
           for _ in $(seq 1 100); do
-            selected_slot=$(sudo find /var/lib/ota/authority-launcher/active \
-              -mindepth 1 -maxdepth 1 -type f -print -quit)
-            if test -n "$selected_slot"; then
+            if sudo test -f "$PRESSURE_REPOSITORY/selected-work-started"; then
+              selected_slot=$(sudo find /var/lib/ota/authority-launcher/active \
+                -mindepth 1 -maxdepth 1 -type f -print -quit)
               selected_child=$(sudo jq -r \
                 'select(.stage == "lease_consumption_verified") | .child.pid' \
                 "$selected_slot")
@@ -646,6 +646,7 @@ jobs:
             sleep 0.1
           done
           test -n "$selected_child"
+          test "$(sudo cat "$PRESSURE_REPOSITORY/selected-work-started")" = started
           sudo kill -INT "$selected_child"
           for _ in $(seq 1 100); do
             selected_service_state=$(systemctl is-active \
@@ -678,7 +679,8 @@ jobs:
             "$EVIDENCE_DIR/selected-interruption.json"
           test ! -e "$PRESSURE_REPOSITORY/selected-work-executed"
           sudo test -d "$PRESSURE_REPOSITORY/.ota/receipts"
-          sudo rm -rf "$PRESSURE_REPOSITORY/.ota"
+          sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
+            "$PRESSURE_REPOSITORY/selected-work-started"
           sudo cp "$EVIDENCE_DIR/selected-interruption.original-ota.yaml" \
             "$PRESSURE_REPOSITORY/ota.yaml"
           sudo chown ota-authority-exec:ota-authority-exec \
