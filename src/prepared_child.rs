@@ -648,7 +648,7 @@ impl PreparedChild {
                 return if libc::WIFEXITED(status) {
                     Ok(Some(libc::WEXITSTATUS(status)))
                 } else if libc::WIFSIGNALED(status) {
-                    Ok(None)
+                    Ok(Some(128 + libc::WTERMSIG(status)))
                 } else {
                     Err(PreparedChildError::CleanupFailed)
                 };
@@ -2275,6 +2275,43 @@ mod tests {
             read_json_frame_blocking(&mut pressure_client).expect("second output");
         assert_eq!((first.sequence, second.sequence), (0, 1));
         assert_ne!(first.stream, second.stream);
+    }
+
+    #[test]
+    fn selected_child_signal_is_observed_as_canonical_exit_code() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork selected child");
+        if pid == 0 {
+            unsafe {
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        let (launcher_session, _core) = UnixStream::pair().expect("completion session");
+        let mut child = PreparedChild {
+            pid,
+            record: LauncherChildProcessV1 {
+                schema_version: 1,
+                identity: identity('1'),
+                invocation_id: String::from("invocation"),
+                request_identity: identity('2'),
+                pid: pid as u32,
+                process_start_time_identity: identity('3'),
+                ota_binary_identity: identity('4'),
+                principal_mapping_identity: identity('5'),
+                working_directory_identity: identity('6'),
+            },
+            launcher_session,
+            stdout: None,
+            stderr: None,
+        };
+        assert_eq!(
+            child
+                .wait_and_reap_selected_child()
+                .expect("reap signalled child"),
+            Some(143)
+        );
     }
 
     #[test]
