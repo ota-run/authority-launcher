@@ -29,6 +29,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: systemd-v3-selected-execution-pressure
+  cancel-in-progress: false
+
 jobs:
   systemd-v3:
     name: Prove signed V3 one-use selected execution and refusal cleanup
