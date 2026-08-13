@@ -627,7 +627,24 @@ jobs:
           repository_content_manifest > "$EVIDENCE_DIR/selected-interruption.repository.before.sha256"
           sudo cp "$PRESSURE_REPOSITORY/ota.yaml" \
             "$EVIDENCE_DIR/selected-interruption.original-ota.yaml"
-          sudo sed -i '/from pathlib/c\                  - "from pathlib import Path; Path(\x27selected-work-started\x27).write_text(\x27started\x27); import time; time.sleep(60)"' \
+          sudo tee "$PRESSURE_REPOSITORY/ota.yaml" >/dev/null <<'YAML'
+          version: 1
+          project:
+            name: systemd-v3-pressure
+          governance:
+            crossing_authority:
+              authority_id: platform-release-authority
+          tasks:
+            governed:
+              description: One selected execution that remains active for interruption pressure
+              command:
+                exe: python3
+                args:
+                  - -c
+                  - "from pathlib import Path; Path('selected-work-started').write_text('started'); import time; time.sleep(60)"
+              safe_for_agent: false
+          YAML
+          sudo chown ota-authority-exec:ota-authority-exec \
             "$PRESSURE_REPOSITORY/ota.yaml"
           (cd "$PRESSURE_REPOSITORY" && \
             /usr/lib/ota-authority/bin/ota validate --json) \
