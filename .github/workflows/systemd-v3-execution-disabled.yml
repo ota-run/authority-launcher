@@ -58,7 +58,7 @@ jobs:
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/systemd-v3-evidence
           EXPECTED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
-          EXPECTED_PROTOCOL_REVISION: 866bb2a4f9b5a9e9658cf80a1b6a2e2150ebedfb
+          EXPECTED_PROTOCOL_REVISION: 3d6a41cd796d44b447ef93ab709d0d1b61b572ad
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR"

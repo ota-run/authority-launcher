@@ -34,7 +34,11 @@
   then atomically publishes the root-owned sidecar. The job principal can only acknowledge that
   exact signed result. The launcher retains the exact terminal frame until a separate
   identity-bound terminal acknowledgement, so a lost terminal response remains replayable. The
-  `.ota` and receipt directories must be execution-principal-owned and mode `0700`. Every
+  `.ota` and receipt directories must be execution-principal-owned and mode `0700`. The launcher
+  unit now binds `CAP_DAC_OVERRIDE` exactly, without granting it ambiently, so the root
+  launcher can traverse that private hierarchy for archive verification and sidecar publication;
+  its protected mount namespace, inaccessible signing-key paths, explicit writable roots, and
+  exact archive checks remain required. Every
   intermediate stage remains restart-readable, including reconnect before the client has received
   finalization. Local regressions cover retained state and alias refusal;
   immutable PID 1 crash pressure and a production operator client remain required before shipment.

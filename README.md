@@ -235,8 +235,12 @@ as a stopped root child. Before fork it creates and fsyncs a root-owned active-s
 working-directory device/inode, principal mapping, PID/start time, binary identity, and complete
 child descriptor boundary.
 
-The Linux pressure unit needs root system-manager access and bounded
-`CAP_SYS_PTRACE` so it can re-observe protected process and stopped-child descriptor posture. It
+The Linux pressure unit needs root system-manager access, bounded `CAP_SYS_PTRACE` so it can
+re-observe protected process and stopped-child descriptor posture, and bounded `CAP_DAC_OVERRIDE`
+so it can traverse the execution principal's exact private `0700` receipt hierarchy and publish
+the producer-signed archive sidecar. `CAP_DAC_OVERRIDE` is present only in the unit's exact
+capability bounding set, not its ambient set; the mount namespace, protected signing-key paths,
+explicit writable roots, owner/mode checks, and signed archive identity remain mandatory. It
 binds listening sockets through protected file metadata, descriptor type, socket options, and exact
 systemd unit relationships rather than treating `/proc/net/unix` path spelling as authority. These
 are bounded adapter requirements, not evidence of provider-attested isolation; the effective unit,

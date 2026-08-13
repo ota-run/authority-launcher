@@ -292,7 +292,13 @@ fn verify_service_properties(
     require_token_set(
         values,
         "CapabilityBoundingSet",
-        &["cap_kill", "cap_setgid", "cap_setuid", "cap_sys_ptrace"],
+        &[
+            "cap_dac_override",
+            "cap_kill",
+            "cap_setgid",
+            "cap_setuid",
+            "cap_sys_ptrace",
+        ],
     )?;
     require_token_set(
         values,
@@ -501,12 +507,18 @@ mod tests {
     fn capabilities_use_systemd_manager_output_spelling() {
         let values = BTreeMap::from([(
             "CapabilityBoundingSet".into(),
-            "cap_kill cap_setgid cap_setuid cap_sys_ptrace".into(),
+            "cap_dac_override cap_kill cap_setgid cap_setuid cap_sys_ptrace".into(),
         )]);
         require_token_set(
             &values,
             "CapabilityBoundingSet",
-            &["cap_kill", "cap_setgid", "cap_setuid", "cap_sys_ptrace"],
+            &[
+                "cap_dac_override",
+                "cap_kill",
+                "cap_setgid",
+                "cap_setuid",
+                "cap_sys_ptrace",
+            ],
         )
         .expect("exact manager capability set");
         assert!(
