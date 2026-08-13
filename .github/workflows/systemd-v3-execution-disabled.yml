@@ -234,6 +234,14 @@ jobs:
           PY
           }
 
+          repository_content_manifest() {
+            # Selected execution necessarily changes directory timestamps while creating and
+            # removing its declared output and Ota receipt state. Compare durable tree shape,
+            # ownership, modes, sizes, links, and file content instead of impossible timestamp
+            # restoration. Refusal cases continue to use the stricter manifest above.
+            repository_manifest | jq -c 'del(.mtime_ns)'
+          }
+
           assert_terminal_clean() {
             local case_name=$1
             local selected=${2:-false}
@@ -454,7 +462,7 @@ jobs:
               "$EVIDENCE_DIR/$case_name.repository.after.sha256"
           }
 
-          repository_manifest > "$EVIDENCE_DIR/repository.before.sha256"
+          repository_content_manifest > "$EVIDENCE_DIR/repository.before.sha256"
           repository_manifest > "$EVIDENCE_DIR/positive.repository.before.sha256"
 
           case_cursor=$(journal_cursor)
@@ -536,7 +544,7 @@ jobs:
           sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
             "$PRESSURE_REPOSITORY/selected-work-executed"
 
-          repository_manifest > "$EVIDENCE_DIR/completion-crash.repository.before.sha256"
+          repository_content_manifest > "$EVIDENCE_DIR/completion-crash.repository.before.sha256"
           reset_services
           set_broker_scenario allowed
           sudo install -o root -g root -m 0600 /dev/null \
@@ -576,11 +584,11 @@ jobs:
             -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 0
           sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
             "$PRESSURE_REPOSITORY/selected-work-executed"
-          repository_manifest > "$EVIDENCE_DIR/completion-crash.repository.after.sha256"
+          repository_content_manifest > "$EVIDENCE_DIR/completion-crash.repository.after.sha256"
           diff -u "$EVIDENCE_DIR/completion-crash.repository.before.sha256" \
             "$EVIDENCE_DIR/completion-crash.repository.after.sha256"
 
-          repository_manifest > "$EVIDENCE_DIR/selected-failure.repository.before.sha256"
+          repository_content_manifest > "$EVIDENCE_DIR/selected-failure.repository.before.sha256"
           sudo cp "$PRESSURE_REPOSITORY/ota.yaml" \
             "$EVIDENCE_DIR/selected-failure.original-ota.yaml"
           sudo sed -i '/from pathlib/c\                  - "import sys; sys.exit(7)"' \
@@ -612,11 +620,11 @@ jobs:
             "$PRESSURE_REPOSITORY/ota.yaml"
           sudo chown ota-authority-exec:ota-authority-exec \
             "$PRESSURE_REPOSITORY/ota.yaml"
-          repository_manifest > "$EVIDENCE_DIR/selected-failure.repository.after.sha256"
+          repository_content_manifest > "$EVIDENCE_DIR/selected-failure.repository.after.sha256"
           diff -u "$EVIDENCE_DIR/selected-failure.repository.before.sha256" \
             "$EVIDENCE_DIR/selected-failure.repository.after.sha256"
 
-          repository_manifest > "$EVIDENCE_DIR/selected-interruption.repository.before.sha256"
+          repository_content_manifest > "$EVIDENCE_DIR/selected-interruption.repository.before.sha256"
           sudo cp "$PRESSURE_REPOSITORY/ota.yaml" \
             "$EVIDENCE_DIR/selected-interruption.original-ota.yaml"
           sudo sed -i '/from pathlib/c\                  - "import time; time.sleep(60)"' \
@@ -668,7 +676,7 @@ jobs:
             "$PRESSURE_REPOSITORY/ota.yaml"
           sudo chown ota-authority-exec:ota-authority-exec \
             "$PRESSURE_REPOSITORY/ota.yaml"
-          repository_manifest > "$EVIDENCE_DIR/selected-interruption.repository.after.sha256"
+          repository_content_manifest > "$EVIDENCE_DIR/selected-interruption.repository.after.sha256"
           diff -u "$EVIDENCE_DIR/selected-interruption.repository.before.sha256" \
             "$EVIDENCE_DIR/selected-interruption.repository.after.sha256"
 
@@ -1158,7 +1166,7 @@ jobs:
           diff -u "$EVIDENCE_DIR/consumption-crash.repository.before.sha256" \
             "$EVIDENCE_DIR/consumption-crash.repository.after.sha256"
 
-          repository_manifest > "$EVIDENCE_DIR/repository.after.sha256"
+          repository_content_manifest > "$EVIDENCE_DIR/repository.after.sha256"
           diff -u "$EVIDENCE_DIR/repository.before.sha256" \
             "$EVIDENCE_DIR/repository.after.sha256"
           test -z "$(git status --porcelain --untracked-files=no)"
