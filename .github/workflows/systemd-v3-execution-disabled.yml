@@ -684,7 +684,9 @@ jobs:
           fi
           test -n "$selected_child"
           test "$(sudo cat "$PRESSURE_REPOSITORY/selected-work-started")" = started
-          sudo kill -INT "$selected_child"
+          # The protected child has no controlling terminal. SIGTERM is the deterministic
+          # noninteractive interruption surface and Core records it as exit code 143.
+          sudo kill -TERM "$selected_child"
           for _ in $(seq 1 100); do
             selected_service_state=$(systemctl is-active \
               ota-authority-pressure-runner.service || true)
