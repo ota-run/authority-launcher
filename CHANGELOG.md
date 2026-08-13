@@ -35,9 +35,9 @@
   A launcher readiness challenge ensures credential and pidfd ancillary capture is enabled before
   the broker proxy sends its authenticated identity preface.
   Refusal and uncertain-cleanup paths remain fail-closed. Immutable Linux/x64 PID 1 pressure run
-  [31663366909](https://github.com/ota-run/authority-launcher/actions/runs/31663366909)
+  [31664495937](https://github.com/ota-run/authority-launcher/actions/runs/31664495937)
   proves completed, failed, interrupted, replay-refused, and crash-recovered selected execution
-  against Launcher `cf82b240e96cdab7c8cdbe26bb673bf430358447`, Core
+  against Launcher `e8b6ae5108559508cfb75141cb9b317d46c182f3`, Core
   `06976f3eb4919a0bddaa318ed0824a6b9448aaaf`, and Protocol
   `9fb00a4ab0f1b4c635dbab67c2e6b140b8eade9c`. Portable archive binding of
   launcher finalization remains open.

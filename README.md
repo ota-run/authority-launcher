@@ -285,7 +285,7 @@ signing credential; the launcher retains public verification truth only. Missing
 oversized, self-inconsistent, or substituted posture, continuation, challenge, attestation, or
 authorization decision/admission fails closed and enters the same exact cleanup path. The decision
 and selected-execution paths have passed immutable Linux/x64 PID 1 systemd pressure in
-[run 31663366909](https://github.com/ota-run/authority-launcher/actions/runs/31663366909),
+[run 31664495937](https://github.com/ota-run/authority-launcher/actions/runs/31664495937),
 including completed, failed, interrupted, replay-refused, and crash-recovered execution. The run
 does not establish provider-attested separation, and portable Ota archives still do not embed the
 launcher-authored post-process finalization.
