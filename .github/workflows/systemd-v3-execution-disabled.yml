@@ -269,6 +269,45 @@ jobs:
             fi
           }
 
+          assert_recorded_boundary_removed() {
+            local case_name=$1
+            local slot_file=$2
+            local child_pid unit_name control_group slot_identity load_state
+            local cgroup_path cgroup_processes slot_matches
+            child_pid=$(jq -er '.child.pid' "$slot_file")
+            unit_name=$(jq -er '.scope.unit_name' "$slot_file")
+            control_group=$(jq -er '.scope.control_group' "$slot_file")
+            slot_identity=$(jq -er '.identity' "$slot_file")
+            load_state=$(systemctl show "$unit_name" -p LoadState --value 2>/dev/null || true)
+            cgroup_path="/sys/fs/cgroup${control_group}"
+            cgroup_processes=0
+            if test -d "$cgroup_path"; then
+              cgroup_processes=$(sudo find "$cgroup_path" -name cgroup.procs -type f \
+                -exec cat {} + | wc -l)
+            fi
+            slot_matches=0
+            while IFS= read -r active_slot; do
+              if sudo jq -e --arg identity "$slot_identity" \
+                '.identity == $identity' "$active_slot" >/dev/null; then
+                slot_matches=$((slot_matches + 1))
+              fi
+            done < <(sudo find /var/lib/ota/authority-launcher/active \
+              -mindepth 1 -maxdepth 1 -type f -print)
+            printf '%s\n' \
+              "child_pid=$child_pid" \
+              "child_pid_absent=$([ ! -d "/proc/$child_pid" ] && echo true || echo false)" \
+              "unit_name=$unit_name" \
+              "unit_load_state=$load_state" \
+              "control_group=$control_group" \
+              "cgroup_processes=$cgroup_processes" \
+              "exact_slot_matches=$slot_matches" \
+              > "$EVIDENCE_DIR/$case_name.recorded-boundary.txt"
+            test ! -d "/proc/$child_pid"
+            test "$load_state" = not-found
+            test "$cgroup_processes" -eq 0
+            test "$slot_matches" -eq 0
+          }
+
           capture_journal() {
             local case_name=$1
             local cursor=$2
@@ -590,6 +629,8 @@ jobs:
           capture_journal completion-crash-recovery "$case_cursor"
           test "$(sudo wc -l "$PRESSURE_REPOSITORY/selected-work-executed" | awk '{print $1}')" -eq 2
           assert_terminal_clean completion-crash-recovery true 2
+          assert_recorded_boundary_removed completion-crash-recovery \
+            "$EVIDENCE_DIR/completion-crash-first.active-slot.json"
           test "$(sudo find /var/lib/ota/authority-launcher/active \
             -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 0
           sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
@@ -1015,6 +1056,8 @@ jobs:
           grep -q 'bounded pressure v3 stage=authorization_received' \
             "$EVIDENCE_DIR/crash-recovery.journal.txt"
           assert_terminal_clean crash-recovery true
+          assert_recorded_boundary_removed crash-recovery \
+            "$EVIDENCE_DIR/crash-first.active-slot.json"
           sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
             "$PRESSURE_REPOSITORY/selected-work-executed"
           repository_content_manifest > "$EVIDENCE_DIR/crash-first.repository.after.sha256"
@@ -1090,6 +1133,8 @@ jobs:
           test "$fresh_request" != "$crashed_request"
           test "$fresh_scope" = "$crashed_scope"
           assert_terminal_clean decision-crash-recovery true
+          assert_recorded_boundary_removed decision-crash-recovery \
+            "$EVIDENCE_DIR/decision-crash-first.active-slot.json"
           sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
             "$PRESSURE_REPOSITORY/selected-work-executed"
           repository_content_manifest > "$EVIDENCE_DIR/decision-crash.repository.after.sha256"
@@ -1139,6 +1184,8 @@ jobs:
           fi
           capture_journal intent-ack-crash-recovery "$case_cursor"
           assert_terminal_clean intent-ack-crash-recovery true
+          assert_recorded_boundary_removed intent-ack-crash-recovery \
+            "$EVIDENCE_DIR/intent-ack-crash-first.active-slot.json"
           assert_count 1 'bounded pressure v3 stage=lease_consume_forwarded' \
             "$EVIDENCE_DIR/intent-ack-crash-recovery.journal.txt"
           extract_consumption_relay_evidence intent-ack-crash-recovery 1
@@ -1210,6 +1257,8 @@ jobs:
           fi
           capture_journal consumption-crash-recovery "$case_cursor"
           assert_terminal_clean consumption-crash-recovery true
+          assert_recorded_boundary_removed consumption-crash-recovery \
+            "$EVIDENCE_DIR/consumption-crash-first.active-slot.json"
           # Recovery consumes no additional frame for the crashed work unit. The accepted retry is
           # a fresh invocation with a different request identity and its own bounded consumption.
           assert_count 1 'bounded pressure v3 stage=lease_consume_forwarded' \
