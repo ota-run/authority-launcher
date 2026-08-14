@@ -294,9 +294,14 @@ principal never reads the private receipt directory and only acknowledges the ex
 The protected journal then retains the exact terminal frame until the client acknowledges that
 terminal identity. Reconnect recovery starts from retained launcher state rather than scanning
 repository files. Administrative receipt-history inspection can use the protected execution or
-root context; a production least-privilege operator attachment/history client remains open. This is
-locally tested candidate code; immutable PID 1 crash pressure remains open before Ota receipt
-history can require the attachment. Only
+root context; a production least-privilege operator attachment/history client remains open.
+Immutable Linux/x64 PID 1
+[run 31758094819](https://github.com/ota-run/authority-launcher/actions/runs/31758094819)
+proves this pressure-only attachment and recovery path against Protocol
+`3e912f721ba9673090d14bcf5f88a2ee27a6b58a`, Core
+`cf3114f3d96d5c030c748a12b2e359586f0ded8c`, and Launcher
+`6954a39aefd35b8df648534a6028c0206c0372f9`. It does not turn the pressure client
+into a production operator surface. Only
 `ota-authority-attestor` receives the systemd-delivered
 signing credential; the launcher retains public verification truth only. Missing, malformed,
 oversized, self-inconsistent, or substituted posture, continuation, challenge, attestation, or
@@ -306,6 +311,18 @@ and selected-execution paths have passed immutable Linux/x64 PID 1 systemd press
 including completed, failed, interrupted, replay-refused, and crash-recovered execution. The run
 does not establish provider-attested separation or the newer portable launcher-finalization
 attachment candidate.
+
+The follow-on portable-finalization run
+[31758094819](https://github.com/ota-run/authority-launcher/actions/runs/31758094819)
+proves that newer candidate across positive execution and completion-, finalization-, and terminal-
+crash recovery. All 21 terminal boundaries end with zero active slots, finalization journals, and
+scopes. Positive execution and those three terminal crash-recovery points each have one valid
+archive and zero invalid archives. A restart after durable Core completion uses finalization schema
+v2 to prove child absence without
+claiming that the restarted launcher observed the exit or reaped the child. Durable producer state
+retains distinct root-owned mode-`0600` cleanup-finalization and archive-attachment issuance
+records. A production attachment/history client, independently administered launcher separation,
+and provider attestation remain open.
 
 The feature-gated `ota-authority-systemd-pressure-client` is the unprivileged side of that positive
 kernel proof. It connects only to `/run/ota/authority-launcher.sock`, submits one bounded

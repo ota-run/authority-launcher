@@ -30,7 +30,10 @@
   absence to Core's durable completion, but it cannot claim that it observed or reaped the old
   child. Recovered finalization therefore uses protocol schema v2 with
   `recovered_absent_completion_bound`, no observed exit code, and `child_reaped: false`; live
-  finalization retains the original observed-and-reaped posture.
+  finalization retains the original observed-and-reaped posture. Immutable Linux/x64 PID 1
+  [run 31758094819](https://github.com/ota-run/authority-launcher/actions/runs/31758094819)
+  proves the corrected portable-finalization and crash-recovery matrix against immutable Protocol,
+  Core, and Launcher revisions, including valid archive history and zero terminal boundary residue.
 
 - Add the candidate durable post-cleanup finalization carrier. Before deleting the active-slot
   journal, the launcher fsyncs a separate protected finalization intent. The attestor signs both
@@ -49,7 +52,8 @@
   finalization. Startup now promotes an exact execution-completion slot into the same durable
   finalization intent before removing the active slot, so a launcher crash after selected work
   cannot force a second work unit. Local regressions cover retained state and alias refusal;
-  immutable PID 1 crash pressure and a production operator client remain required before shipment.
+  immutable PID 1 crash pressure is green in run `31758094819`, while a production operator client
+  remains required before shipment.
 
 - Enable the first bounded selected-execution path for `systemd_protected_launcher/v1`. Core keeps
   the private launcher session through terminal transaction finalization and sends one completion
