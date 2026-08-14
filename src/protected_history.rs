@@ -712,9 +712,14 @@ fn try_read_exact_file_at(
         ) as i32
     };
     if descriptor < 0 {
-        return if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOENT) {
             Ok(None)
         } else {
+            eprintln!(
+                "ota-authority-launcher: protected history file failed stage=open errno={}",
+                error.raw_os_error().unwrap_or_default()
+            );
             Err(ProtectedHistoryError::StoreUnavailable)
         };
     }
@@ -728,15 +733,27 @@ fn try_read_exact_file_at(
         || metadata.nlink() != 1
         || metadata.len() > ota_authority_protocol::MAX_HISTORY_RESPONSE_BYTES_V1
     {
+        eprintln!(
+            "ota-authority-launcher: protected history file failed stage=metadata file={} uid={} mode={:o} links={} bytes={}",
+            metadata.is_file(),
+            metadata.uid(),
+            metadata.mode() & 0o7777,
+            metadata.nlink(),
+            metadata.len()
+        );
         return Err(ProtectedHistoryError::ObjectInvalid);
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.seek(SeekFrom::Start(0))
         .and_then(|_| file.read_to_end(&mut bytes))
-        .map_err(|_| ProtectedHistoryError::StoreUnavailable)?;
+        .map_err(|_| {
+            eprintln!("ota-authority-launcher: protected history file failed stage=read");
+            ProtectedHistoryError::StoreUnavailable
+        })?;
     if expected_identity
         .is_some_and(|identity| format!("sha256:{:x}", Sha256::digest(&bytes)) != identity)
     {
+        eprintln!("ota-authority-launcher: protected history file failed stage=digest");
         return Err(ProtectedHistoryError::ObjectInvalid);
     }
     Ok(Some((bytes, metadata)))
