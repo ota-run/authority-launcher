@@ -918,9 +918,20 @@ mod tests {
 
     #[test]
     fn protected_blob_publication_is_atomic_idempotent_and_alias_safe() {
-        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("root");
-        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
         let owner = unsafe { libc::geteuid() };
+        let root = if owner == 0 {
+            tempfile::tempdir_in("/root").expect("root")
+        } else {
+            tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("untrusted root")
+        };
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
+        if owner != 0 {
+            assert!(matches!(
+                open_protected_directory(root.path(), owner),
+                Err(ProtectedHistoryError::StoreUnavailable)
+            ));
+            return;
+        }
         let directory = open_protected_directory(root.path(), owner).expect("protected root");
         if matches!(
             try_read_exact_file_at(&directory, "missing", owner, None),
