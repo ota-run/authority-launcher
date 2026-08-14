@@ -111,7 +111,7 @@ pub(crate) fn locate_archive(
             .ok_or_else(|| {
                 String::from("the protected receipt archive omits its contract snapshot identity")
             })?;
-        let snapshot_name = contract_snapshot_name(snapshot_ref)?;
+        let snapshot_name = contract_snapshot_name(repository_fd, snapshot_ref)?;
         let snapshot = read_contract_snapshot(repository_fd, expected_owner_uid, &snapshot_name)?;
         if snapshot.content_identity != snapshot_identity {
             return Err(String::from(
@@ -325,8 +325,31 @@ fn read_regular_file(
     })
 }
 
-fn contract_snapshot_name(snapshot_ref: &str) -> Result<CString, String> {
-    let path = Path::new(snapshot_ref);
+fn contract_snapshot_name(repository_fd: RawFd, snapshot_ref: &str) -> Result<CString, String> {
+    let mut path = Path::new(snapshot_ref);
+    let absolute_reference;
+    if path.is_absolute() {
+        let repository = fs::read_link(format!("/proc/self/fd/{repository_fd}"))
+            .map_err(|_| String::from("the protected contract snapshot reference is invalid"))?;
+        let expected_prefix = repository.join(".ota/contracts");
+        let Some(name) = path
+            .strip_prefix(&expected_prefix)
+            .ok()
+            .and_then(|relative| {
+                let mut components = relative.components();
+                match (components.next(), components.next()) {
+                    (Some(std::path::Component::Normal(name)), None) => Some(name),
+                    _ => None,
+                }
+            })
+        else {
+            return Err(String::from(
+                "the protected contract snapshot reference is invalid",
+            ));
+        };
+        absolute_reference = PathBuf::from(".ota/contracts").join(name);
+        path = absolute_reference.as_path();
+    }
     let mut components = path.components().peekable();
     if matches!(components.peek(), Some(std::path::Component::CurDir)) {
         components.next();
@@ -596,15 +619,36 @@ mod tests {
     #[test]
     fn contract_snapshot_reference_accepts_otas_display_form_without_widening() {
         let name = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
-        assert!(contract_snapshot_name(&format!(".ota/contracts/{name}")).is_ok());
-        assert!(contract_snapshot_name(&format!("./.ota/contracts/{name}")).is_ok());
+        let repository = File::open(".").expect("repository descriptor");
+        assert!(
+            contract_snapshot_name(repository.as_raw_fd(), &format!(".ota/contracts/{name}"))
+                .is_ok()
+        );
+        assert!(
+            contract_snapshot_name(repository.as_raw_fd(), &format!("./.ota/contracts/{name}"))
+                .is_ok()
+        );
+        assert!(
+            contract_snapshot_name(
+                repository.as_raw_fd(),
+                &std::env::current_dir()
+                    .expect("current directory")
+                    .join(".ota/contracts")
+                    .join(name)
+                    .to_string_lossy(),
+            )
+            .is_ok()
+        );
         for reference in [
             format!("../.ota/contracts/{name}"),
             format!("/.ota/contracts/{name}"),
             format!(".ota/contracts/nested/{name}"),
             format!(".ota/receipts/{name}"),
         ] {
-            assert!(contract_snapshot_name(&reference).is_err(), "{reference}");
+            assert!(
+                contract_snapshot_name(repository.as_raw_fd(), &reference).is_err(),
+                "{reference}"
+            );
         }
     }
 
