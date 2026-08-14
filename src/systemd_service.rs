@@ -1749,20 +1749,27 @@ fn complete_archive_attachment_for_request(
         };
         sidecar.identity = launcher_finalization_archive_sidecar_v1_identity(&sidecar)
             .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
-        journal
-            .record_sidecar(sidecar.clone())
-            .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
+        journal.record_sidecar(sidecar.clone()).map_err(|_| {
+            eprintln!("ota-authority-launcher: portable finalization failed stage=sidecar_journal");
+            SystemdServiceError::FinalizationUnavailable
+        })?;
         sidecar
     };
-    let history_binding = crate::protected_history::load_protected_history_binding()
-        .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
+    let history_binding =
+        crate::protected_history::load_protected_history_binding().map_err(|_| {
+            eprintln!("ota-authority-launcher: portable finalization failed stage=history_binding");
+            SystemdServiceError::FinalizationUnavailable
+        })?;
     let attachment = crate::protected_history::attach_protected_history(
         &history_binding,
         &target,
         &sidecar,
         journal.journal(),
     )
-    .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
+    .map_err(|_| {
+        eprintln!("ota-authority-launcher: portable finalization failed stage=history_attachment");
+        SystemdServiceError::FinalizationUnavailable
+    })?;
     match journal.journal().stage {
         FinalizationJournalStageV1::SidecarIssued
         | FinalizationJournalStageV1::SidecarAcknowledged
@@ -1771,7 +1778,12 @@ fn complete_archive_attachment_for_request(
         {
             journal
                 .record_protected_history_attachment(attachment)
-                .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
+                .map_err(|_| {
+                    eprintln!(
+                        "ota-authority-launcher: portable finalization failed stage=history_journal"
+                    );
+                    SystemdServiceError::FinalizationUnavailable
+                })?;
         }
         FinalizationJournalStageV1::ProtectedHistoryAttached
         | FinalizationJournalStageV1::SidecarAcknowledged
