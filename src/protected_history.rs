@@ -651,13 +651,25 @@ fn persist_exact_file(
 
 fn sync_existing_file_at(directory: &OwnedFd, name: &str) -> Result<(), ProtectedHistoryError> {
     let name = CString::new(name).map_err(|_| ProtectedHistoryError::ObjectInvalid)?;
+    let descriptor = open_exact_readonly_at(directory, &name)
+        .map_err(|_| ProtectedHistoryError::PersistenceFailed)?;
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    file.sync_all()
+        .map_err(|_| ProtectedHistoryError::PersistenceFailed)?;
+    if unsafe { libc::fsync(directory.as_raw_fd()) } != 0 {
+        return Err(ProtectedHistoryError::PersistenceFailed);
+    }
+    Ok(())
+}
+
+fn open_exact_readonly_at(directory: &OwnedFd, name: &CString) -> std::io::Result<i32> {
     let mut how: libc::open_how = unsafe { std::mem::zeroed() };
     how.flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
     how.resolve = libc::RESOLVE_BENEATH
         | libc::RESOLVE_NO_MAGICLINKS
         | libc::RESOLVE_NO_SYMLINKS
         | libc::RESOLVE_NO_XDEV;
-    let descriptor = unsafe {
+    let mut descriptor = unsafe {
         libc::syscall(
             libc::SYS_openat2,
             directory.as_raw_fd(),
@@ -667,15 +679,25 @@ fn sync_existing_file_at(directory: &OwnedFd, name: &str) -> Result<(), Protecte
         ) as i32
     };
     if descriptor < 0 {
-        return Err(ProtectedHistoryError::PersistenceFailed);
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ENOSYS) {
+            return Err(error);
+        }
+        // The verified directory descriptor and single-component name make openat with
+        // O_NOFOLLOW equivalent for this exact-file lookup on kernels or sandboxes that do not
+        // expose openat2.
+        descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
     }
-    let file = unsafe { File::from_raw_fd(descriptor) };
-    file.sync_all()
-        .map_err(|_| ProtectedHistoryError::PersistenceFailed)?;
-    if unsafe { libc::fsync(directory.as_raw_fd()) } != 0 {
-        return Err(ProtectedHistoryError::PersistenceFailed);
-    }
-    Ok(())
+    Ok(descriptor)
 }
 
 fn read_exact_file(
@@ -696,33 +718,20 @@ fn try_read_exact_file_at(
     expected_identity: Option<&str>,
 ) -> Result<Option<(Vec<u8>, std::fs::Metadata)>, ProtectedHistoryError> {
     let name = CString::new(name).map_err(|_| ProtectedHistoryError::ObjectInvalid)?;
-    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
-    how.flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64;
-    how.resolve = libc::RESOLVE_BENEATH
-        | libc::RESOLVE_NO_MAGICLINKS
-        | libc::RESOLVE_NO_SYMLINKS
-        | libc::RESOLVE_NO_XDEV;
-    let descriptor = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            &how,
-            std::mem::size_of::<libc::open_how>(),
-        ) as i32
+    let descriptor = match open_exact_readonly_at(directory, &name) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            return if error.raw_os_error() == Some(libc::ENOENT) {
+                Ok(None)
+            } else {
+                eprintln!(
+                    "ota-authority-launcher: protected history file failed stage=open errno={}",
+                    error.raw_os_error().unwrap_or_default()
+                );
+                Err(ProtectedHistoryError::StoreUnavailable)
+            };
+        }
     };
-    if descriptor < 0 {
-        let error = std::io::Error::last_os_error();
-        return if error.raw_os_error() == Some(libc::ENOENT) {
-            Ok(None)
-        } else {
-            eprintln!(
-                "ota-authority-launcher: protected history file failed stage=open errno={}",
-                error.raw_os_error().unwrap_or_default()
-            );
-            Err(ProtectedHistoryError::StoreUnavailable)
-        };
-    }
     let mut file = unsafe { File::from_raw_fd(descriptor) };
     let metadata = file
         .metadata()
