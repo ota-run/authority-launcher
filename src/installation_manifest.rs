@@ -84,6 +84,10 @@ pub(crate) enum ProtectedInstallationRoleV1 {
     JobRunnerExecutable,
     JobRunnerServiceUnit,
     JobRunnerServiceDropIn,
+    HistoryClientExecutable,
+    HistoryBinding,
+    HistoryServiceUnit,
+    HistorySocketUnit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -192,6 +196,68 @@ pub(crate) fn load_protected_installation_manifest(
         0,
         Path::new("/"),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_protected_history_installation(
+    expected_manifest_identity: &str,
+    launcher_executable: &Path,
+    history_binding_path: &Path,
+    history_client_path: &Path,
+    history_client_identity: &str,
+    history_service_unit_identity: &str,
+    history_socket_unit_identity: &str,
+) -> Result<(), InstallationManifestError> {
+    let manifest_file = open_protected_file(
+        Path::new(SYSTEMD_INSTALLATION_MANIFEST_PATH),
+        0,
+        Path::new("/"),
+    )
+    .map_err(map_config_error)?;
+    let manifest: ProtectedInstallationManifestV1 =
+        serde_json::from_reader(manifest_file).map_err(|_| InstallationManifestError::Malformed)?;
+    if protected_installation_manifest_identity(&manifest)? != manifest.identity
+        || manifest.identity != expected_manifest_identity
+    {
+        return Err(InstallationManifestError::Mismatch);
+    }
+    let mut observed = BTreeMap::new();
+    for entry in &manifest.files {
+        let mut file =
+            open_protected_file(&entry.path, 0, Path::new("/")).map_err(map_config_error)?;
+        if sha256_file_identity(&mut file).map_err(map_config_error)? != entry.identity
+            || observed
+                .insert((entry.role, entry.path.clone()), ())
+                .is_some()
+        {
+            return Err(InstallationManifestError::Mismatch);
+        }
+    }
+    require_exact_singular_path(
+        &manifest,
+        ProtectedInstallationRoleV1::LauncherExecutable,
+        launcher_executable,
+    )?;
+    require_exact_singular_path(
+        &manifest,
+        ProtectedInstallationRoleV1::HistoryBinding,
+        history_binding_path,
+    )?;
+    require_exact_singular_path(
+        &manifest,
+        ProtectedInstallationRoleV1::HistoryClientExecutable,
+        history_client_path,
+    )?;
+    if manifest.singular_identity(ProtectedInstallationRoleV1::HistoryClientExecutable)?
+        != history_client_identity
+        || manifest.singular_identity(ProtectedInstallationRoleV1::HistoryServiceUnit)?
+            != history_service_unit_identity
+        || manifest.singular_identity(ProtectedInstallationRoleV1::HistorySocketUnit)?
+            != history_socket_unit_identity
+    {
+        return Err(InstallationManifestError::Mismatch);
+    }
+    Ok(())
 }
 
 fn load_protected_installation_manifest_at(
@@ -363,6 +429,29 @@ fn validate_manifest_shape(
                 return Err(InstallationManifestError::Malformed);
             }
         }
+    }
+    let history_roles = [
+        ProtectedInstallationRoleV1::HistoryClientExecutable,
+        ProtectedInstallationRoleV1::HistoryBinding,
+        ProtectedInstallationRoleV1::HistoryServiceUnit,
+        ProtectedInstallationRoleV1::HistorySocketUnit,
+    ];
+    let history_count = history_roles
+        .iter()
+        .filter(|role| roles.contains(role))
+        .count();
+    if history_count != 0
+        && (history_count != history_roles.len()
+            || history_roles.iter().any(|role| {
+                manifest
+                    .files
+                    .iter()
+                    .filter(|entry| entry.role == *role)
+                    .count()
+                    != 1
+            }))
+    {
+        return Err(InstallationManifestError::Malformed);
     }
     Ok(())
 }

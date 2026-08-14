@@ -41,6 +41,8 @@ use ota_authority_protocol::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::protected_history::ProtectedHistoryAttachmentV1;
+
 const FINALIZATION_JOURNAL_IDENTITY_DOMAIN_V1: &[u8] =
     b"ota.authority-launcher.finalization-journal.v1\0";
 const MAX_JOURNAL_BYTES: u64 = 128 * 1024;
@@ -52,6 +54,7 @@ pub(crate) enum FinalizationJournalStageV1 {
     SignedFinalization,
     ArchiveRequested,
     SidecarIssued,
+    ProtectedHistoryAttached,
     SidecarAcknowledged,
     TerminalIssued,
 }
@@ -73,6 +76,8 @@ pub(crate) struct FinalizationJournalV1 {
     pub archive_request: Option<LauncherFinalizationArchiveRequestV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar: Option<LauncherFinalizationArchiveSidecarV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_history_attachment: Option<ProtectedHistoryAttachmentV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar_persistence: Option<LauncherFinalizationArchivePersistenceV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,6 +125,7 @@ impl FinalizationJournal {
             signed_finalization: None,
             archive_request: None,
             sidecar: None,
+            protected_history_attachment: None,
             sidecar_persistence: None,
             terminal: None,
         };
@@ -253,7 +259,7 @@ impl FinalizationJournal {
         &mut self,
         persistence: LauncherFinalizationArchivePersistenceV1,
     ) -> Result<(), FinalizationJournalError> {
-        if self.journal.stage != FinalizationJournalStageV1::SidecarIssued
+        if self.journal.stage != FinalizationJournalStageV1::ProtectedHistoryAttached
             || launcher_finalization_archive_persistence_v1_identity(&persistence)
                 .ok()
                 .as_deref()
@@ -273,6 +279,34 @@ impl FinalizationJournal {
         }
         self.journal.stage = FinalizationJournalStageV1::SidecarAcknowledged;
         self.journal.sidecar_persistence = Some(persistence);
+        self.persist()
+    }
+
+    pub(crate) fn record_protected_history_attachment(
+        &mut self,
+        attachment: ProtectedHistoryAttachmentV1,
+    ) -> Result<(), FinalizationJournalError> {
+        if !matches!(
+            self.journal.stage,
+            FinalizationJournalStageV1::SidecarIssued
+                | FinalizationJournalStageV1::SidecarAcknowledged
+                | FinalizationJournalStageV1::TerminalIssued
+        ) || self.journal.protected_history_attachment.is_some()
+            || !is_sha256_identity(&attachment.catalog_identity)
+            || !is_sha256_identity(&attachment.repository_binding_identity)
+            || !is_sha256_identity(&attachment.catalog_namespace_identity)
+            || !is_sha256_identity(&attachment.archive_blob_identity)
+            || !is_sha256_identity(&attachment.contract_snapshot_blob_identity)
+            || !is_sha256_identity(&attachment.sidecar_blob_identity)
+            || !is_sha256_identity(&attachment.finalization_journal_identity)
+            || attachment.finalization_journal_identity != self.journal.identity
+        {
+            return Err(FinalizationJournalError::InvalidJournal);
+        }
+        if self.journal.stage == FinalizationJournalStageV1::SidecarIssued {
+            self.journal.stage = FinalizationJournalStageV1::ProtectedHistoryAttached;
+        }
+        self.journal.protected_history_attachment = Some(attachment);
         self.persist()
     }
 
@@ -302,6 +336,7 @@ impl FinalizationJournal {
             .as_ref()
             .ok_or(FinalizationJournalError::InvalidJournal)?;
         if self.journal.stage != FinalizationJournalStageV1::TerminalIssued
+            || self.journal.protected_history_attachment.is_none()
             || launcher_terminal_persistence_v1_identity(persistence)
                 .ok()
                 .as_deref()
@@ -419,6 +454,20 @@ fn stage_is_valid(journal: &FinalizationJournalV1) -> bool {
                         .as_ref()
                         .is_some_and(|sidecar| sidecar.identity == persistence.sidecar_identity)
             });
+    let protected_history_valid =
+        journal
+            .protected_history_attachment
+            .as_ref()
+            .is_some_and(|attachment| {
+                attachment.schema_version == 1
+                    && is_sha256_identity(&attachment.catalog_identity)
+                    && is_sha256_identity(&attachment.repository_binding_identity)
+                    && is_sha256_identity(&attachment.catalog_namespace_identity)
+                    && is_sha256_identity(&attachment.archive_blob_identity)
+                    && is_sha256_identity(&attachment.contract_snapshot_blob_identity)
+                    && is_sha256_identity(&attachment.sidecar_blob_identity)
+                    && is_sha256_identity(&attachment.finalization_journal_identity)
+            });
     let terminal_valid = journal.terminal.as_ref().is_some_and(|terminal| {
         launcher_terminal_frame_v1_identity(terminal).is_ok()
             && terminal.invocation_id == journal.invocation_id
@@ -429,6 +478,7 @@ fn stage_is_valid(journal: &FinalizationJournalV1) -> bool {
             journal.signed_finalization.is_none()
                 && journal.archive_request.is_none()
                 && journal.sidecar.is_none()
+                && journal.protected_history_attachment.is_none()
                 && journal.sidecar_persistence.is_none()
                 && journal.terminal.is_none()
         }
@@ -436,6 +486,7 @@ fn stage_is_valid(journal: &FinalizationJournalV1) -> bool {
             signed_valid
                 && journal.archive_request.is_none()
                 && journal.sidecar.is_none()
+                && journal.protected_history_attachment.is_none()
                 && journal.sidecar_persistence.is_none()
                 && journal.terminal.is_none()
         }
@@ -443,6 +494,7 @@ fn stage_is_valid(journal: &FinalizationJournalV1) -> bool {
             signed_valid
                 && request_valid
                 && journal.sidecar.is_none()
+                && journal.protected_history_attachment.is_none()
                 && journal.sidecar_persistence.is_none()
                 && journal.terminal.is_none()
         }
@@ -450,6 +502,15 @@ fn stage_is_valid(journal: &FinalizationJournalV1) -> bool {
             signed_valid
                 && request_valid
                 && sidecar_valid
+                && journal.protected_history_attachment.is_none()
+                && journal.sidecar_persistence.is_none()
+                && journal.terminal.is_none()
+        }
+        FinalizationJournalStageV1::ProtectedHistoryAttached => {
+            signed_valid
+                && request_valid
+                && sidecar_valid
+                && protected_history_valid
                 && journal.sidecar_persistence.is_none()
                 && journal.terminal.is_none()
         }
@@ -457,6 +518,7 @@ fn stage_is_valid(journal: &FinalizationJournalV1) -> bool {
             signed_valid
                 && request_valid
                 && sidecar_valid
+                && (protected_history_valid || journal.protected_history_attachment.is_none())
                 && sidecar_persistence_valid
                 && journal.terminal.is_none()
         }
@@ -464,10 +526,20 @@ fn stage_is_valid(journal: &FinalizationJournalV1) -> bool {
             signed_valid
                 && request_valid
                 && sidecar_valid
+                && (protected_history_valid || journal.protected_history_attachment.is_none())
                 && sidecar_persistence_valid
                 && terminal_valid
         }
     }
+}
+
+fn is_sha256_identity(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
 }
 
 fn journal_path(
@@ -693,6 +765,33 @@ mod tests {
         sidecar.identity =
             launcher_finalization_archive_sidecar_v1_identity(&sidecar).expect("sidecar identity");
         journal.record_sidecar(sidecar.clone()).expect("sidecar");
+        let mut premature_persistence = LauncherFinalizationArchivePersistenceV1 {
+            schema_version: 1,
+            message_kind: LAUNCHER_FINALIZATION_ARCHIVE_PERSISTENCE.into(),
+            identity: String::new(),
+            request_identity: request.request_identity.clone(),
+            sidecar_identity: sidecar.identity.clone(),
+        };
+        premature_persistence.identity =
+            launcher_finalization_archive_persistence_v1_identity(&premature_persistence)
+                .expect("premature persistence identity");
+        assert!(
+            journal
+                .record_sidecar_persistence(premature_persistence)
+                .is_err()
+        );
+        journal
+            .record_protected_history_attachment(ProtectedHistoryAttachmentV1 {
+                schema_version: 1,
+                catalog_identity: identity('a'),
+                repository_binding_identity: identity('b'),
+                catalog_namespace_identity: identity('c'),
+                archive_blob_identity: identity('d'),
+                contract_snapshot_blob_identity: identity('e'),
+                sidecar_blob_identity: identity('f'),
+                finalization_journal_identity: journal.journal().identity.clone(),
+            })
+            .expect("protected history attachment");
         drop(journal);
 
         let mut recovered = FinalizationJournal::load_for_principal(&directory, owner, &principal)
@@ -700,7 +799,7 @@ mod tests {
             .expect("sidecar state exists");
         assert_eq!(
             recovered.journal().stage,
-            FinalizationJournalStageV1::SidecarIssued
+            FinalizationJournalStageV1::ProtectedHistoryAttached
         );
         let mut persistence = LauncherFinalizationArchivePersistenceV1 {
             schema_version: 1,
@@ -748,6 +847,29 @@ mod tests {
         wrong.identity =
             launcher_terminal_persistence_v1_identity(&wrong).expect("wrong persistence identity");
         assert!(recovered.acknowledge_terminal_and_finalize(&wrong).is_err());
+        let mut attachment = recovered
+            .journal
+            .protected_history_attachment
+            .take()
+            .expect("protected history attachment");
+        recovered
+            .persist()
+            .expect("persist legacy terminal journal");
+        drop(recovered);
+
+        let mut recovered = FinalizationJournal::load_for_principal(&directory, owner, &principal)
+            .expect("load legacy terminal journal")
+            .expect("legacy terminal journal exists");
+        assert!(
+            recovered
+                .acknowledge_terminal_and_finalize(&terminal_persistence)
+                .is_err()
+        );
+        assert!(recovered.path.exists());
+        attachment.finalization_journal_identity = recovered.journal.identity.clone();
+        recovered
+            .record_protected_history_attachment(attachment)
+            .expect("migrate legacy terminal journal");
         recovered
             .acknowledge_terminal_and_finalize(&terminal_persistence)
             .expect("finalize after terminal acknowledgement");

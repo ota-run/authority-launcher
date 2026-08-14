@@ -26,6 +26,22 @@
 
 ## Unreleased
 
+- Add the Launcher side of the production systemd operator attachment. The new
+  `ota-authority-systemd-client` uses only the fixed protected-launcher socket, admits only governed
+  Ota execution commands, preserves globally ordered output, verifies terminal evidence, and uses
+  exact finalization recovery without pressure-only controls. A separate fixed protected-history
+  service now admits only the installed least-privilege client, binds the exact live peer and
+  administrator-owned repository mapping, and streams acyclic Protocol records for three protected
+  content-addressed objects: receipt archive, referenced immutable contract snapshot, and signed
+  sidecar. The binding must name the canonical
+  `/var/lib/ota/authority-launcher/history/{blobs,catalog}` roots; alternate protected roots refuse.
+  The service repeats complete least-privilege process, executable, working-directory, and peer-
+  identity admission before its first response and terminal completion. Launcher publishes those
+  objects and their catalog entry durably before repository sidecar acknowledgement or terminal-
+  journal deletion. The coordinated Core consumer is implemented in the same V11.7 delivery batch,
+  and both consumers pin Protocol commit `04a199a1eddd72b5b61958e0fe7f2d4e662e05cf`.
+  Installed PID 1 deployment and hosted pressure remain open.
+
 - Make completion-crash recovery evidence explicit. A restarted launcher may bind verified child
   absence to Core's durable completion, but it cannot claim that it observed or reaped the old
   child. Recovered finalization therefore uses protocol schema v2 with

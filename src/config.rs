@@ -522,7 +522,7 @@ pub(crate) fn sha256_file_identity(file: &mut File) -> Result<String, ConfigErro
 }
 
 #[cfg(target_os = "linux")]
-fn open_protected_executable(
+pub(crate) fn open_protected_executable(
     path: &Path,
     expected_uid: u32,
     trusted_root: &Path,

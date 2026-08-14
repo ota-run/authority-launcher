@@ -36,6 +36,10 @@ mod installation_manifest;
 mod prepared_child;
 #[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
 mod pressure_provision;
+#[cfg(target_os = "linux")]
+mod protected_history;
+#[cfg(target_os = "linux")]
+mod protected_history_service;
 #[cfg(test)]
 mod reference_peer;
 #[cfg(target_os = "linux")]
@@ -80,6 +84,10 @@ enum Command {
     #[command(hide = true)]
     ServeSystemd,
 
+    /// Internal systemd socket-activation entrypoint for protected history streaming.
+    #[command(hide = true)]
+    ServeHistory,
+
     /// Install the fixed V3 local pressure boundary.
     #[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
     #[command(hide = true)]
@@ -113,6 +121,7 @@ fn main() -> ExitCode {
             ota_args,
         } => run(authority_id.as_str(), ota_args.as_slice()),
         Command::ServeSystemd => serve_systemd(),
+        Command::ServeHistory => serve_history(),
         #[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
         Command::ProvisionSystemdV3Pressure {
             authority_id,
@@ -155,6 +164,20 @@ fn serve_systemd() -> Result<u8, String> {
     {
         Err(String::from(
             "the systemd protected launcher adapter supports Linux only",
+        ))
+    }
+}
+
+fn serve_history() -> Result<u8, String> {
+    #[cfg(target_os = "linux")]
+    {
+        protected_history_service::serve_once().map_err(|error| error.to_string())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(String::from(
+            "the protected history adapter supports Linux only",
         ))
     }
 }

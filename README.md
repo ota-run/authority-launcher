@@ -289,12 +289,56 @@ claim. The current candidate persists a protected finalization journal before de
 active slot, asks the producer to sign the cleanup record and a separate exact archive attachment,
 reopens the private archive through the execution-principal repository descriptor, and verifies its
 owner, content identity, and transaction before atomically publishing a root-owned sidecar. Both
-`.ota` and `.ota/receipts` must be owned by the execution principal with mode `0700`; the job
-principal never reads the private receipt directory and only acknowledges the exact signed result.
+`.ota`, `.ota/receipts`, and `.ota/contracts` must be owned by the execution principal with mode
+`0700`; the job principal never reads the private receipt or contract-snapshot directories and only
+acknowledges the exact signed result.
 The protected journal then retains the exact terminal frame until the client acknowledges that
 terminal identity. Reconnect recovery starts from retained launcher state rather than scanning
-repository files. Administrative receipt-history inspection can use the protected execution or
-root context; a production least-privilege operator attachment/history client remains open.
+repository files.
+
+### Production client and protected history candidate
+
+`ota-authority-systemd-client` is the production invocation client for the fixed
+`/run/ota/authority-launcher.sock` boundary. It accepts only `run`, `up`, `proof runtime`, and
+`proof lifecycle`, preserves one globally ordered stdout/stderr stream, verifies the exact terminal
+record, and uses identity-bound finalization recovery after a disconnect. It has no pressure
+expectations, fault controls, alternate socket, or authority-material input:
+
+```bash
+ota-authority-systemd-client --authority-id release --repository . -- \
+  run publish --grant release
+```
+
+The Launcher-side protected-history candidate uses the separate fixed
+`/run/ota/authority-history.sock` service and root-owned
+`/etc/ota/authority-history.json` binding. The binding is reconciled with the protected
+installation manifest and fixes the admitted client executable, operator UID/GID and profile,
+service/socket identities, response ceilings, the canonical
+`/var/lib/ota/authority-launcher/history/{blobs,catalog}` roots, and exact repository-instance
+mapping. Alternate storage roots refuse even when they are otherwise administrator-owned and
+protected. The history peer must be non-root, hold no effective, permitted, inheritable, or ambient
+capabilities, use `NoNewPrivileges=1`, remain limited to its primary group and pidfd-live, and run
+the exact installed client. The kernel capability bounding set remains outside this operator-profile
+claim. Each response manifest binds the
+verified peer instance and `non_agent` attribution; the durable catalog binds the administrator-
+owned operator profile. The service repeats the complete pidfd, credentials, groups, capabilities,
+`NoNewPrivileges`, installed-executable, process-start, working-directory, and peer-identity
+reconciliation before its first response and immediately before terminal completion.
+
+Before a successful finalization journal can advance, Launcher freezes and publishes three
+independent root-owned mode-`0600` content-addressed objects: the receipt archive, the immutable
+contract snapshot named by that archive, and the producer-signed sidecar. Publication is
+descriptor-relative, `openat2`-constrained, fsynced, create-new, and idempotent. Object identities
+derive first from manifest identity, entry ordinal, catalog identity, kind, content identity,
+length, and chunk count; the entry then binds all three object identities. Protected history never
+reopens a repository snapshot during operator reads and never returns a protected filesystem path
+or general read primitive.
+
+Launcher verifies protected storage and producer signatures only. Core remains the sole semantic
+receipt/archive verifier. The Core protected-history source, installed systemd deployment, and
+immutable Linux/x64 PID 1 pressure are not proved by this local candidate and remain required before
+the production operator surface is complete.
+
 Immutable Linux/x64 PID 1
 [run 31758094819](https://github.com/ota-run/authority-launcher/actions/runs/31758094819)
 proves this pressure-only attachment and recovery path against Protocol
@@ -321,8 +365,8 @@ archive and zero invalid archives. A restart after durable Core completion uses 
 v2 to prove child absence without
 claiming that the restarted launcher observed the exit or reaped the child. Durable producer state
 retains distinct root-owned mode-`0600` cleanup-finalization and archive-attachment issuance
-records. A production attachment/history client, independently administered launcher separation,
-and provider attestation remain open.
+records. Independently administered launcher separation and provider attestation remain open; that
+run predates and does not prove the production client or protected-history candidate above.
 
 The feature-gated `ota-authority-systemd-pressure-client` is the unprivileged side of that positive
 kernel proof. It connects only to `/run/ota/authority-launcher.sock`, submits one bounded

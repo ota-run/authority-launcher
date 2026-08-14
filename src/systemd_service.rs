@@ -1704,6 +1704,7 @@ fn complete_archive_attachment_for_request(
             .map_err(|_| SystemdServiceError::FinalizationUnavailable)?,
         FinalizationJournalStageV1::ArchiveRequested
         | FinalizationJournalStageV1::SidecarIssued
+        | FinalizationJournalStageV1::ProtectedHistoryAttached
         | FinalizationJournalStageV1::SidecarAcknowledged
         | FinalizationJournalStageV1::TerminalIssued
             if journal.journal().archive_request.as_ref() == Some(&request) => {}
@@ -1753,6 +1754,31 @@ fn complete_archive_attachment_for_request(
             .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
         sidecar
     };
+    let history_binding = crate::protected_history::load_protected_history_binding()
+        .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
+    let attachment = crate::protected_history::attach_protected_history(
+        &history_binding,
+        &target,
+        &sidecar,
+        journal.journal(),
+    )
+    .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
+    match journal.journal().stage {
+        FinalizationJournalStageV1::SidecarIssued
+        | FinalizationJournalStageV1::SidecarAcknowledged
+        | FinalizationJournalStageV1::TerminalIssued
+            if journal.journal().protected_history_attachment.is_none() =>
+        {
+            journal
+                .record_protected_history_attachment(attachment)
+                .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
+        }
+        FinalizationJournalStageV1::ProtectedHistoryAttached
+        | FinalizationJournalStageV1::SidecarAcknowledged
+        | FinalizationJournalStageV1::TerminalIssued
+            if journal.journal().protected_history_attachment.as_ref() == Some(&attachment) => {}
+        _ => return Err(SystemdServiceError::FinalizationUnavailable),
+    }
     persist_sidecar(&target, &sidecar).map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
     let mut response = LauncherFinalizationArchiveResponseV1 {
         schema_version: 1,
@@ -1776,7 +1802,7 @@ fn complete_archive_attachment_for_request(
     persist_sidecar(&target, &response.sidecar)
         .map_err(|_| SystemdServiceError::FinalizationUnavailable)?;
     match journal.journal().stage {
-        FinalizationJournalStageV1::SidecarIssued => journal
+        FinalizationJournalStageV1::ProtectedHistoryAttached => journal
             .record_sidecar_persistence(persistence)
             .map_err(|_| SystemdServiceError::FinalizationUnavailable),
         FinalizationJournalStageV1::SidecarAcknowledged

@@ -28,3 +28,5 @@ pub mod attestor;
 pub mod linux_observations;
 #[cfg(target_os = "linux")]
 pub mod observation_collector;
+#[cfg(target_os = "linux")]
+pub mod systemd_client;

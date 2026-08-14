@@ -35,7 +35,19 @@ use sha2::{Digest, Sha256};
 
 const MAX_ARCHIVE_BYTES: u64 = 16 * 1024 * 1024;
 const OTA_DIRECTORY: &CStr = c".ota";
+const CONTRACT_DIRECTORY: &CStr = c"contracts";
 const RECEIPT_DIRECTORY: &CStr = c"receipts";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrozenAttachmentObject {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) content_identity: String,
+    pub(crate) owner_uid: u32,
+    pub(crate) mode: u32,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) link_count: u64,
+}
 
 pub(crate) struct ArchiveAttachmentTarget {
     directory: File,
@@ -44,6 +56,8 @@ pub(crate) struct ArchiveAttachmentTarget {
     pub(crate) sidecar_file_name: String,
     receipt_archive_identity: String,
     expected_owner_uid: u32,
+    pub(crate) archive: FrozenAttachmentObject,
+    pub(crate) contract_snapshot: FrozenAttachmentObject,
 }
 
 pub(crate) fn locate_archive(
@@ -70,11 +84,11 @@ pub(crate) fn locate_archive(
         }
         let name = CString::new(name.as_bytes())
             .map_err(|_| String::from("a protected receipt archive name is invalid"))?;
-        let bytes = read_regular_file(directory.as_raw_fd(), &name, expected_owner_uid)?;
-        if format!("sha256:{:x}", Sha256::digest(&bytes)) != receipt_archive_identity {
+        let archive = read_regular_file(directory.as_raw_fd(), &name, expected_owner_uid)?;
+        if archive.content_identity != receipt_archive_identity {
             continue;
         }
-        let value: serde_json::Value = serde_json::from_slice(&bytes)
+        let value: serde_json::Value = serde_json::from_slice(&archive.bytes)
             .map_err(|_| String::from("the protected receipt archive is invalid"))?;
         if value
             .pointer("/receipt/crossing/authority/archive_evidence/transaction/identity")
@@ -85,14 +99,33 @@ pub(crate) fn locate_archive(
                 "the protected receipt archive transaction identity is invalid",
             ));
         }
-        matches.push(name);
+        let snapshot_ref = value
+            .pointer("/receipt/contract_snapshot_ref")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                String::from("the protected receipt archive omits its contract snapshot")
+            })?;
+        let snapshot_identity = value
+            .pointer("/receipt/contract_snapshot_hash")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                String::from("the protected receipt archive omits its contract snapshot identity")
+            })?;
+        let snapshot_name = contract_snapshot_name(snapshot_ref)?;
+        let snapshot = read_contract_snapshot(repository_fd, expected_owner_uid, &snapshot_name)?;
+        if snapshot.content_identity != snapshot_identity {
+            return Err(String::from(
+                "the protected contract snapshot identity is invalid",
+            ));
+        }
+        matches.push((name, archive, snapshot));
     }
     if matches.len() != 1 {
         return Err(String::from(
             "the exact protected receipt archive is unavailable or ambiguous",
         ));
     }
-    let archive_name = matches.pop().expect("one protected archive");
+    let (archive_name, archive, contract_snapshot) = matches.pop().expect("one protected archive");
     let archive_file_name = archive_name
         .to_str()
         .map_err(|_| String::from("the protected receipt archive name is invalid"))?;
@@ -111,6 +144,8 @@ pub(crate) fn locate_archive(
         sidecar_file_name,
         receipt_archive_identity: receipt_archive_identity.into(),
         expected_owner_uid,
+        archive,
+        contract_snapshot,
     })
 }
 
@@ -123,7 +158,7 @@ pub(crate) fn persist_sidecar(
         &target.archive_name,
         target.expected_owner_uid,
     )?;
-    if format!("sha256:{:x}", Sha256::digest(&archive)) != target.receipt_archive_identity {
+    if archive.content_identity != target.receipt_archive_identity || archive != target.archive {
         return Err(String::from(
             "the protected receipt archive changed before sidecar publication",
         ));
@@ -250,7 +285,7 @@ fn read_regular_file(
     directory_fd: RawFd,
     name: &CStr,
     expected_owner_uid: u32,
-) -> Result<Vec<u8>, String> {
+) -> Result<FrozenAttachmentObject, String> {
     let descriptor = unsafe {
         libc::openat(
             directory_fd,
@@ -278,7 +313,74 @@ fn read_regular_file(
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.read_to_end(&mut bytes)
         .map_err(|_| String::from("a protected receipt archive is unreadable"))?;
-    Ok(bytes)
+    let content_identity = format!("sha256:{:x}", Sha256::digest(&bytes));
+    Ok(FrozenAttachmentObject {
+        bytes,
+        content_identity,
+        owner_uid: metadata.uid(),
+        mode: metadata.mode() & 0o7777,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        link_count: metadata.nlink(),
+    })
+}
+
+fn contract_snapshot_name(snapshot_ref: &str) -> Result<CString, String> {
+    let path = Path::new(snapshot_ref);
+    let mut components = path.components();
+    let valid_prefix = matches!(components.next(), Some(std::path::Component::Normal(value)) if value == ".ota")
+        && matches!(components.next(), Some(std::path::Component::Normal(value)) if value == "contracts");
+    let name = match (valid_prefix, components.next(), components.next()) {
+        (true, Some(std::path::Component::Normal(name)), None)
+            if Path::new(name).extension().and_then(|value| value.to_str()) == Some("json") =>
+        {
+            name
+        }
+        _ => {
+            return Err(String::from(
+                "the protected contract snapshot reference is invalid",
+            ));
+        }
+    };
+    CString::new(name.as_bytes())
+        .map_err(|_| String::from("the protected contract snapshot reference is invalid"))
+}
+
+fn read_contract_snapshot(
+    repository_fd: RawFd,
+    expected_owner_uid: u32,
+    name: &CStr,
+) -> Result<FrozenAttachmentObject, String> {
+    let ota_descriptor = unsafe {
+        libc::openat(
+            repository_fd,
+            OTA_DIRECTORY.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if ota_descriptor < 0 {
+        return Err(String::from(
+            "the protected contract snapshot is unavailable",
+        ));
+    }
+    let ota = unsafe { File::from_raw_fd(ota_descriptor) };
+    verify_private_directory(&ota, expected_owner_uid)?;
+    let contracts_descriptor = unsafe {
+        libc::openat(
+            ota.as_raw_fd(),
+            CONTRACT_DIRECTORY.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if contracts_descriptor < 0 {
+        return Err(String::from(
+            "the protected contract snapshot is unavailable",
+        ));
+    }
+    let contracts = unsafe { File::from_raw_fd(contracts_descriptor) };
+    verify_private_directory(&contracts, expected_owner_uid)?;
+    read_regular_file(contracts.as_raw_fd(), name, expected_owner_uid)
+        .map_err(|_| String::from("the protected contract snapshot is unavailable"))
 }
 
 fn existing_file_matches(directory: &File, name: &CStr, expected: &[u8]) -> Result<bool, String> {
@@ -356,17 +458,35 @@ mod tests {
     ) {
         let root = tempdir().expect("repository");
         let receipts = root.path().join(".ota/receipts");
+        let contracts = root.path().join(".ota/contracts");
         fs::create_dir_all(&receipts).expect("receipts");
+        fs::create_dir_all(&contracts).expect("contracts");
         fs::set_permissions(root.path().join(".ota"), fs::Permissions::from_mode(0o700))
             .expect("ota permissions");
         fs::set_permissions(&receipts, fs::Permissions::from_mode(0o700))
             .expect("receipt permissions");
+        fs::set_permissions(&contracts, fs::Permissions::from_mode(0o700))
+            .expect("contract permissions");
         let crossing = identity('4');
+        let snapshot_bytes = br#"{"schema_version":1}"#;
+        let snapshot_identity = format!("sha256:{:x}", Sha256::digest(snapshot_bytes));
+        let snapshot_name = format!(
+            "sha256-{}.json",
+            snapshot_identity.trim_start_matches("sha256:")
+        );
+        let snapshot_path = contracts.join(&snapshot_name);
+        fs::write(&snapshot_path, snapshot_bytes).expect("snapshot");
+        fs::set_permissions(&snapshot_path, fs::Permissions::from_mode(0o600))
+            .expect("snapshot permissions");
         let archive_path = receipts.join("repo-receipt-1.json");
         let archive = serde_json::json!({
-            "receipt": { "crossing": { "authority": { "archive_evidence": {
-                "transaction": { "identity": crossing }
-            }}}}
+            "receipt": {
+                "contract_snapshot_hash": snapshot_identity,
+                "contract_snapshot_ref": format!(".ota/contracts/{snapshot_name}"),
+                "crossing": { "authority": { "archive_evidence": {
+                    "transaction": { "identity": crossing }
+                }}}
+            }
         });
         let bytes = serde_json::to_vec(&archive).expect("archive bytes");
         fs::write(&archive_path, &bytes).expect("archive");
@@ -518,6 +638,26 @@ mod tests {
         .expect("restore receipt permissions");
         fs::set_permissions(root.path().join(".ota"), fs::Permissions::from_mode(0o770))
             .expect("unsafe ota permissions");
+        assert!(locate_archive(repository.as_raw_fd(), owner, &archive, &crossing).is_err());
+    }
+
+    #[test]
+    fn missing_changed_or_aliased_contract_snapshot_refuses() {
+        let (root, repository, archive, crossing, _) = fixture();
+        let owner = unsafe { libc::geteuid() };
+        let snapshot = fs::read_dir(root.path().join(".ota/contracts"))
+            .expect("contracts")
+            .next()
+            .expect("snapshot entry")
+            .expect("snapshot")
+            .path();
+        fs::write(&snapshot, br#"{"schema_version":2}"#).expect("changed snapshot");
+        assert!(locate_archive(repository.as_raw_fd(), owner, &archive, &crossing).is_err());
+
+        fs::remove_file(&snapshot).expect("remove snapshot");
+        let alias_target = root.path().join("snapshot-alias-target");
+        fs::write(&alias_target, br#"{"schema_version":1}"#).expect("alias target");
+        symlink(&alias_target, &snapshot).expect("snapshot symlink");
         assert!(locate_archive(repository.as_raw_fd(), owner, &archive, &crossing).is_err());
     }
 }

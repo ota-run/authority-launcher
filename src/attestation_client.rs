@@ -34,17 +34,20 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use ota_authority_protocol::{
     ATTESTATION_RESPONSE_DOMAIN_V3, LauncherAttestationProducerBindingV1,
     LauncherAttestationSigningRequestV1, LauncherAttestationSigningResponseV1,
-    LauncherFinalizationArchiveSigningRequestV1, LauncherFinalizationArchiveSigningResponseV1,
-    LauncherFinalizationSigningRequestV1, LauncherFinalizationSigningResponseV1, domain_separated,
-    launcher_attestation_claims_v3, launcher_attestation_claims_v3_identity,
-    launcher_attestation_producer_binding_v1_identity,
+    LauncherFinalizationArchiveSidecarV1, LauncherFinalizationArchiveSigningRequestV1,
+    LauncherFinalizationArchiveSigningResponseV1, LauncherFinalizationSigningRequestV1,
+    LauncherFinalizationSigningResponseV1, domain_separated, launcher_attestation_claims_v3,
+    launcher_attestation_claims_v3_identity, launcher_attestation_producer_binding_v1_identity,
     launcher_attestation_signing_response_v1_identity,
     launcher_execution_finalization_signature_bytes_v1,
+    launcher_finalization_archive_sidecar_v1_identity,
     launcher_finalization_archive_signature_bytes_v1,
     launcher_finalization_archive_signing_request_v1_identity,
     launcher_finalization_archive_signing_response_v1_identity,
     launcher_finalization_signing_request_v1_identity,
     launcher_finalization_signing_response_v1_identity, sha256_identity,
+    signed_launcher_execution_finalization_v1_identity,
+    signed_launcher_finalization_archive_v1_identity,
     validate_launcher_attestation_producer_binding_v1,
     validate_launcher_attestation_signing_request_v1,
     validate_launcher_attestation_signing_response_v1,
@@ -242,6 +245,56 @@ pub fn request_finalization_archive(
         .map_err(|_| AttestationClientError::InvalidResponse)?;
     revalidate_producer(&producer, binding)?;
     Ok(response)
+}
+
+/// Verify producer-authenticated finalization relationships without interpreting receipt semantics.
+pub fn verify_finalization_archive_sidecar(
+    binding: &LauncherAttestationProducerBindingV1,
+    sidecar: &LauncherFinalizationArchiveSidecarV1,
+) -> Result<(), AttestationClientError> {
+    if launcher_finalization_archive_sidecar_v1_identity(sidecar)
+        .map_err(|_| AttestationClientError::InvalidResponse)?
+        != sidecar.identity
+        || signed_launcher_execution_finalization_v1_identity(&sidecar.signed_finalization)
+            .map_err(|_| AttestationClientError::InvalidResponse)?
+            != sidecar.signed_finalization.identity
+        || signed_launcher_finalization_archive_v1_identity(&sidecar.signed_archive)
+            .map_err(|_| AttestationClientError::InvalidResponse)?
+            != sidecar.signed_archive.identity
+        || sidecar.signed_archive.signed_finalization_identity
+            != sidecar.signed_finalization.identity
+        || sidecar.signed_finalization.producer_binding_identity != binding.identity
+        || sidecar.signed_archive.producer_binding_identity != binding.identity
+        || sidecar.signed_finalization.key_id != binding.signing_key_id
+        || sidecar.signed_archive.key_id != binding.signing_key_id
+        || sidecar.signed_finalization.algorithm != "ed25519"
+        || sidecar.signed_archive.algorithm != "ed25519"
+    {
+        return Err(AttestationClientError::InvalidResponse);
+    }
+    let finalization_signature = URL_SAFE_NO_PAD
+        .decode(&sidecar.signed_finalization.signature)
+        .ok()
+        .and_then(|bytes| Signature::from_slice(&bytes).ok())
+        .ok_or(AttestationClientError::InvalidResponse)?;
+    let finalization_bytes = launcher_execution_finalization_signature_bytes_v1(
+        &sidecar.signed_finalization.finalization,
+        &sidecar.signed_finalization.producer_binding_identity,
+        &sidecar.signed_finalization.issued_at,
+    )
+    .map_err(|_| AttestationClientError::InvalidResponse)?;
+    let archive_signature = URL_SAFE_NO_PAD
+        .decode(&sidecar.signed_archive.signature)
+        .ok()
+        .and_then(|bytes| Signature::from_slice(&bytes).ok())
+        .ok_or(AttestationClientError::InvalidResponse)?;
+    let archive_bytes = launcher_finalization_archive_signature_bytes_v1(&sidecar.signed_archive)
+        .map_err(|_| AttestationClientError::InvalidResponse)?;
+    let verifier = decode_verifying_key(binding)?;
+    verifier
+        .verify(&finalization_bytes, &finalization_signature)
+        .and_then(|()| verifier.verify(&archive_bytes, &archive_signature))
+        .map_err(|_| AttestationClientError::InvalidResponse)
 }
 
 #[cfg(feature = "systemd-pressure-faults")]
