@@ -226,22 +226,30 @@ fn validate_binding(
         || binding.mappings.is_empty()
         || protected_history_binding_identity(binding)? != binding.identity
     {
+        eprintln!("ota-authority-launcher: protected history binding failed stage=shape");
         return Err(ProtectedHistoryError::BindingInvalid);
     }
     verify_protected_directory(&binding.blob_root, expected_owner_uid, trusted_root)
         .and_then(|()| {
             verify_protected_directory(&binding.catalog_root, expected_owner_uid, trusted_root)
         })
-        .map_err(|_| ProtectedHistoryError::StoreUnavailable)?;
+        .map_err(|_| {
+            eprintln!("ota-authority-launcher: protected history binding failed stage=storage");
+            ProtectedHistoryError::StoreUnavailable
+        })?;
     let mut client = open_protected_executable(
         &binding.installed_client_path,
         expected_owner_uid,
         trusted_root,
     )
-    .map_err(|_| ProtectedHistoryError::BindingInvalid)?;
+    .map_err(|_| {
+        eprintln!("ota-authority-launcher: protected history binding failed stage=client_open");
+        ProtectedHistoryError::BindingInvalid
+    })?;
     if sha256_file_identity(&mut client).map_err(|_| ProtectedHistoryError::BindingInvalid)?
         != binding.installed_client_identity
     {
+        eprintln!("ota-authority-launcher: protected history binding failed stage=client_identity");
         return Err(ProtectedHistoryError::BindingInvalid);
     }
     let launcher_executable =
@@ -255,7 +263,10 @@ fn validate_binding(
         binding.service_unit_identity.as_str(),
         binding.socket_unit_identity.as_str(),
     )
-    .map_err(|_| ProtectedHistoryError::BindingInvalid)?;
+    .map_err(|_| {
+        eprintln!("ota-authority-launcher: protected history binding failed stage=installation");
+        ProtectedHistoryError::BindingInvalid
+    })?;
     let mut mapping_ids = std::collections::BTreeSet::new();
     let mut repository_ids = std::collections::BTreeSet::new();
     let mut namespaces = std::collections::BTreeSet::new();
@@ -273,11 +284,14 @@ fn validate_binding(
             || !repository_ids.insert(mapping.repository_binding_identity.clone())
             || !namespaces.insert(mapping.catalog_namespace_identity.clone())
         {
+            eprintln!("ota-authority-launcher: protected history binding failed stage=mapping");
             return Err(ProtectedHistoryError::BindingInvalid);
         }
         let namespace = namespace_path(&binding.catalog_root, &mapping.catalog_namespace_identity)?;
-        verify_protected_directory(&namespace, expected_owner_uid, trusted_root)
-            .map_err(|_| ProtectedHistoryError::StoreUnavailable)?;
+        verify_protected_directory(&namespace, expected_owner_uid, trusted_root).map_err(|_| {
+            eprintln!("ota-authority-launcher: protected history binding failed stage=namespace");
+            ProtectedHistoryError::StoreUnavailable
+        })?;
     }
     Ok(())
 }
