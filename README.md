@@ -296,7 +296,7 @@ The protected journal then retains the exact terminal frame until the client ack
 terminal identity. Reconnect recovery starts from retained launcher state rather than scanning
 repository files.
 
-### Production client and protected history candidate
+### Production client and protected history
 
 `ota-authority-systemd-client` is the production invocation client for the fixed
 `/run/ota/authority-launcher.sock` boundary. It accepts only `run`, `up`, `proof runtime`, and
@@ -330,16 +330,26 @@ reconciliation before its first response and immediately before terminal complet
 Before a successful finalization journal can advance, Launcher freezes and publishes three
 independent root-owned mode-`0600` content-addressed objects: the receipt archive, the immutable
 contract snapshot named by that archive, and the producer-signed sidecar. Publication is
-descriptor-relative, `openat2`-constrained, fsynced, create-new, and idempotent. Object identities
+descriptor-relative, no-follow, fsynced, create-new, and idempotent. The history reader prefers
+`openat2`; when its hardened service environment returns `ENOSYS`, it permits only an exact-basename
+`openat(O_NOFOLLOW | O_CLOEXEC)` fallback and still requires a root-owned mode-`0600` regular file
+with one link, bounded size, and matching digest. Object identities
 derive first from manifest identity, entry ordinal, catalog identity, kind, content identity,
 length, and chunk count; the entry then binds all three object identities. Protected history never
 reopens a repository snapshot during operator reads and never returns a protected filesystem path
 or general read primitive.
 
 Launcher verifies protected storage and producer signatures only. Core remains the sole semantic
-receipt/archive verifier. The Core protected-history source, installed systemd deployment, and
-immutable Linux/x64 PID 1 pressure are not proved by this local candidate and remain required before
-the production operator surface is complete.
+receipt/archive verifier. Immutable Linux/x64 PID 1
+[run 31823037642](https://github.com/ota-run/authority-launcher/actions/runs/31823037642)
+proves the installed production client and protected-history source against Protocol
+`04a199a1eddd72b5b61958e0fe7f2d4e662e05cf`, clean source-built Core
+`d9d424168b1c1dad48351651c610789e54f74dcf`, and Launcher
+`c80828aa7b64a4bb8c1d9957d937d4fae4d70828`. The retained artifacts report one valid and zero
+invalid protected archive, one catalog entry, three content-addressed objects, exact cleanup, and
+unchanged refusal worktrees without private signing material. The workflow controller provisioned
+the authority stack, so independently administered launcher separation and provider attestation
+remain open.
 
 Immutable Linux/x64 PID 1
 [run 31758094819](https://github.com/ota-run/authority-launcher/actions/runs/31758094819)
@@ -368,7 +378,7 @@ v2 to prove child absence without
 claiming that the restarted launcher observed the exit or reaped the child. Durable producer state
 retains distinct root-owned mode-`0600` cleanup-finalization and archive-attachment issuance
 records. Independently administered launcher separation and provider attestation remain open; that
-run predates and does not prove the production client or protected-history candidate above.
+run predates the production client and protected-history proof in run `31823037642` above.
 
 The feature-gated `ota-authority-systemd-pressure-client` is the unprivileged side of that positive
 kernel proof. It connects only to `/run/ota/authority-launcher.sock`, submits one bounded

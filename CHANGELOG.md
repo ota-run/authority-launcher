@@ -26,6 +26,18 @@
 
 ## Unreleased
 
+- Prove the installed production systemd client and protected receipt-history source in immutable
+  Linux/x64 PID 1 run
+  [31823037642](https://github.com/ota-run/authority-launcher/actions/runs/31823037642)
+  against Protocol `04a199a1eddd72b5b61958e0fe7f2d4e662e05cf`, clean source-built Core
+  `d9d424168b1c1dad48351651c610789e54f74dcf`, and Launcher
+  `c80828aa7b64a4bb8c1d9957d937d4fae4d70828`. The matrix retains one valid and zero invalid
+  protected archive, one catalog entry and three content-addressed objects, one-use/refusal/recovery
+  evidence, exact cleanup, unchanged refusal worktrees, and no private signing material. Hardened
+  history reads now use an exact-basename no-follow fallback only when `openat2` is unavailable;
+  owner, mode, link-count, size, and digest verification remain mandatory. Independently
+  administered launcher separation and provider attestation remain open.
+
 - Made the root-only systemd pressure provisioner install the production invocation client mode,
   fixed protected-history socket/service, canonical storage roots, exact repository mapping, and
   manifest-bound Core history reader. A domain-separated history-installation projection removes
