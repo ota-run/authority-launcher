@@ -372,16 +372,13 @@ fn socket_peer_credentials(stream: &UnixStream) -> Result<libc::ucred, LinuxObse
 }
 
 fn require_live_pidfd(pidfd: &OwnedFd) -> Result<(), LinuxObservationError> {
-    if unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            pidfd.as_raw_fd(),
-            0,
-            std::ptr::null::<libc::siginfo_t>(),
-            0,
-        )
-    } < 0
-    {
+    let mut descriptor = libc::pollfd {
+        fd: pidfd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let observed = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    if observed != 0 || descriptor.revents != 0 {
         return Err(LinuxObservationError::PeerCredentialsUnavailable);
     }
     Ok(())
