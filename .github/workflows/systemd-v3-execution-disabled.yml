@@ -1382,8 +1382,10 @@ jobs:
           test -z "$(awk '$1 != "root" || $2 != "root" || $3 != "600" \
             || $4 != "regular" || $5 != "file" { print; exit }' \
             "$EVIDENCE_DIR/attestor-issuance-state.txt")"
-          grep -q '/finalization-' "$EVIDENCE_DIR/attestor-issuance-state.txt"
-          grep -q '/finalization-archive-' "$EVIDENCE_DIR/attestor-issuance-state.txt"
+          grep -Eq '/finalization-[0-9a-f]{64}\.json$' \
+            "$EVIDENCE_DIR/attestor-issuance-state.txt"
+          grep -Eq '/finalization-archive-[0-9a-f]{64}\.json$' \
+            "$EVIDENCE_DIR/attestor-issuance-state.txt"
           systemctl show \
             ota-authority-launcher.service \
             ota-authority-attestor.service \
