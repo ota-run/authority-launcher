@@ -1373,9 +1373,17 @@ jobs:
           jq -e --arg lease "$positive_lease" 'index($lease) != null' \
             "$EVIDENCE_DIR/consumed-leases.json" >/dev/null
           sudo rm -rf /var/lib/ota/authority-broker-pressure
-          test -z "$(sudo find /var/lib/ota -type f \
-            \( -iname '*decision*' -o -iname '*lease*' -o -iname '*receipt*' -o -iname '*archive*' \) \
-            -print -quit)"
+          test -z "$(sudo find /var/lib/ota/authority-launcher/active \
+            /var/lib/ota/authority-launcher/finalization -type f -print -quit)"
+          sudo find /var/lib/ota/authority-attestor -mindepth 1 -maxdepth 1 -type f \
+            -exec stat -c '%U %G %a %F %n' {} \; \
+            | sort | tee "$EVIDENCE_DIR/attestor-issuance-state.txt" >/dev/null
+          test -s "$EVIDENCE_DIR/attestor-issuance-state.txt"
+          test -z "$(awk '$1 != "root" || $2 != "root" || $3 != "600" \
+            || $4 != "regular" || $5 != "file" { print; exit }' \
+            "$EVIDENCE_DIR/attestor-issuance-state.txt")"
+          grep -q '/finalization-' "$EVIDENCE_DIR/attestor-issuance-state.txt"
+          grep -q '/finalization-archive-' "$EVIDENCE_DIR/attestor-issuance-state.txt"
           systemctl show \
             ota-authority-launcher.service \
             ota-authority-attestor.service \
