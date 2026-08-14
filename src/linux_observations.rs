@@ -74,17 +74,14 @@ pub struct VerifiedPeerProcessStatus {
 pub fn observe_connected_peer(
     stream: &UnixStream,
 ) -> Result<ObservedSessionPeer, LinuxObservationError> {
-    let credentials = socket_peer_credentials(stream).map_err(|error| {
+    let credentials = socket_peer_credentials(stream).inspect_err(|_| {
         eprintln!("ota-authority-launcher: peer observation failed stage=socket_credentials");
-        error
     })?;
-    let pidfd = socket_peer_pidfd(stream).map_err(|error| {
+    let pidfd = socket_peer_pidfd(stream).inspect_err(|_| {
         eprintln!("ota-authority-launcher: peer observation failed stage=socket_pidfd");
-        error
     })?;
-    require_live_pidfd(&pidfd).map_err(|error| {
+    require_live_pidfd(&pidfd).inspect_err(|_| {
         eprintln!("ota-authority-launcher: peer observation failed stage=pidfd_liveness");
-        error
     })?;
     Ok(ObservedSessionPeer {
         pidfd,

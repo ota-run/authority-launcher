@@ -608,7 +608,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         socket_unit_identity: sha256_file(Path::new(HISTORY_SOCKET_UNIT))?,
         blob_root: PathBuf::from(HISTORY_BLOB_ROOT),
         catalog_root: PathBuf::from(HISTORY_CATALOG_ROOT),
-        maximum_response_bytes: ota_authority_protocol::MAX_HISTORY_RESPONSE_BYTES_V1 as u64,
+        maximum_response_bytes: ota_authority_protocol::MAX_HISTORY_RESPONSE_BYTES_V1,
         maximum_entry_count: ota_authority_protocol::MAX_HISTORY_ENTRY_COUNT_V1 as u32,
         mappings: vec![history_mapping],
     };

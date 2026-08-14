@@ -473,14 +473,12 @@ pub(crate) fn load_catalog_entries(
         let identity_name = name
             .strip_suffix(".json")
             .ok_or(ProtectedHistoryError::ObjectInvalid)?;
-        identity_file_name(&format!("sha256:{identity_name}")).map_err(|error| {
+        identity_file_name(&format!("sha256:{identity_name}")).inspect_err(|_| {
             eprintln!("ota-authority-launcher: protected history catalog failed stage=name");
-            error
         })?;
         let bytes = read_exact_file(&namespace, &name, 0, None)
-            .map_err(|error| {
+            .inspect_err(|_| {
                 eprintln!("ota-authority-launcher: protected history catalog failed stage=file");
-                error
             })?
             .0;
         let entry: ProtectedHistoryCatalogEntryV1 =
