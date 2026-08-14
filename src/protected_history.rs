@@ -918,7 +918,7 @@ mod tests {
 
     #[test]
     fn protected_blob_publication_is_atomic_idempotent_and_alias_safe() {
-        let root = tempfile::tempdir_in("/root").expect("root");
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("root");
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
         let owner = unsafe { libc::geteuid() };
         let directory = open_protected_directory(root.path(), owner).expect("protected root");
@@ -926,9 +926,8 @@ mod tests {
             try_read_exact_file_at(&directory, "missing", owner, None),
             Err(ProtectedHistoryError::StoreUnavailable)
         ) {
-            // The production store requires openat2. Emulated or older kernels must refuse
-            // rather than weakening path resolution; native pressure supplies the positive
-            // publication proof.
+            // Unsupported exact-file lookup must refuse rather than weakening path resolution;
+            // native pressure supplies the positive publication proof.
             assert_eq!(
                 persist_blob(root.path(), b"archive", owner),
                 Err(ProtectedHistoryError::StoreUnavailable)
