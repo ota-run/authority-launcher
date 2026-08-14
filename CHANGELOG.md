@@ -26,6 +26,11 @@
 
 ## Unreleased
 
+- Made the root-only systemd pressure provisioner install the production invocation client mode,
+  fixed protected-history socket/service, canonical storage roots, exact repository mapping, and
+  manifest-bound Core history reader. A domain-separated history-installation projection removes
+  the binding/manifest hash cycle while the complete manifest still binds the exact binding bytes.
+
 - Add the Launcher side of the production systemd operator attachment. The new
   `ota-authority-systemd-client` uses only the fixed protected-launcher socket, admits only governed
   Ota execution commands, preserves globally ordered output, verifies terminal evidence, and uses

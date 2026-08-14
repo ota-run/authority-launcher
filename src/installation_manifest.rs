@@ -43,6 +43,8 @@ pub(crate) const SYSTEMD_INSTALLATION_MANIFEST_PATH: &str =
     "/etc/ota/authority-launcher-installation.json";
 const INSTALLATION_MANIFEST_IDENTITY_DOMAIN_V1: &str =
     "ota.authority-launcher.installation-manifest.v1\0";
+const HISTORY_INSTALLATION_IDENTITY_DOMAIN_V1: &str =
+    "ota.authority-launcher.history-installation.v1\0";
 const BROKER_PROXY_INSTALLATION_IDENTITY_DOMAIN_V1: &str =
     "ota.authority-launcher.broker-proxy-installation.v1\0";
 
@@ -173,6 +175,21 @@ pub(crate) fn protected_installation_manifest_identity(
     .map_err(|_| InstallationManifestError::Malformed)
 }
 
+pub(crate) fn protected_history_installation_identity(
+    manifest: &ProtectedInstallationManifestV1,
+) -> Result<String, InstallationManifestError> {
+    let mut canonical = manifest.clone();
+    canonical.identity.clear();
+    canonical
+        .files
+        .retain(|entry| entry.role != ProtectedInstallationRoleV1::HistoryBinding);
+    message_identity(
+        HISTORY_INSTALLATION_IDENTITY_DOMAIN_V1.as_bytes(),
+        &canonical,
+    )
+    .map_err(|_| InstallationManifestError::Malformed)
+}
+
 pub(crate) fn broker_proxy_installation_identity(
     service_unit_identity: &str,
     socket_unit_identity: &str,
@@ -217,7 +234,7 @@ pub(crate) fn verify_protected_history_installation(
     let manifest: ProtectedInstallationManifestV1 =
         serde_json::from_reader(manifest_file).map_err(|_| InstallationManifestError::Malformed)?;
     if protected_installation_manifest_identity(&manifest)? != manifest.identity
-        || manifest.identity != expected_manifest_identity
+        || protected_history_installation_identity(&manifest)? != expected_manifest_identity
     {
         return Err(InstallationManifestError::Mismatch);
     }
@@ -513,6 +530,42 @@ mod tests {
     use crate::config::{
         RunAs, SessionPeer, SystemdPrincipalMappingV1, systemd_launcher_service_config_identity,
     };
+
+    #[test]
+    fn history_installation_projection_breaks_the_binding_manifest_hash_cycle() {
+        let mut manifest = ProtectedInstallationManifestV1 {
+            schema_version: 1,
+            identity: String::new(),
+            launcher_configuration_identity: format!("sha256:{}", "1".repeat(64)),
+            launcher_profile_identity: format!("sha256:{}", "2".repeat(64)),
+            job_principal_profile_identity: format!("sha256:{}", "3".repeat(64)),
+            files: vec![
+                ProtectedInstallationFileV1 {
+                    role: ProtectedInstallationRoleV1::LauncherExecutable,
+                    path: PathBuf::from("/usr/lib/ota-authority/bin/ota-authority-launcher"),
+                    identity: format!("sha256:{}", "4".repeat(64)),
+                },
+                ProtectedInstallationFileV1 {
+                    role: ProtectedInstallationRoleV1::HistoryBinding,
+                    path: PathBuf::from("/etc/ota/authority-history.json"),
+                    identity: format!("sha256:{}", "5".repeat(64)),
+                },
+            ],
+        };
+        let projected =
+            protected_history_installation_identity(&manifest).expect("history projection");
+        manifest.files[1].identity = format!("sha256:{}", "6".repeat(64));
+        assert_eq!(
+            protected_history_installation_identity(&manifest).expect("changed binding projection"),
+            projected
+        );
+        manifest.files[0].identity = format!("sha256:{}", "7".repeat(64));
+        assert_ne!(
+            protected_history_installation_identity(&manifest)
+                .expect("changed launcher projection"),
+            projected
+        );
+    }
 
     #[test]
     fn manifest_binds_every_required_protected_file_and_refuses_substitution() {

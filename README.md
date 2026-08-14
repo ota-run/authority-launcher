@@ -312,7 +312,9 @@ ota-authority-systemd-client --authority-id release --repository . -- \
 The Launcher-side protected-history candidate uses the separate fixed
 `/run/ota/authority-history.sock` service and root-owned
 `/etc/ota/authority-history.json` binding. The binding is reconciled with the protected
-installation manifest and fixes the admitted client executable, operator UID/GID and profile,
+installation manifest through a cycle-free history-installation projection. That projection
+excludes only the binding file entry; the full manifest still binds and verifies the exact binding
+bytes. The binding fixes the admitted client executable, operator UID/GID and profile,
 service/socket identities, response ceilings, the canonical
 `/var/lib/ota/authority-launcher/history/{blobs,catalog}` roots, and exact repository-instance
 mapping. Alternate storage roots refuse even when they are otherwise administrator-owned and

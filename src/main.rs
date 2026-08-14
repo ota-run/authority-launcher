@@ -110,6 +110,8 @@ enum Command {
         ota_binary: std::path::PathBuf,
         #[arg(long)]
         pressure_client_binary: std::path::PathBuf,
+        #[arg(long)]
+        production_client: bool,
     },
 }
 
@@ -133,6 +135,7 @@ fn main() -> ExitCode {
             broker_decision_binary,
             ota_binary,
             pressure_client_binary,
+            production_client,
         } => pressure_provision::provision(pressure_provision::ProvisionRequest {
             authority_id,
             job_user,
@@ -143,6 +146,7 @@ fn main() -> ExitCode {
             broker_decision_binary,
             ota_binary,
             pressure_client_binary,
+            production_client,
         }),
     };
     match result {

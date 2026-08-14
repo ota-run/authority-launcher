@@ -38,12 +38,13 @@ use ota_authority_protocol::{
     AUTHORIZATION_REQUEST_DOMAIN_V1, BROKER_BINDING_IDENTITY_DOMAIN_V1,
     CHALLENGE_REQUEST_DOMAIN_V1, LEASE_CONSUME_DOMAIN_V1, LEASE_CONSUME_RESPONSE_DOMAIN_V1,
     LEASE_CONSUMPTION_QUERY_DOMAIN_V1, LEASE_CONSUMPTION_STATUS_DOMAIN_V1,
-    LEASE_ISSUANCE_DOMAIN_V1, LauncherAttestationProducerBindingV1,
+    LEASE_ISSUANCE_DOMAIN_V1, LauncherAttestationProducerBindingV1, LauncherWorkingDirectoryV1,
     SYSTEMD_JOB_PRINCIPAL_PROFILE_ID_V2, SYSTEMD_LAUNCHER_PROFILE_ID_V3,
     SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1, SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3,
-    launcher_attestation_producer_binding_v1_identity, message_identity, sha256_identity,
-    systemd_job_principal_profile_identity, systemd_job_principal_profile_v2,
-    systemd_launcher_profile_identity, systemd_launcher_profile_v3,
+    launcher_attestation_producer_binding_v1_identity, launcher_working_directory_identity,
+    message_identity, sha256_identity, systemd_job_principal_profile_identity,
+    systemd_job_principal_profile_v2, systemd_launcher_profile_identity,
+    systemd_launcher_profile_v3,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -59,7 +60,13 @@ use crate::config::{
 };
 use crate::installation_manifest::{
     ProtectedInstallationFileV1, ProtectedInstallationManifestV1, ProtectedInstallationRoleV1,
-    broker_proxy_installation_identity, protected_installation_manifest_identity,
+    broker_proxy_installation_identity, protected_history_installation_identity,
+    protected_installation_manifest_identity,
+};
+use crate::protected_history::{
+    HISTORY_BINDING_PATH, HISTORY_BLOB_ROOT, HISTORY_CATALOG_ROOT, HISTORY_SOCKET_PATH,
+    ProtectedHistoryBindingV1, ProtectedHistoryRepositoryMappingV1,
+    protected_history_binding_identity, protected_history_repository_mapping_identity,
 };
 
 const ETC_OTA: &str = "/etc/ota";
@@ -96,6 +103,8 @@ const BROKER_PROXY_SOCKET_UNIT: &str = "/etc/systemd/system/ota-authority-broker
 const RUNNER_SERVICE: &str = "/etc/systemd/system/ota-authority-pressure-runner.service";
 const RUNNER_SERVICE_DROP_IN: &str =
     "/etc/systemd/system/ota-authority-pressure-runner.service.d/zzzz-ota-pressure-hardening.conf";
+const HISTORY_SERVICE: &str = "/etc/systemd/system/ota-authority-history.service";
+const HISTORY_SOCKET_UNIT: &str = "/etc/systemd/system/ota-authority-history.socket";
 const ORBSTACK_GLOBAL_SERVICE_DROP_IN: &str = "/run/systemd/system/service.d/zzz-lxc-service.conf";
 const INVOCATION_SLICE: &str = "/etc/systemd/system/ota-authority-invocations.slice";
 const NON_LOGIN_SHELL: &str = "/usr/sbin/nologin";
@@ -106,6 +115,12 @@ const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const PKCHECK: &str = "/usr/bin/pkcheck";
 const POLKIT_RULE: &str = "/etc/polkit-1/rules.d/00-ota-authority-deny.rules";
 const SUDO: &str = "/usr/bin/sudo";
+const HISTORY_OPERATOR_PROFILE_IDENTITY_DOMAIN_V1: &[u8] =
+    b"ota.authority-launcher.history-operator-profile.v1\0";
+const HISTORY_REPOSITORY_BINDING_IDENTITY_DOMAIN_V1: &[u8] =
+    b"ota.authority-launcher.history-repository-binding.v1\0";
+const HISTORY_CATALOG_NAMESPACE_IDENTITY_DOMAIN_V1: &[u8] =
+    b"ota.authority-launcher.history-catalog-namespace.v1\0";
 
 pub(crate) struct ProvisionRequest {
     pub authority_id: String,
@@ -117,6 +132,7 @@ pub(crate) struct ProvisionRequest {
     pub broker_decision_binary: PathBuf,
     pub ota_binary: PathBuf,
     pub pressure_client_binary: PathBuf,
+    pub production_client: bool,
 }
 
 #[derive(Clone)]
@@ -214,7 +230,10 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         &job,
         &repository_root,
         &pressure_client_binary,
+        request.production_client,
     );
+    let history_service = history_service_unit(&launcher_binary);
+    let history_socket = history_socket_unit(execution.group.as_str());
     write_root_file(
         Path::new(POLKIT_RULE),
         polkit_deny_rule(&job, &execution)?.as_bytes(),
@@ -251,6 +270,16 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         0o644,
     )?;
     write_root_file(Path::new(RUNNER_SERVICE), runner_service.as_bytes(), 0o644)?;
+    write_root_file(
+        Path::new(HISTORY_SERVICE),
+        history_service.as_bytes(),
+        0o644,
+    )?;
+    write_root_file(
+        Path::new(HISTORY_SOCKET_UNIT),
+        history_socket.as_bytes(),
+        0o644,
+    )?;
     write_root_file(
         Path::new(LAUNCHER_SERVICE_DROP_IN),
         launcher_hardening_drop_in(&repository_root, read_only_paths.as_slice()).as_bytes(),
@@ -490,7 +519,11 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     .map(|(role, path)| {
         Ok(ProtectedInstallationFileV1 {
             role,
-            identity: sha256_file(&path)?,
+            identity: if role == ProtectedInstallationRoleV1::HistoryBinding {
+                format!("sha256:{}", "0".repeat(64))
+            } else {
+                sha256_file(&path)?
+            },
             path,
         })
     })
@@ -504,6 +537,90 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         job_principal_profile_identity: job_profile_identity,
         files,
     };
+    let repository_metadata = fs::metadata(&repository_root)
+        .map_err(|_| String::from("pressure repository metadata unavailable"))?;
+    let mut working_directory = LauncherWorkingDirectoryV1 {
+        schema_version: 1,
+        identity: String::new(),
+        logical_path: repository_root.to_string_lossy().into_owned(),
+        device: repository_metadata.dev(),
+        inode: repository_metadata.ino(),
+    };
+    working_directory.identity = launcher_working_directory_identity(&working_directory)
+        .map_err(|_| String::from("history working-directory identity unavailable"))?;
+    let repository_binding_identity = message_identity(
+        HISTORY_REPOSITORY_BINDING_IDENTITY_DOMAIN_V1,
+        &(
+            launcher_config.identity.as_str(),
+            request.authority_id.as_str(),
+            working_directory.identity.as_str(),
+        ),
+    )
+    .map_err(|_| String::from("history repository binding identity unavailable"))?;
+    let catalog_namespace_identity = message_identity(
+        HISTORY_CATALOG_NAMESPACE_IDENTITY_DOMAIN_V1,
+        &(
+            repository_binding_identity.as_str(),
+            request.authority_id.as_str(),
+        ),
+    )
+    .map_err(|_| String::from("history catalog namespace identity unavailable"))?;
+    create_root_directory(
+        &Path::new(HISTORY_CATALOG_ROOT).join(&catalog_namespace_identity),
+        0o700,
+    )?;
+    let mut history_mapping = ProtectedHistoryRepositoryMappingV1 {
+        schema_version: 1,
+        identity: String::new(),
+        repository_binding_identity,
+        catalog_namespace_identity,
+        authority_id: request.authority_id.clone(),
+        working_directory,
+    };
+    history_mapping.identity = protected_history_repository_mapping_identity(&history_mapping)
+        .map_err(|_| String::from("history repository mapping identity unavailable"))?;
+    let history_installation_identity = protected_history_installation_identity(&manifest)
+        .map_err(|_| String::from("history installation identity unavailable"))?;
+    let ota_identity = sha256_file(&ota_binary)?;
+    let operator_profile_identity = message_identity(
+        HISTORY_OPERATOR_PROFILE_IDENTITY_DOMAIN_V1,
+        &(
+            execution.uid,
+            execution.gid,
+            ota_identity.as_str(),
+            "primary_group_only:no_new_privs:no_process_capabilities",
+        ),
+    )
+    .map_err(|_| String::from("history operator profile identity unavailable"))?;
+    let mut history_binding = ProtectedHistoryBindingV1 {
+        schema_version: 1,
+        identity: String::new(),
+        protocol_profile: ota_authority_protocol::SYSTEMD_PROTECTED_HISTORY_PROTOCOL_V1.into(),
+        socket_path: PathBuf::from(HISTORY_SOCKET_PATH),
+        socket_group_gid: execution.gid,
+        installation_manifest_identity: history_installation_identity,
+        installed_client_path: ota_binary.clone(),
+        installed_client_identity: ota_identity,
+        operator_uid: execution.uid,
+        operator_gid: execution.gid,
+        operator_profile_identity,
+        service_unit_identity: sha256_file(Path::new(HISTORY_SERVICE))?,
+        socket_unit_identity: sha256_file(Path::new(HISTORY_SOCKET_UNIT))?,
+        blob_root: PathBuf::from(HISTORY_BLOB_ROOT),
+        catalog_root: PathBuf::from(HISTORY_CATALOG_ROOT),
+        maximum_response_bytes: ota_authority_protocol::MAX_HISTORY_RESPONSE_BYTES_V1 as u64,
+        maximum_entry_count: ota_authority_protocol::MAX_HISTORY_ENTRY_COUNT_V1 as u32,
+        mappings: vec![history_mapping],
+    };
+    history_binding.identity = protected_history_binding_identity(&history_binding)
+        .map_err(|_| String::from("history binding identity unavailable"))?;
+    write_json(Path::new(HISTORY_BINDING_PATH), &history_binding, 0o600)?;
+    manifest
+        .files
+        .iter_mut()
+        .find(|entry| entry.role == ProtectedInstallationRoleV1::HistoryBinding)
+        .ok_or_else(|| String::from("history binding manifest entry unavailable"))?
+        .identity = sha256_file(Path::new(HISTORY_BINDING_PATH))?;
     manifest.identity = protected_installation_manifest_identity(&manifest)
         .map_err(|_| String::from("installation manifest identity unavailable"))?;
     write_json(Path::new(INSTALLATION_MANIFEST), &manifest, 0o600)?;
@@ -515,6 +632,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         "ota-authority-launcher.socket",
         "ota-authority-attestor.socket",
         "ota-authority-broker-proxy.socket",
+        "ota-authority-history.socket",
     ])?;
     println!(
         "systemd-v3-pressure-provisioned authority={} launcher_config={} installation={}",
@@ -619,6 +737,22 @@ fn protected_role_paths(
             ProtectedInstallationRoleV1::JobRunnerServiceDropIn,
             PathBuf::from(RUNNER_SERVICE_DROP_IN),
         ),
+        (
+            ProtectedInstallationRoleV1::HistoryClientExecutable,
+            ota.to_path_buf(),
+        ),
+        (
+            ProtectedInstallationRoleV1::HistoryBinding,
+            PathBuf::from(HISTORY_BINDING_PATH),
+        ),
+        (
+            ProtectedInstallationRoleV1::HistoryServiceUnit,
+            PathBuf::from(HISTORY_SERVICE),
+        ),
+        (
+            ProtectedInstallationRoleV1::HistorySocketUnit,
+            PathBuf::from(HISTORY_SOCKET_UNIT),
+        ),
     ];
     if Path::new(ORBSTACK_GLOBAL_SERVICE_DROP_IN).exists() {
         for role in [
@@ -655,7 +789,7 @@ fn polkit_deny_rule(job: &Account, execution: &Account) -> Result<String, String
     ))
 }
 
-fn protected_directories() -> [(&'static str, u32); 9] {
+fn protected_directories() -> [(&'static str, u32); 11] {
     [
         (ETC_OTA, 0o755),
         (STATE_ROOT, 0o755),
@@ -666,12 +800,14 @@ fn protected_directories() -> [(&'static str, u32); 9] {
         (FINALIZATION_STATE, 0o700),
         (BROKER_STATE, 0o700),
         (LAUNCHER_RUNTIME, 0o700),
+        (HISTORY_BLOB_ROOT, 0o700),
+        (HISTORY_CATALOG_ROOT, 0o700),
     ]
 }
 
 fn launcher_service_unit(launcher: &Path, repository: &Path, read_only: &[String]) -> String {
     format!(
-        "[Unit]\nDescription=Ota protected authority launcher\nRequires=ota-authority-launcher.socket ota-authority-attestor.socket\nAfter=ota-authority-launcher.socket ota-authority-attestor.socket\n\n[Service]\nType=simple\nExecStart={} serve-systemd\nUser=root\nGroup=root\nUMask=0077\nNoNewPrivileges=yes\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths={}\nReadWritePaths={} {} {}\n",
+        "[Unit]\nDescription=Ota protected authority launcher\nRequires=ota-authority-launcher.socket ota-authority-attestor.socket\nAfter=ota-authority-launcher.socket ota-authority-attestor.socket\n\n[Service]\nType=simple\nExecStart={} serve-systemd\nUser=root\nGroup=root\nUMask=0077\nNoNewPrivileges=yes\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths={}\nReadWritePaths={} {} {} {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}\n",
         launcher.display(),
         read_only.join(" "),
         LAUNCHER_RUNTIME,
@@ -682,7 +818,7 @@ fn launcher_service_unit(launcher: &Path, repository: &Path, read_only: &[String
 
 fn launcher_hardening_drop_in(repository: &Path, read_only: &[String]) -> String {
     format!(
-        "[Service]\nUser=root\nGroup=root\nUMask=0077\nNoNewPrivileges=yes\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths=\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths=\nReadOnlyPaths={}\nReadWritePaths=\nReadWritePaths={} {} {}\n",
+        "[Service]\nUser=root\nGroup=root\nUMask=0077\nNoNewPrivileges=yes\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths=\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths=\nReadOnlyPaths={}\nReadWritePaths=\nReadWritePaths={} {} {} {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}\n",
         read_only.join(" "),
         LAUNCHER_RUNTIME,
         LAUNCHER_STATE,
@@ -693,6 +829,19 @@ fn launcher_hardening_drop_in(repository: &Path, read_only: &[String]) -> String
 fn launcher_socket_unit(group: &str) -> String {
     format!(
         "[Unit]\nDescription=Ota protected authority launcher socket\n\n[Socket]\nListenStream={LAUNCHER_SOCKET}\nSocketUser=root\nSocketGroup={group}\nSocketMode=0660\nAccept=no\nRemoveOnStop=yes\nService=ota-authority-launcher.service\n\n[Install]\nWantedBy=sockets.target\n"
+    )
+}
+
+fn history_service_unit(launcher: &Path) -> String {
+    format!(
+        "[Unit]\nDescription=Ota protected receipt history\nRequires=ota-authority-history.socket\nAfter=ota-authority-history.socket\n\n[Service]\nType=simple\nExecStart={} serve-history\nUser=root\nGroup=root\nUMask=0077\nNoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nRestrictRealtime=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes\nMemoryDenyWriteExecute=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_SYS_PTRACE\nAmbientCapabilities=\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX\nReadOnlyPaths={ETC_OTA} {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}\n",
+        launcher.display()
+    )
+}
+
+fn history_socket_unit(group: &str) -> String {
+    format!(
+        "[Unit]\nDescription=Ota protected receipt history socket\n\n[Socket]\nListenStream={HISTORY_SOCKET_PATH}\nSocketUser=root\nSocketGroup={group}\nSocketMode=0660\nAccept=no\nRemoveOnStop=yes\nService=ota-authority-history.service\n\n[Install]\nWantedBy=sockets.target\n"
     )
 }
 
@@ -733,16 +882,26 @@ fn runner_service_unit(
     account: &Account,
     repository: &Path,
     client: &Path,
+    production_client: bool,
 ) -> String {
+    let client_arguments = if production_client {
+        format!(
+            "--authority-id {authority_id} --repository {} --json -- run governed --grant {authority_id} --receipt",
+            repository.display()
+        )
+    } else {
+        format!(
+            "--authority-id {authority_id} --repository {} --expected-terminal observed-decision-outcome -- run governed --grant {authority_id} --receipt",
+            repository.display()
+        )
+    };
     format!(
-        "[Unit]\nDescription=Ota V3 protected-launcher pressure client\nAfter=ota-authority-launcher.socket\nRequires=ota-authority-launcher.socket\n\n[Service]\nType=oneshot\nUser={}\nGroup={}\nSupplementaryGroups=\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nRestrictSUIDSGID=yes\nRestrictNamespaces=yes\nRestrictAddressFamilies=AF_UNIX\nSyslogIdentifier=ota-authority-pressure-client\nWorkingDirectory={}\nExecStart={} --authority-id {} --repository {} --expected-terminal observed-decision-outcome -- run governed --grant {} --receipt\n",
+        "[Unit]\nDescription=Ota V3 protected-launcher pressure client\nAfter=ota-authority-launcher.socket\nRequires=ota-authority-launcher.socket\n\n[Service]\nType=oneshot\nUser={}\nGroup={}\nSupplementaryGroups=\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nRestrictSUIDSGID=yes\nRestrictNamespaces=yes\nRestrictAddressFamilies=AF_UNIX\nSyslogIdentifier=ota-authority-pressure-client\nWorkingDirectory={}\nExecStart={} {}\n",
         account.name,
         account.group,
         repository.display(),
         client.display(),
-        authority_id,
-        repository.display(),
-        authority_id,
+        client_arguments,
     )
 }
 
@@ -950,6 +1109,13 @@ mod tests {
         )));
         assert!(attestor_socket_unit().contains("ListenSequentialPacket="));
         assert!(protected_directories().contains(&(ACTIVE_SLOT_STATE, 0o700)));
+        assert!(protected_directories().contains(&(HISTORY_BLOB_ROOT, 0o700)));
+        assert!(protected_directories().contains(&(HISTORY_CATALOG_ROOT, 0o700)));
+        assert!(history_service_unit(Path::new("/usr/lib/ota-authority/bin/launcher"))
+            .contains("serve-history"));
+        assert!(history_socket_unit("execution").contains(&format!(
+            "ListenStream={HISTORY_SOCKET_PATH}\nSocketUser=root\nSocketGroup=execution\nSocketMode=0660"
+        )));
         let rule = polkit_deny_rule(
             &Account {
                 name: String::from("job"),
@@ -979,8 +1145,24 @@ mod tests {
                 },
                 Path::new("/srv/ota-pressure"),
                 Path::new("/usr/lib/ota-authority/bin/pressure-client"),
+                false,
             )
             .contains("-- run governed --grant release --receipt")
+        );
+        assert!(
+            runner_service_unit(
+                "release",
+                &Account {
+                    name: String::from("job"),
+                    uid: 1001,
+                    gid: 1001,
+                    group: String::from("job"),
+                },
+                Path::new("/srv/ota-pressure"),
+                Path::new("/usr/lib/ota-authority/bin/ota-authority-systemd-client"),
+                true,
+            )
+            .contains("--json -- run governed --grant release --receipt")
         );
     }
 
