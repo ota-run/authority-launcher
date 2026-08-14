@@ -309,6 +309,16 @@ fn verify_service_properties(
         Path::new("/run/ota/authority-launcher"),
         Path::new("/var/lib/ota/authority-launcher"),
     ];
+    if installation
+        .optional_singular_path(ProtectedInstallationRoleV1::HistoryBinding)
+        .map_err(|_| SystemdRuntimeObservationError::Mismatch)?
+        .is_some()
+    {
+        writable.extend([
+            Path::new(crate::protected_history::HISTORY_BLOB_ROOT),
+            Path::new(crate::protected_history::HISTORY_CATALOG_ROOT),
+        ]);
+    }
     writable.extend(config.allowed_repository_roots.iter().map(PathBuf::as_path));
     require_path_set(values, "ReadWritePaths", writable)?;
     let mut read_only = vec![Path::new("/etc/ota")];
