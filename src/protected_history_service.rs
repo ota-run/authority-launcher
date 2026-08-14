@@ -132,7 +132,10 @@ fn serve_connection(
     binding: &ProtectedHistoryBindingV1,
     stream: &mut UnixStream,
 ) -> Result<(), ConnectionError> {
-    let peer = observe_connected_peer(stream).map_err(|_| {
+    let peer = observe_connected_peer(stream).map_err(|error| {
+        eprintln!(
+            "ota-authority-launcher: protected history peer refused stage=observation reason={error}"
+        );
         ConnectionError::PreQuery(LauncherHistoryRefusalReasonV1::PeerAdmissionRefused)
     })?;
     admit_operator(binding, stream, &peer).map_err(ConnectionError::PreQuery)?;
