@@ -614,8 +614,8 @@ jobs:
             "$EVIDENCE_DIR/positive.receipt-history.json"
           positive_archive_path=$(jq -er '.archives[0].archive_path' \
             "$EVIDENCE_DIR/positive.receipt-history.json")
-          positive_archive_identity=$(sudo jq -er '.archive_identity' \
-            "$positive_archive_path")
+          positive_archive_identity="sha256:$(sudo sha256sum \
+            "$positive_archive_path" | awk '{print $1}')"
           sudo systemd-run --quiet --pipe --wait --collect --service-type=exec \
             --uid=ota-authority-exec --gid=ota-authority-exec \
             --working-directory="$PRESSURE_REPOSITORY" \
@@ -1607,7 +1607,7 @@ jobs:
             | tee "$EVIDENCE_DIR/local-receipt-history.json"
           archive_path=$(jq -er '.archives[0].archive_path' \
             "$EVIDENCE_DIR/local-receipt-history.json")
-          archive_identity=$(sudo jq -er '.archive_identity' "$archive_path")
+          archive_identity="sha256:$(sudo sha256sum "$archive_path" | awk '{print $1}')"
           sudo systemd-run --quiet --pipe --wait --collect --service-type=exec \
             --uid=ota-authority-exec --gid=ota-authority-exec \
             --working-directory="$PRESSURE_REPOSITORY" \
