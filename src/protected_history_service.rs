@@ -217,12 +217,21 @@ fn admit_operator(
     peer: &ObservedSessionPeer,
 ) -> Result<(), LauncherHistoryRefusalReasonV1> {
     if peer.uid != binding.operator_uid || peer.gid != binding.operator_gid || peer.uid == 0 {
+        eprintln!("ota-authority-launcher: protected history peer refused stage=credentials");
         return Err(LauncherHistoryRefusalReasonV1::PeerAdmissionRefused);
     }
-    revalidate_connected_peer(stream, peer)
-        .and_then(|()| verify_peer_process_status(peer))
-        .and_then(|_| verify_peer_executable_identity(peer, &binding.installed_client_identity))
-        .map_err(|_| LauncherHistoryRefusalReasonV1::PeerAdmissionRefused)
+    revalidate_connected_peer(stream, peer).map_err(|_| {
+        eprintln!("ota-authority-launcher: protected history peer refused stage=connection");
+        LauncherHistoryRefusalReasonV1::PeerAdmissionRefused
+    })?;
+    verify_peer_process_status(peer).map_err(|_| {
+        eprintln!("ota-authority-launcher: protected history peer refused stage=process_posture");
+        LauncherHistoryRefusalReasonV1::PeerAdmissionRefused
+    })?;
+    verify_peer_executable_identity(peer, &binding.installed_client_identity).map_err(|_| {
+        eprintln!("ota-authority-launcher: protected history peer refused stage=executable");
+        LauncherHistoryRefusalReasonV1::PeerAdmissionRefused
+    })
 }
 
 fn observe_working_directory(

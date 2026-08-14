@@ -616,6 +616,7 @@ jobs:
             "$EVIDENCE_DIR/positive.receipt-history.json")
           positive_archive_identity="sha256:$(sudo sha256sum \
             "$positive_archive_path" | awk '{print $1}')"
+          set +e
           sudo systemd-run --quiet --pipe --wait --collect --service-type=exec \
             --uid=ota-authority-exec --gid=ota-authority-exec \
             --working-directory="$PRESSURE_REPOSITORY" \
@@ -627,6 +628,11 @@ jobs:
             --source systemd_protected_launcher \
             --archive-identity "$positive_archive_identity" --json \
             | tee "$EVIDENCE_DIR/positive.protected-receipt-history.json"
+          protected_history_status=${PIPESTATUS[0]}
+          set -e
+          sudo journalctl --no-pager --output=cat -u ota-authority-history.service \
+            | tee "$EVIDENCE_DIR/positive.protected-history-service-journal.txt" >/dev/null
+          test "$protected_history_status" -eq 0
           jq -e \
             '.ok == true
              and .history_source == "systemd_protected_launcher"
@@ -1608,6 +1614,7 @@ jobs:
           archive_path=$(jq -er '.archives[0].archive_path' \
             "$EVIDENCE_DIR/local-receipt-history.json")
           archive_identity="sha256:$(sudo sha256sum "$archive_path" | awk '{print $1}')"
+          set +e
           sudo systemd-run --quiet --pipe --wait --collect --service-type=exec \
             --uid=ota-authority-exec --gid=ota-authority-exec \
             --working-directory="$PRESSURE_REPOSITORY" \
@@ -1619,6 +1626,11 @@ jobs:
             --source systemd_protected_launcher \
             --archive-identity "$archive_identity" --json \
             | tee "$EVIDENCE_DIR/protected-receipt-history.json"
+          protected_history_status=${PIPESTATUS[0]}
+          set -e
+          sudo journalctl --no-pager --output=cat -u ota-authority-history.service \
+            | tee "$EVIDENCE_DIR/protected-history-service-journal.txt" >/dev/null
+          test "$protected_history_status" -eq 0
           jq -e --arg archive "$archive_identity" \
             '.ok == true
              and .history_source == "systemd_protected_launcher"
