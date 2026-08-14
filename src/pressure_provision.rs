@@ -566,7 +566,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     )
     .map_err(|_| String::from("history catalog namespace identity unavailable"))?;
     create_root_directory(
-        &Path::new(HISTORY_CATALOG_ROOT).join(&catalog_namespace_identity),
+        &catalog_namespace_directory(&catalog_namespace_identity)?,
         0o700,
     )?;
     let mut history_mapping = ProtectedHistoryRepositoryMappingV1 {
@@ -1009,6 +1009,19 @@ fn create_root_directory(path: &Path, mode: u32) -> Result<(), String> {
         .map_err(|_| String::from("protected directory permissions failed"))
 }
 
+fn catalog_namespace_directory(identity: &str) -> Result<PathBuf, String> {
+    let name = identity
+        .strip_prefix("sha256:")
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+        .ok_or_else(|| String::from("history catalog namespace identity unavailable"))?;
+    Ok(Path::new(HISTORY_CATALOG_ROOT).join(name))
+}
+
 fn write_json(path: &Path, value: &impl Serialize, mode: u32) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|_| String::from("protected JSON serialization failed"))?;
@@ -1183,5 +1196,16 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(attestation_claims.authenticated_origin.as_str())
         );
+    }
+
+    #[test]
+    fn catalog_namespace_uses_the_content_addressed_digest_name() {
+        let digest = "a".repeat(64);
+        assert_eq!(
+            catalog_namespace_directory(&format!("sha256:{digest}")).expect("namespace directory"),
+            Path::new(HISTORY_CATALOG_ROOT).join(&digest)
+        );
+        assert!(catalog_namespace_directory(&format!("sha256:AA{}", "a".repeat(62))).is_err());
+        assert!(catalog_namespace_directory(&digest).is_err());
     }
 }
