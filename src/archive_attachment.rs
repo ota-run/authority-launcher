@@ -327,7 +327,10 @@ fn read_regular_file(
 
 fn contract_snapshot_name(snapshot_ref: &str) -> Result<CString, String> {
     let path = Path::new(snapshot_ref);
-    let mut components = path.components();
+    let mut components = path.components().peekable();
+    if matches!(components.peek(), Some(std::path::Component::CurDir)) {
+        components.next();
+    }
     let valid_prefix = matches!(components.next(), Some(std::path::Component::Normal(value)) if value == ".ota")
         && matches!(components.next(), Some(std::path::Component::Normal(value)) if value == "contracts");
     let name = match (valid_prefix, components.next(), components.next()) {
@@ -482,7 +485,7 @@ mod tests {
         let archive = serde_json::json!({
             "receipt": {
                 "contract_snapshot_hash": snapshot_identity,
-                "contract_snapshot_ref": format!(".ota/contracts/{snapshot_name}"),
+                "contract_snapshot_ref": format!("./.ota/contracts/{snapshot_name}"),
                 "crossing": { "authority": { "archive_evidence": {
                     "transaction": { "identity": crossing }
                 }}}
@@ -588,6 +591,21 @@ mod tests {
             .expect("sidecar JSON"),
             sidecar
         );
+    }
+
+    #[test]
+    fn contract_snapshot_reference_accepts_otas_display_form_without_widening() {
+        let name = "sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json";
+        assert!(contract_snapshot_name(&format!(".ota/contracts/{name}")).is_ok());
+        assert!(contract_snapshot_name(&format!("./.ota/contracts/{name}")).is_ok());
+        for reference in [
+            format!("../.ota/contracts/{name}"),
+            format!("/.ota/contracts/{name}"),
+            format!(".ota/contracts/nested/{name}"),
+            format!(".ota/receipts/{name}"),
+        ] {
+            assert!(contract_snapshot_name(&reference).is_err(), "{reference}");
+        }
     }
 
     #[test]

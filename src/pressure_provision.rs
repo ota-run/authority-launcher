@@ -1111,8 +1111,10 @@ mod tests {
         assert!(protected_directories().contains(&(ACTIVE_SLOT_STATE, 0o700)));
         assert!(protected_directories().contains(&(HISTORY_BLOB_ROOT, 0o700)));
         assert!(protected_directories().contains(&(HISTORY_CATALOG_ROOT, 0o700)));
-        assert!(history_service_unit(Path::new("/usr/lib/ota-authority/bin/launcher"))
-            .contains("serve-history"));
+        assert!(
+            history_service_unit(Path::new("/usr/lib/ota-authority/bin/launcher"))
+                .contains("serve-history")
+        );
         assert!(history_socket_unit("execution").contains(&format!(
             "ListenStream={HISTORY_SOCKET_PATH}\nSocketUser=root\nSocketGroup=execution\nSocketMode=0660"
         )));
