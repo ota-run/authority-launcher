@@ -632,6 +632,10 @@ jobs:
           set -e
           sudo journalctl --no-pager --output=cat -u ota-authority-history.service \
             | tee "$EVIDENCE_DIR/positive.protected-history-service-journal.txt" >/dev/null
+          sudo cp -a /var/lib/ota/authority-launcher/history \
+            "$EVIDENCE_DIR/positive.protected-history-store"
+          sudo chown -R "$(id -u):$(id -g)" \
+            "$EVIDENCE_DIR/positive.protected-history-store"
           test "$protected_history_status" -eq 0
           jq -e \
             '.ok == true
@@ -1630,6 +1634,10 @@ jobs:
           set -e
           sudo journalctl --no-pager --output=cat -u ota-authority-history.service \
             | tee "$EVIDENCE_DIR/protected-history-service-journal.txt" >/dev/null
+          sudo cp -a /var/lib/ota/authority-launcher/history \
+            "$EVIDENCE_DIR/protected-history-store"
+          sudo chown -R "$(id -u):$(id -g)" \
+            "$EVIDENCE_DIR/protected-history-store"
           test "$protected_history_status" -eq 0
           jq -e --arg archive "$archive_identity" \
             '.ok == true
