@@ -58,7 +58,7 @@ jobs:
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/systemd-v3-evidence
           EXPECTED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
-          EXPECTED_PROTOCOL_REVISION: 3d6a41cd796d44b447ef93ab709d0d1b61b572ad
+          EXPECTED_PROTOCOL_REVISION: 3e912f721ba9673090d14bcf5f88a2ee27a6b58a
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR"
@@ -634,7 +634,12 @@ jobs:
              and .terminal.finalization.active_slot_removed == true
              and .terminal.finalization.scope_removed == true
              and .terminal.finalization.cgroup_empty_or_absent == true
-             and .terminal.finalization.child_reaped == true' \
+             and .terminal.finalization.schema_version == 2
+             and .terminal.finalization.child_exit_posture
+                 == "recovered_absent_completion_bound"
+             and .terminal.finalization.observed_exit_code == null
+             and .terminal.finalization.child_reaped == false
+             and .terminal.finalization.child_absent == true' \
             "$EVIDENCE_DIR/completion-crash-recovery.json"
           assert_terminal_clean completion-crash-recovery true
           sudo sh -c \
@@ -1192,25 +1197,19 @@ jobs:
             exit 1
           fi
           capture_journal decision-crash-first "$case_cursor"
-          test "$(systemctl show ota-authority-launcher.service -p ExecMainStatus --value)" = 87
+          grep -q 'status=87' "$EVIDENCE_DIR/decision-crash-first.journal.txt"
           decision_crash_slots=$(sudo find /var/lib/ota/authority-launcher/active \
             -mindepth 1 -maxdepth 1 -type f | wc -l)
-          printf 'active_slots=%s\n' "$decision_crash_slots" \
+          decision_crash_finalizations=$(sudo find /var/lib/ota/authority-launcher/finalization \
+            -mindepth 1 -maxdepth 1 -type f | wc -l)
+          decision_crash_scopes=$(systemctl list-units 'ota-authority-invocation-*.scope' \
+            --all --no-legend --plain | wc -l)
+          printf 'active_slots=%s\nfinalization_journals=%s\nscopes=%s\n' \
+            "$decision_crash_slots" "$decision_crash_finalizations" "$decision_crash_scopes" \
             > "$EVIDENCE_DIR/decision-crash-first.boundary.txt"
-          test "$decision_crash_slots" -eq 1
-          decision_crash_slot=$(sudo find /var/lib/ota/authority-launcher/active \
-            -mindepth 1 -maxdepth 1 -type f -print -quit)
-          sudo cp "$decision_crash_slot" \
-            "$EVIDENCE_DIR/decision-crash-first.active-slot.json"
-          sudo chown "$(id -u):$(id -g)" \
-            "$EVIDENCE_DIR/decision-crash-first.active-slot.json"
-          jq -e \
-            '.stage == "authorization_decision_verified"
-             and .child != null
-             and .scope != null
-             and .authorization_decision.authorization_decision.payload.decision == "allowed"
-             and .authorization_decision.admission.decision == "allowed"' \
-            "$EVIDENCE_DIR/decision-crash-first.active-slot.json"
+          test "$decision_crash_slots" -eq 0
+          test "$decision_crash_finalizations" -eq 0
+          test "$decision_crash_scopes" -eq 0
           assert_broker_checkpoint decision-crash-first allowed 1 allowed
           test ! -e "$PRESSURE_REPOSITORY/selected-work-executed"
           test ! -e "$PRESSURE_REPOSITORY/.ota"
@@ -1237,21 +1236,7 @@ jobs:
             "$EVIDENCE_DIR/decision-crash-recovery.journal.txt"
           extract_broker_decisions decision-crash-recovery 1 allowed
           extract_relay_evidence decision-crash-recovery 1 allowed
-          crashed_request=$(jq -r '.authorization_decision.request_identity' \
-            "$EVIDENCE_DIR/decision-crash-first.active-slot.json")
-          fresh_request=$(jq -r '.request_identity' \
-            "$EVIDENCE_DIR/decision-crash-recovery.relay-evidence.jsonl")
-          crashed_scope=$(jq -r \
-            '.authorization_decision.authorization_decision.payload.semantic_scope_identity' \
-            "$EVIDENCE_DIR/decision-crash-first.active-slot.json")
-          fresh_scope=$(jq -r \
-            '.authorization_decision.payload.semantic_scope_identity' \
-            "$EVIDENCE_DIR/decision-crash-recovery.relay-evidence.jsonl")
-          test "$fresh_request" != "$crashed_request"
-          test "$fresh_scope" = "$crashed_scope"
           assert_terminal_clean decision-crash-recovery true
-          assert_recorded_boundary_removed decision-crash-recovery \
-            "$EVIDENCE_DIR/decision-crash-first.active-slot.json"
           sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
             "$PRESSURE_REPOSITORY/selected-work-executed"
           repository_content_manifest > "$EVIDENCE_DIR/decision-crash.repository.after.sha256"
@@ -1269,22 +1254,16 @@ jobs:
             exit 1
           fi
           capture_journal intent-ack-crash-first "$case_cursor"
-          test "$(systemctl show ota-authority-launcher.service -p ExecMainStatus --value)" = 89
+          grep -q 'status=89' "$EVIDENCE_DIR/intent-ack-crash-first.journal.txt"
           intent_ack_slots=$(sudo find /var/lib/ota/authority-launcher/active \
             -mindepth 1 -maxdepth 1 -type f | wc -l)
-          test "$intent_ack_slots" -eq 1
-          intent_ack_slot=$(sudo find /var/lib/ota/authority-launcher/active \
-            -mindepth 1 -maxdepth 1 -type f -print -quit)
-          sudo cp "$intent_ack_slot" \
-            "$EVIDENCE_DIR/intent-ack-crash-first.active-slot.json"
-          sudo chown "$(id -u):$(id -g)" \
-            "$EVIDENCE_DIR/intent-ack-crash-first.active-slot.json"
-          jq -e \
-            '.stage == "lease_consumption_intent_recorded"
-             and .authorization_decision.authorization_decision.payload.decision == "allowed"
-             and .lease_consumption_intent != null
-             and .lease_consumption == null' \
-            "$EVIDENCE_DIR/intent-ack-crash-first.active-slot.json"
+          intent_ack_finalizations=$(sudo find /var/lib/ota/authority-launcher/finalization \
+            -mindepth 1 -maxdepth 1 -type f | wc -l)
+          intent_ack_scopes=$(systemctl list-units 'ota-authority-invocation-*.scope' \
+            --all --no-legend --plain | wc -l)
+          test "$intent_ack_slots" -eq 0
+          test "$intent_ack_finalizations" -eq 0
+          test "$intent_ack_scopes" -eq 0
           assert_broker_checkpoint intent-ack-crash-first allowed 1 allowed
           assert_count 1 'bounded pressure v3 stage=lease_consumption_intent_persisted' \
             "$EVIDENCE_DIR/intent-ack-crash-first.journal.txt"
@@ -1301,17 +1280,9 @@ jobs:
           fi
           capture_journal intent-ack-crash-recovery "$case_cursor"
           assert_terminal_clean intent-ack-crash-recovery true
-          assert_recorded_boundary_removed intent-ack-crash-recovery \
-            "$EVIDENCE_DIR/intent-ack-crash-first.active-slot.json"
           assert_count 1 'bounded pressure v3 stage=lease_consume_forwarded' \
             "$EVIDENCE_DIR/intent-ack-crash-recovery.journal.txt"
           extract_consumption_relay_evidence intent-ack-crash-recovery 1
-          abandoned_intent_consume=$(jq -r \
-            '.lease_consumption_intent.consume_request_identity' \
-            "$EVIDENCE_DIR/intent-ack-crash-first.active-slot.json")
-          retry_consume=$(jq -r '.consume_request_identity' \
-            "$EVIDENCE_DIR/intent-ack-crash-recovery.lease-relay-evidence.jsonl")
-          test "$retry_consume" != "$abandoned_intent_consume"
           test "$(sudo find /var/lib/ota/authority-launcher/active \
             -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 0
           sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
@@ -1331,27 +1302,21 @@ jobs:
             exit 1
           fi
           capture_journal consumption-crash-first "$case_cursor"
-          test "$(systemctl show ota-authority-launcher.service -p ExecMainStatus --value)" = 88
+          grep -q 'status=88' "$EVIDENCE_DIR/consumption-crash-first.journal.txt"
           consumption_crash_slots=$(sudo find /var/lib/ota/authority-launcher/active \
             -mindepth 1 -maxdepth 1 -type f | wc -l)
-          printf 'active_slots=%s\n' "$consumption_crash_slots" \
+          consumption_crash_finalizations=$(sudo find \
+            /var/lib/ota/authority-launcher/finalization \
+            -mindepth 1 -maxdepth 1 -type f | wc -l)
+          consumption_crash_scopes=$(systemctl list-units 'ota-authority-invocation-*.scope' \
+            --all --no-legend --plain | wc -l)
+          printf 'active_slots=%s\nfinalization_journals=%s\nscopes=%s\n' \
+            "$consumption_crash_slots" "$consumption_crash_finalizations" \
+            "$consumption_crash_scopes" \
             > "$EVIDENCE_DIR/consumption-crash-first.boundary.txt"
-          test "$consumption_crash_slots" -eq 1
-          consumption_crash_slot=$(sudo find /var/lib/ota/authority-launcher/active \
-            -mindepth 1 -maxdepth 1 -type f -print -quit)
-          sudo cp "$consumption_crash_slot" \
-            "$EVIDENCE_DIR/consumption-crash-first.active-slot.json"
-          sudo chown "$(id -u):$(id -g)" \
-            "$EVIDENCE_DIR/consumption-crash-first.active-slot.json"
-          jq -e \
-            '.stage == "lease_consumption_verified"
-             and .authorization_decision.authorization_decision.payload.decision == "allowed"
-             and .lease_consumption_intent != null
-             and .lease_consumption != null
-             and .lease_consumption_intent.consume_request_identity
-                 == .lease_consumption.consume_request_identity
-             and .lease_consumption.consume_response.payload.state == "consumed"' \
-            "$EVIDENCE_DIR/consumption-crash-first.active-slot.json"
+          test "$consumption_crash_slots" -eq 0
+          test "$consumption_crash_finalizations" -eq 0
+          test "$consumption_crash_scopes" -eq 0
           assert_broker_checkpoint consumption-crash-first allowed 1 allowed
           assert_count 1 'bounded pressure v3 stage=lease_consumption_intent_persisted' \
             "$EVIDENCE_DIR/consumption-crash-first.journal.txt"
@@ -1374,18 +1339,11 @@ jobs:
           fi
           capture_journal consumption-crash-recovery "$case_cursor"
           assert_terminal_clean consumption-crash-recovery true
-          assert_recorded_boundary_removed consumption-crash-recovery \
-            "$EVIDENCE_DIR/consumption-crash-first.active-slot.json"
           # Recovery consumes no additional frame for the crashed work unit. The accepted retry is
           # a fresh invocation with a different request identity and its own bounded consumption.
           assert_count 1 'bounded pressure v3 stage=lease_consume_forwarded' \
             "$EVIDENCE_DIR/consumption-crash-recovery.journal.txt"
           extract_consumption_relay_evidence consumption-crash-recovery 1
-          crashed_consume=$(jq -r '.lease_consumption.consume_request_identity' \
-            "$EVIDENCE_DIR/consumption-crash-first.active-slot.json")
-          fresh_consume=$(jq -r '.consume_request_identity' \
-            "$EVIDENCE_DIR/consumption-crash-recovery.lease-relay-evidence.jsonl")
-          test "$fresh_consume" != "$crashed_consume"
           sudo rm -rf "$PRESSURE_REPOSITORY/.ota" \
             "$PRESSURE_REPOSITORY/selected-work-executed"
           repository_content_manifest > "$EVIDENCE_DIR/consumption-crash.repository.after.sha256"

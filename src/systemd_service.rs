@@ -47,7 +47,7 @@ use ota_authority_launcher::linux_observations::{
 };
 use ota_authority_protocol::{
     ATTESTATION_RESPONSE, AuthorizationDecision, LAUNCHER_TERMINAL, LauncherAttestationClaimsV3,
-    LauncherAttestationSigningRequestV1, LauncherExecutionCompletionV1,
+    LauncherAttestationSigningRequestV1, LauncherChildExitPostureV1, LauncherExecutionCompletionV1,
     LauncherExecutionFinalizationV1, LauncherExecutionOutcomeV1,
     LauncherFinalizationArchivePersistenceV1, LauncherFinalizationArchiveRequestV1,
     LauncherFinalizationArchiveResponseV1, LauncherFinalizationArchiveSidecarV1,
@@ -478,6 +478,7 @@ fn execute_selected_boundary(
         &boundary.active_slot,
         completion.clone(),
         observed_exit_code,
+        false,
     )?;
     let mut finalization_journal = retain_finalization_intent(&boundary.active_slot, finalization)?;
     eprintln!("ota-authority-launcher: portable finalization stage=intent_recorded");
@@ -506,6 +507,7 @@ fn build_execution_finalization(
     active_slot: &ActiveSlot,
     completion: LauncherExecutionCompletionV1,
     observed_exit_code: Option<i32>,
+    recovered_after_launcher_restart: bool,
 ) -> Result<LauncherExecutionFinalizationV1, SystemdServiceError> {
     let child_identity = active_slot
         .child()
@@ -518,13 +520,24 @@ fn build_execution_finalization(
         .identity
         .clone();
     let mut finalization = LauncherExecutionFinalizationV1 {
-        schema_version: 1,
+        schema_version: if recovered_after_launcher_restart {
+            2
+        } else {
+            1
+        },
         identity: String::new(),
         completion,
         child_identity,
         scope_identity,
-        observed_exit_code,
-        child_reaped: true,
+        child_exit_posture: recovered_after_launcher_restart
+            .then_some(LauncherChildExitPostureV1::RecoveredAbsentCompletionBound),
+        observed_exit_code: if recovered_after_launcher_restart {
+            None
+        } else {
+            observed_exit_code
+        },
+        child_reaped: !recovered_after_launcher_restart,
+        child_absent: recovered_after_launcher_restart.then_some(true),
         scope_removed: true,
         cgroup_empty_or_absent: true,
         active_slot_removed: true,
@@ -1320,8 +1333,7 @@ fn reconcile_active_slots(
         let Some(completion) = slot.execution_completion().cloned() else {
             return Ok(());
         };
-        let finalization =
-            build_execution_finalization(slot, completion.clone(), completion.exit_code)?;
+        let finalization = build_execution_finalization(slot, completion, None, true)?;
         retain_finalization_intent(slot, finalization).map(|_| ())
     })
 }
@@ -1894,7 +1906,7 @@ fn selected_terminal(finalization: LauncherExecutionFinalizationV1) -> LauncherT
         protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
         invocation_id: finalization.completion.invocation_id.clone(),
         outcome,
-        exit_code: finalization.observed_exit_code,
+        exit_code: finalization.completion.exit_code,
         stage: Some(stage),
         finalization: Some(finalization),
     }

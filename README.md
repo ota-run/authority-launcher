@@ -282,7 +282,10 @@ uncertain outcome retains the slot and fails closed.
 This path permits selected execution only after signed V3 admission and one bounded consumed
 lease. The selected Ota command creates its ordinary transaction-bound crossing receipt/archive;
 launcher terminal evidence separately binds Core's completion to exact child, scope, cgroup, and
-slot cleanup. The current candidate persists a protected finalization journal before deleting the
+slot cleanup. A live launcher records the exit code it observed while reaping the child. After a
+launcher restart, finalization instead records `recovered_absent_completion_bound`, binds verified
+child absence to Core's durable completion, and explicitly makes no observed-exit or child-reaped
+claim. The current candidate persists a protected finalization journal before deleting the
 active slot, asks the producer to sign the cleanup record and a separate exact archive attachment,
 reopens the private archive through the execution-principal repository descriptor, and verifies its
 owner, content identity, and transaction before atomically publishing a root-owned sidecar. Both

@@ -26,6 +26,12 @@
 
 ## Unreleased
 
+- Make completion-crash recovery evidence explicit. A restarted launcher may bind verified child
+  absence to Core's durable completion, but it cannot claim that it observed or reaped the old
+  child. Recovered finalization therefore uses protocol schema v2 with
+  `recovered_absent_completion_bound`, no observed exit code, and `child_reaped: false`; live
+  finalization retains the original observed-and-reaped posture.
+
 - Add the candidate durable post-cleanup finalization carrier. Before deleting the active-slot
   journal, the launcher fsyncs a separate protected finalization intent. The attestor signs both
   exact cleanup evidence and a distinct attachment binding that evidence to the exact receipt
