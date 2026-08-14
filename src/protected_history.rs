@@ -467,35 +467,62 @@ pub(crate) fn load_catalog_entries(
             continue;
         }
         if !name.ends_with(".json") {
+            eprintln!("ota-authority-launcher: protected history catalog failed stage=name");
             return Err(ProtectedHistoryError::ObjectInvalid);
         }
         let identity_name = name
             .strip_suffix(".json")
             .ok_or(ProtectedHistoryError::ObjectInvalid)?;
-        identity_file_name(&format!("sha256:{identity_name}"))?;
-        let bytes = read_exact_file(&namespace, &name, 0, None)?.0;
+        identity_file_name(&format!("sha256:{identity_name}")).map_err(|error| {
+            eprintln!("ota-authority-launcher: protected history catalog failed stage=name");
+            error
+        })?;
+        let bytes = read_exact_file(&namespace, &name, 0, None)
+            .map_err(|error| {
+                eprintln!("ota-authority-launcher: protected history catalog failed stage=file");
+                error
+            })?
+            .0;
         let entry: ProtectedHistoryCatalogEntryV1 =
-            serde_json::from_slice(&bytes).map_err(|_| ProtectedHistoryError::ObjectInvalid)?;
-        if catalog_entry_identity(&entry)? != entry.identity
-            || entry.repository_mapping_identity != mapping.identity
+            serde_json::from_slice(&bytes).map_err(|_| {
+                eprintln!("ota-authority-launcher: protected history catalog failed stage=decode");
+                ProtectedHistoryError::ObjectInvalid
+            })?;
+        if catalog_entry_identity(&entry)? != entry.identity {
+            eprintln!("ota-authority-launcher: protected history catalog failed stage=identity");
+            return Err(ProtectedHistoryError::ObjectInvalid);
+        }
+        if entry.repository_mapping_identity != mapping.identity
             || entry.repository_binding_identity != mapping.repository_binding_identity
             || entry.catalog_namespace_identity != mapping.catalog_namespace_identity
             || entry.operator_profile_identity != binding.operator_profile_identity
             || entry.authority_id != mapping.authority_id
             || entry.working_directory != mapping.working_directory
-            || entry.receipt_archive_identity != entry.archive_blob.content_identity
+        {
+            eprintln!("ota-authority-launcher: protected history catalog failed stage=mapping");
+            return Err(ProtectedHistoryError::ObjectInvalid);
+        }
+        if entry.receipt_archive_identity != entry.archive_blob.content_identity
             || entry.receipt_archive_identity != entry.archive_source.content_identity
             || entry.contract_snapshot_identity != entry.contract_snapshot_blob.content_identity
             || entry.contract_snapshot_identity != entry.contract_snapshot_source.content_identity
-            || !is_sha256(&entry.launcher_request_identity)
+        {
+            eprintln!("ota-authority-launcher: protected history catalog failed stage=objects");
+            return Err(ProtectedHistoryError::ObjectInvalid);
+        }
+        if !is_sha256(&entry.launcher_request_identity)
             || !is_sha256(&entry.work_unit_identity)
             || !is_sha256(&entry.crossing_transaction_identity)
             || !is_sha256(&entry.sidecar_identity)
             || !is_sha256(&entry.signed_finalization_identity)
             || !is_sha256(&entry.signed_archive_identity)
             || !is_sha256(&entry.finalization_journal_identity)
-            || entry.creation_posture != "frozen_before_terminal_acknowledgement"
         {
+            eprintln!("ota-authority-launcher: protected history catalog failed stage=identities");
+            return Err(ProtectedHistoryError::ObjectInvalid);
+        }
+        if entry.creation_posture != "frozen_before_terminal_acknowledgement" {
+            eprintln!("ota-authority-launcher: protected history catalog failed stage=posture");
             return Err(ProtectedHistoryError::ObjectInvalid);
         }
         entries.push(entry);
