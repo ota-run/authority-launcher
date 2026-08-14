@@ -1375,7 +1375,13 @@ jobs:
           sudo rm -rf /var/lib/ota/authority-broker-pressure
           test -z "$(sudo find /var/lib/ota/authority-launcher/active \
             /var/lib/ota/authority-launcher/finalization -type f -print -quit)"
+          sudo stat -c '%U %G %a %F' \
+            /var/lib/ota/authority-attestor/issuance.lock \
+            | tee "$EVIDENCE_DIR/attestor-issuance-lock-posture.txt" >/dev/null
+          grep -Fx 'root root 600 regular empty file' \
+            "$EVIDENCE_DIR/attestor-issuance-lock-posture.txt"
           sudo find /var/lib/ota/authority-attestor -mindepth 1 -maxdepth 1 -type f \
+            -name '*.json' \
             -exec stat -c '%U %G %a %F %n' {} \; \
             | sort | tee "$EVIDENCE_DIR/attestor-issuance-state.txt" >/dev/null
           test -s "$EVIDENCE_DIR/attestor-issuance-state.txt"
