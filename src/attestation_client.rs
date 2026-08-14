@@ -205,22 +205,34 @@ pub fn request_finalization_archive(
     {
         return Err(AttestationClientError::InvalidResponse);
     }
-    let connection = connect_seqpacket(binding)?;
+    let connection = pressure_client_stage("archive_connect", connect_seqpacket(binding))?;
     let request_bytes =
         serde_jcs::to_vec(request).map_err(|_| AttestationClientError::InvalidResponse)?;
-    send_packet(&connection, &request_bytes)?;
-    let response_bytes = receive_packet(&connection, binding.maximum_request_bytes)?;
-    let producer = observe_producer(binding)?;
-    revalidate_producer(&producer, binding)?;
-    reject_queued_packet(&connection)?;
-    let response: LauncherFinalizationArchiveSigningResponseV1 =
+    pressure_client_stage(
+        "archive_request_packet",
+        send_packet(&connection, &request_bytes),
+    )?;
+    let response_bytes = pressure_client_stage(
+        "archive_response_packet",
+        receive_packet(&connection, binding.maximum_request_bytes),
+    )?;
+    let producer = pressure_client_stage("archive_peer_observed", observe_producer(binding))?;
+    pressure_client_stage(
+        "archive_peer_before_validation",
+        revalidate_producer(&producer, binding),
+    )?;
+    pressure_client_stage("archive_queued_packet", reject_queued_packet(&connection))?;
+    let response: LauncherFinalizationArchiveSigningResponseV1 = pressure_client_stage(
+        "archive_response_decode",
         serde_json::from_slice(&response_bytes)
-            .map_err(|_| AttestationClientError::InvalidResponse)?;
-    if serde_jcs::to_vec(&response).map_err(|_| AttestationClientError::InvalidResponse)?
-        != response_bytes
-        || launcher_finalization_archive_signing_response_v1_identity(&response)
-            .map_err(|_| AttestationClientError::InvalidResponse)?
-            != response.response_identity
+            .map_err(|_| AttestationClientError::InvalidResponse),
+    )?;
+    let canonical_response =
+        serde_jcs::to_vec(&response).map_err(|_| AttestationClientError::InvalidResponse)?;
+    let response_identity = launcher_finalization_archive_signing_response_v1_identity(&response)
+        .map_err(|_| AttestationClientError::InvalidResponse)?;
+    if canonical_response != response_bytes
+        || response_identity != response.response_identity
         || response.request_identity != request.request_identity
         || response.signed_archive.signed_finalization_identity
             != request.signed_finalization.identity
@@ -231,7 +243,10 @@ pub fn request_finalization_archive(
         || response.signed_archive.key_id != binding.signing_key_id
         || response.signed_archive.algorithm != "ed25519"
     {
-        return Err(AttestationClientError::InvalidResponse);
+        return pressure_client_stage(
+            "archive_response_reconciliation",
+            Err(AttestationClientError::InvalidResponse),
+        );
     }
     let signature = URL_SAFE_NO_PAD
         .decode(&response.signed_archive.signature)
@@ -240,10 +255,16 @@ pub fn request_finalization_archive(
         .ok_or(AttestationClientError::InvalidResponse)?;
     let signed_bytes = launcher_finalization_archive_signature_bytes_v1(&response.signed_archive)
         .map_err(|_| AttestationClientError::InvalidResponse)?;
-    decode_verifying_key(binding)?
-        .verify(&signed_bytes, &signature)
-        .map_err(|_| AttestationClientError::InvalidResponse)?;
-    revalidate_producer(&producer, binding)?;
+    pressure_client_stage(
+        "archive_signature",
+        decode_verifying_key(binding)?
+            .verify(&signed_bytes, &signature)
+            .map_err(|_| AttestationClientError::InvalidResponse),
+    )?;
+    pressure_client_stage(
+        "archive_peer_after_validation",
+        revalidate_producer(&producer, binding),
+    )?;
     Ok(response)
 }
 
