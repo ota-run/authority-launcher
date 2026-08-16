@@ -1505,8 +1505,12 @@ fn managed_authority_units() -> [&'static str; 8] {
 fn require_managed_authority_units_inactive() -> Result<Vec<String>, String> {
     let mut checked = Vec::new();
     for unit in managed_authority_units() {
-        let properties =
-            systemctl_properties(unit, &["LoadState", "ActiveState", "SubState", "MainPID"])?;
+        let property_names = if unit.ends_with(".service") {
+            &["LoadState", "ActiveState", "SubState", "MainPID"][..]
+        } else {
+            &["LoadState", "ActiveState", "SubState"][..]
+        };
+        let properties = systemctl_properties(unit, property_names)?;
         let load_state = properties
             .get("LoadState")
             .ok_or_else(|| String::from("managed authority unit load state is unavailable"))?;
@@ -1516,13 +1520,11 @@ fn require_managed_authority_units_inactive() -> Result<Vec<String>, String> {
         let sub_state = properties
             .get("SubState")
             .ok_or_else(|| String::from("managed authority unit substate is unavailable"))?;
-        let main_pid = properties
-            .get("MainPID")
-            .ok_or_else(|| String::from("managed authority unit main PID is unavailable"))?;
         if !matches!(load_state.as_str(), "loaded" | "not-found")
             || active_state != "inactive"
             || sub_state != "dead"
-            || main_pid != "0"
+            || (unit.ends_with(".service")
+                && properties.get("MainPID").map(String::as_str) != Some("0"))
         {
             return Err(String::from(
                 "prepared provisioning requires every managed authority unit to be inactive",
