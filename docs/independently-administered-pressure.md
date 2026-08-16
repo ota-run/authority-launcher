@@ -160,6 +160,9 @@ ambiguous filesystem object, including a dangling symlink, refuses instead of be
 Every managed authority service and socket unit must also be inactive or not yet installed. After
 the protected unit files are durable, provisioning explicitly enables and starts the newly loaded
 socket units, then verifies the launcher and history socket owner, exact bound group, and mode.
+The pre-mutation systemd socket inventory must have no owner for any fixed authority path, and the
+post-activation inventory must name exactly one canonical unit for each path. Remove obsolete
+pressure socket units rather than allowing two units to race for one pathname across reboot.
 Every existing ancestor of every managed path must be a root-owned, non-writable directory and
 must not be a symlink; this is checked without following aliases before the first mutation.
 The resulting observation and exact canonical ordered checked-path set, including the protected
@@ -253,6 +256,7 @@ sudo systemctl enable --now ota-authority-pressure-runner.service
 
 # After the trigger reports a bounded administrator-controlled disconnect:
 sudo systemctl disable --now ota-authority-pressure-runner.service
+sudo systemctl reset-failed ota-authority-pressure-runner.service
 sudo /usr/lib/ota-authority/bin/ota-authority-systemd-recovery-controller reboot
 
 # Reconnect as the administrator only after the host returns.

@@ -178,6 +178,8 @@ struct PreparedProvisioningObservationV1 {
     authority_state_paths_checked: Vec<String>,
     authority_unit_posture: String,
     authority_units_checked: Vec<String>,
+    authority_socket_listener_posture: String,
+    authority_socket_paths_checked: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -746,8 +748,14 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         "ota-authority-broker-proxy.socket",
         "ota-authority-history.socket",
     ])?;
+    verify_exact_socket_unit_owner(LAUNCHER_SOCKET, "ota-authority-launcher.socket")?;
+    verify_exact_socket_unit_owner(ATTESTOR_SOCKET, "ota-authority-attestor.socket")?;
+    verify_exact_socket_unit_owner(BROKER_PROXY_SOCKET, "ota-authority-broker-proxy.socket")?;
+    verify_exact_socket_unit_owner(HISTORY_SOCKET_PATH, "ota-authority-history.socket")?;
     verify_activated_socket(Path::new(LAUNCHER_SOCKET), job.gid, 0o660)?;
     verify_activated_socket(Path::new(HISTORY_SOCKET_PATH), job.gid, 0o660)?;
+    verify_activated_socket(Path::new(ATTESTOR_SOCKET), 0, 0o600)?;
+    verify_activated_socket(Path::new(BROKER_PROXY_SOCKET), 0, 0o600)?;
     // The canonical runner cannot start until this final, durable publication succeeds.
     write_json(
         Path::new(PUBLIC_INSTALLATION_EVIDENCE),
@@ -1321,6 +1329,7 @@ fn observe_prepared_provisioning_precondition(
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let authority_units_checked = require_managed_authority_units_inactive()?;
+    let authority_socket_paths_checked = require_managed_socket_paths_unowned()?;
     verify_managed_authority_ancestor_chains(authority_state_paths_checked.as_slice())?;
     require_managed_authority_state_absent(authority_state_paths_checked.as_slice())?;
 
@@ -1353,6 +1362,10 @@ fn observe_prepared_provisioning_precondition(
         authority_state_paths_checked,
         authority_unit_posture: String::from("inactive_or_not_found_before_mutation"),
         authority_units_checked,
+        authority_socket_listener_posture: String::from(
+            "no_loaded_systemd_socket_unit_owns_managed_path_before_mutation",
+        ),
+        authority_socket_paths_checked,
     };
     observation.identity = prepared_provisioning_observation_identity(&observation)?;
     Ok(observation)
@@ -1500,6 +1513,82 @@ fn managed_authority_units() -> [&'static str; 8] {
         "ota-authority-history.service",
         "ota-authority-history.socket",
     ]
+}
+
+fn managed_authority_socket_paths() -> [&'static str; 4] {
+    [
+        LAUNCHER_SOCKET,
+        ATTESTOR_SOCKET,
+        BROKER_PROXY_SOCKET,
+        HISTORY_SOCKET_PATH,
+    ]
+}
+
+fn systemd_socket_units() -> Result<BTreeMap<String, Vec<String>>, String> {
+    let output = Command::new(SYSTEMCTL)
+        .args([
+            "list-sockets",
+            "--all",
+            "--no-legend",
+            "--no-pager",
+            "--plain",
+        ])
+        .env_clear()
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|_| String::from("systemd socket inventory is unavailable"))?;
+    if !output.status.success() {
+        return Err(String::from("systemd socket inventory was refused"));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| String::from("systemd socket inventory is malformed"))?;
+    Ok(parse_systemd_socket_units(stdout.as_str()))
+}
+
+fn parse_systemd_socket_units(output: &str) -> BTreeMap<String, Vec<String>> {
+    let mut sockets = BTreeMap::<String, Vec<String>>::new();
+    for line in output.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(path) = fields.next() else {
+            continue;
+        };
+        let Some(unit) = fields.next() else {
+            continue;
+        };
+        sockets
+            .entry(path.to_owned())
+            .or_default()
+            .push(unit.to_owned());
+    }
+    for units in sockets.values_mut() {
+        units.sort();
+        units.dedup();
+    }
+    sockets
+}
+
+fn require_managed_socket_paths_unowned() -> Result<Vec<String>, String> {
+    let sockets = systemd_socket_units()?;
+    let checked = managed_authority_socket_paths()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if checked.iter().any(|path| sockets.contains_key(path)) {
+        return Err(String::from(
+            "prepared provisioning requires every managed socket path to have no loaded systemd owner",
+        ));
+    }
+    Ok(checked)
+}
+
+fn verify_exact_socket_unit_owner(path: &str, expected_unit: &str) -> Result<(), String> {
+    let sockets = systemd_socket_units()?;
+    if sockets.get(path).map(Vec::as_slice) != Some(&[expected_unit.to_owned()]) {
+        return Err(String::from(
+            "activated authority socket does not have exactly one canonical systemd owner",
+        ));
+    }
+    Ok(())
 }
 
 fn require_managed_authority_units_inactive() -> Result<Vec<String>, String> {
@@ -1845,6 +1934,13 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            authority_socket_listener_posture: String::from(
+                "no_loaded_systemd_socket_unit_owns_managed_path_before_mutation",
+            ),
+            authority_socket_paths_checked: managed_authority_socket_paths()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
         };
         let identity =
             prepared_provisioning_observation_identity(&observation).expect("observation identity");
@@ -1892,6 +1988,26 @@ mod tests {
                 "ota-authority-history.service",
                 "ota-authority-history.socket",
             ]
+        );
+    }
+
+    #[test]
+    fn systemd_socket_inventory_retains_duplicate_path_owners() {
+        let sockets = parse_systemd_socket_units(
+            "/run/ota/authority-launcher.sock ota-authority-launcher.socket ota-authority-launcher.service\n\
+             /run/ota/authority-launcher.sock ota-authority-scope-pressure.socket ota-authority-scope-pressure.service\n\
+             /run/ota/authority-history.sock ota-authority-history.socket ota-authority-history.service\n",
+        );
+        assert_eq!(
+            sockets.get(LAUNCHER_SOCKET),
+            Some(&vec![
+                String::from("ota-authority-launcher.socket"),
+                String::from("ota-authority-scope-pressure.socket"),
+            ])
+        );
+        assert_eq!(
+            sockets.get(HISTORY_SOCKET_PATH),
+            Some(&vec![String::from("ota-authority-history.socket")])
         );
     }
 

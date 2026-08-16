@@ -1177,6 +1177,10 @@ mod linux {
                 .get("authority_unit_posture")
                 .and_then(serde_json::Value::as_str)
                 != Some("inactive_or_not_found_before_mutation")
+            || precondition
+                .get("authority_socket_listener_posture")
+                .and_then(serde_json::Value::as_str)
+                != Some("no_loaded_systemd_socket_unit_owns_managed_path_before_mutation")
         {
             return Err(String::from("prepared provisioning observation is invalid"));
         }
@@ -1201,6 +1205,26 @@ mod linux {
                 .any(|(observed, expected)| observed.as_str() != Some(expected))
         {
             return Err(String::from("prepared authority unit inventory is invalid"));
+        }
+        let expected_authority_socket_paths = [
+            "/run/ota/authority-launcher.sock",
+            "/run/ota/authority-attestor.sock",
+            "/run/ota/broker-proxy.sock",
+            "/run/ota/authority-history.sock",
+        ];
+        let observed_authority_socket_paths = precondition
+            .get("authority_socket_paths_checked")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| String::from("prepared authority socket inventory is unavailable"))?;
+        if observed_authority_socket_paths.len() != expected_authority_socket_paths.len()
+            || observed_authority_socket_paths
+                .iter()
+                .zip(expected_authority_socket_paths)
+                .any(|(observed, expected)| observed.as_str() != Some(expected))
+        {
+            return Err(String::from(
+                "prepared authority socket inventory is invalid",
+            ));
         }
         let job_uid = precondition
             .get("job_uid")

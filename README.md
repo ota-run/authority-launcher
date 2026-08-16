@@ -374,7 +374,8 @@ by the closed profile; a sibling GitHub runner service cannot inherit that autho
 also refuses before its first authority write unless that runner is stopped, both selected
 principals are process-free, every managed authority service/socket is inactive, and the managed
 authority namespace is fresh. Activation starts freshly loaded socket units and verifies their
-exact protected group boundary before public evidence is published. The runner's exact
+exact protected group boundary and sole systemd ownership before public evidence is published;
+any loaded legacy or competing unit for a fixed socket path refuses. The runner's exact
 systemd unit remains gated on final protected installation-evidence publication throughout
 provisioning. See
 [Independently Administered Systemd Pressure](docs/independently-administered-pressure.md).

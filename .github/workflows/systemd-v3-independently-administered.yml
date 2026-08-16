@@ -160,6 +160,12 @@ jobs:
               "ota-authority-history.service",
               "ota-authority-history.socket",
           ]
+          expected_authority_socket_paths = [
+              "/run/ota/authority-launcher.sock",
+              "/run/ota/authority-attestor.sock",
+              "/run/ota/broker-proxy.sock",
+              "/run/ota/authority-history.sock",
+          ]
           if (
               precondition.get("schema_version") != 1
               or precondition.get("runner_service_unit") != "ota-authority-pressure-runner.service"
@@ -185,6 +191,10 @@ jobs:
                   != "inactive_or_not_found_before_mutation"
               or precondition.get("authority_units_checked")
                   != expected_authority_units
+              or precondition.get("authority_socket_listener_posture")
+                  != "no_loaded_systemd_socket_unit_owns_managed_path_before_mutation"
+              or precondition.get("authority_socket_paths_checked")
+                  != expected_authority_socket_paths
           ):
               raise SystemExit("prepared provisioning observation is invalid")
           claimed_precondition_identity = precondition.get("identity", "")
