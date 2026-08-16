@@ -37,8 +37,7 @@ mod linux {
 
     use clap::{Parser, Subcommand, ValueEnum};
     use ota_authority_launcher::systemd_client::{
-        InvocationRequest, InvocationResult, RecoveryPolicy, invoke_with_recovery_policy,
-        recover_invocation_with_observer,
+        InvocationRequest, InvocationResult, recover_invocation_with_observer,
     };
     use ota_authority_protocol::{
         LAUNCHER_INVOCATION_REQUEST, LauncherInvocationRequestV1,
@@ -222,11 +221,6 @@ mod linux {
         result: Option<InvocationResult>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error_reason: Option<String>,
-    }
-
-    #[derive(Debug, Clone, Copy)]
-    enum ClientOperation {
-        InvokeWithoutRecovery,
     }
 
     #[derive(Debug, Deserialize)]
@@ -741,79 +735,6 @@ mod linux {
             Err(_) => return Err(String::from("pending recovery state is unavailable")),
         }
         Ok(())
-    }
-
-    fn invoke_as_principal(
-        uid: u32,
-        gid: u32,
-        request: InvocationRequest,
-        operation: ClientOperation,
-    ) -> Result<ChildInvocationResult, String> {
-        let mut descriptors = [0_i32; 2];
-        if unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            return Err(String::from(
-                "failed to create the controller result channel",
-            ));
-        }
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            unsafe {
-                libc::close(descriptors[0]);
-                libc::close(descriptors[1]);
-            }
-            return Err(String::from(
-                "failed to fork the constrained pressure client",
-            ));
-        }
-        if pid == 0 {
-            unsafe { libc::close(descriptors[0]) };
-            let principal_ready = enter_exact_principal(uid, gid);
-            let result = if principal_ready {
-                let invocation = match operation {
-                    ClientOperation::InvokeWithoutRecovery => invoke_with_recovery_policy(
-                        request,
-                        RecoveryPolicy::AdministratorControlled,
-                    ),
-                };
-                match invocation {
-                    Ok(result) => ChildInvocationResult {
-                        ok: true,
-                        result: Some(result),
-                        error_reason: None,
-                    },
-                    Err(error) => ChildInvocationResult {
-                        ok: false,
-                        result: None,
-                        error_reason: Some(error.reason_code().into()),
-                    },
-                }
-            } else {
-                ChildInvocationResult {
-                    ok: false,
-                    result: None,
-                    error_reason: Some(String::from("principal_drop_failed")),
-                }
-            };
-            let encoded = serde_json::to_vec(&result).unwrap_or_default();
-            let mut output = unsafe { File::from_raw_fd(descriptors[1]) };
-            let _ = output.write_all(encoded.as_slice());
-            let _ = output.flush();
-            unsafe { libc::_exit(0) }
-        }
-        unsafe { libc::close(descriptors[1]) };
-        let mut input = unsafe { File::from_raw_fd(descriptors[0]) };
-        let mut encoded = Vec::new();
-        input
-            .read_to_end(&mut encoded)
-            .map_err(|_| String::from("failed to read the constrained client result"))?;
-        let mut status = 0_i32;
-        if unsafe { libc::waitpid(pid, &mut status, 0) } != pid || !libc::WIFEXITED(status) {
-            return Err(String::from(
-                "the constrained pressure client did not exit cleanly",
-            ));
-        }
-        serde_json::from_slice(encoded.as_slice())
-            .map_err(|_| String::from("the constrained client result is invalid"))
     }
 
     fn enter_exact_principal(uid: u32, gid: u32) -> bool {
