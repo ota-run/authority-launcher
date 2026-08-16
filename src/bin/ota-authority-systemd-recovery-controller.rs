@@ -1771,12 +1771,12 @@ mod linux {
             {
                 return Err(String::from("protected directory chain is unsafe"));
             }
+            if current == Path::new("/") {
+                break;
+            }
             let parent = current
                 .parent()
                 .ok_or_else(|| String::from("protected directory chain is invalid"))?;
-            if parent == current {
-                break;
-            }
             current = parent.to_path_buf();
         }
         Ok(())
@@ -1905,6 +1905,12 @@ mod linux {
             assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
             assert!(libc::WIFEXITED(status));
             assert_eq!(libc::WEXITSTATUS(status), 0);
+        }
+
+        #[test]
+        fn protected_directory_chain_accepts_the_filesystem_root() {
+            verify_root_directory_chain(Path::new("/"))
+                .expect("the canonical root terminates the protected chain");
         }
     }
 }
