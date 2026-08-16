@@ -48,7 +48,14 @@
   execution counts from those protected records and history rather than reading
   execution-principal-owned sentinels. The final
   consumer workflow has no checkout, elevation, service control, fault control, or credential
-  access. Immutable Linux/x64 PID 1 execution remains required before this gate is claimed green.
+  access. Immutable Linux/x64 PID 1
+  [run 31953535665](https://github.com/ota-run/authority-launcher/actions/runs/31953535665)
+  closes this gate against Protocol `04a199a1eddd72b5b61958e0fe7f2d4e662e05cf`, clean source-built
+  Core `e49f21ee77e522a614a776bcf17c9f9be16c8a90`, and Launcher
+  `a348a13fd60b067266013cf8a0f047bbe274fd81`. The retained consumer artifact independently
+  re-verifies all three expected protected archive identities with zero invalid or legacy archives,
+  unchanged repository manifests, exact boot transitions, complete terminal cleanup, and no private
+  authority material. Provider attestation remains open.
 
 - Prove the independently administered positive pressure lane in immutable Linux/x64 PID 1
   [run 31939777636](https://github.com/ota-run/authority-launcher/actions/runs/31939777636)
@@ -78,8 +85,8 @@
   The retained artifact binds a stopped/process-free prepared runner, the exact 32-path fresh-state
   inventory, installed revisions and file identities, one consumed work unit, completed selected
   execution, exact child/scope/cgroup/slot cleanup, one valid protected archive, zero invalid
-  archives, and no private key or reusable credential material. Separate administrator-driven
-  reboot recovery and provider attestation remain open.
+  archives, and no private key or reusable credential material. The separate administrator-driven
+  reboot gate is now green in run `31953535665`; provider attestation remains open.
 
 - Prove the installed production systemd client and protected receipt-history source in immutable
   Linux/x64 PID 1 run

@@ -209,9 +209,17 @@ separation being tested. A separate administrator-owned controller must arm each
 reboot the host, and retain public recovery evidence. The repository workflow may only reconnect
 through the fixed production client after the administrator declares the prepared runner ready.
 
-Until that controller matrix is green, this lane proves only the independently prepared positive
-path. Provider-attested image identity, host isolation, and administrator independence remain
-separate stronger claims.
+The controller matrix is green in immutable Linux/x64 PID 1
+[run 31953535665](https://github.com/ota-run/authority-launcher/actions/runs/31953535665)
+against Protocol `04a199a1eddd72b5b61958e0fe7f2d4e662e05cf`, clean source-built Core
+`e49f21ee77e522a614a776bcf17c9f9be16c8a90`, and Launcher
+`a348a13fd60b067266013cf8a0f047bbe274fd81`. The three trigger runs were
+[execution completion](https://github.com/ota-run/authority-launcher/actions/runs/31953062149),
+[finalization intent](https://github.com/ota-run/authority-launcher/actions/runs/31953195858), and
+[terminal recorded](https://github.com/ota-run/authority-launcher/actions/runs/31953359001). The
+consumer artifact independently re-verifies the exact three archive identities, boot transitions,
+unchanged repository manifests, complete cleanup, and zero invalid or legacy-unverified archives.
+Provider-attested image identity and host isolation remain separate stronger claims.
 
 The pressure-only `ota-authority-systemd-recovery-controller` is the canonical administrator
 controller. Install its exact reviewed binary as root at

@@ -386,8 +386,16 @@ proves that consumer-only positive path against Protocol
 `634a2c169e083da4e02abd72a7bf29ae388ddf3d`, and Launcher
 `ea7480e8d8b8aa214c5602628fb6dfa6382e2088`. It completed one consumed work unit with exact
 child/scope/cgroup/slot cleanup and one valid protected archive with zero invalid archives. This
-closes the positive hardened-launcher separation branch only; administrator-driven reboot recovery
-and provider attestation remain open.
+closes the positive hardened-launcher separation branch. The separate administrator-driven
+reboot/fault-recovery matrix is green in immutable Linux/x64 PID 1
+[run 31953535665](https://github.com/ota-run/authority-launcher/actions/runs/31953535665)
+against Protocol `04a199a1eddd72b5b61958e0fe7f2d4e662e05cf`, clean source-built Core
+`e49f21ee77e522a614a776bcf17c9f9be16c8a90`, and Launcher
+`a348a13fd60b067266013cf8a0f047bbe274fd81`. Its consumer artifact independently re-verifies the
+execution-completion, finalization-intent, and terminal-recorded reboot cases as three valid
+protected archives with zero invalid or legacy-unverified archives, unchanged repository state,
+and zero residual child, scope, cgroup, active-slot, or finalization state. Provider attestation
+remains open.
 
 Immutable Linux/x64 PID 1
 [run 31758094819](https://github.com/ota-run/authority-launcher/actions/runs/31758094819)
