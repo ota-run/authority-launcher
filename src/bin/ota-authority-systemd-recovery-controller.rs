@@ -970,27 +970,14 @@ mod linux {
 
     fn protected_history(uid: u32, gid: u32, repository: &Path) -> Result<HistoryOutput, String> {
         let mut command = Command::new(OTA_BINARY);
-        command
-            .current_dir(repository)
-            .args([
-                "receipt",
-                "--history",
-                "--source",
-                "systemd_protected_launcher",
-                "--json",
-            ])
-            .uid(uid)
-            .gid(gid);
-        unsafe {
-            command.pre_exec(move || {
-                if libc::setgroups(0, std::ptr::null()) != 0
-                    || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        command.current_dir(repository).args([
+            "receipt",
+            "--history",
+            "--source",
+            "systemd_protected_launcher",
+            "--json",
+        ]);
+        configure_exact_principal(&mut command, uid, gid);
         command.env_clear();
         let output = command
             .output()
@@ -1000,6 +987,21 @@ mod linux {
         }
         serde_json::from_slice(output.stdout.as_slice())
             .map_err(|_| String::from("protected history output is invalid"))
+    }
+
+    fn configure_exact_principal(command: &mut Command, uid: u32, gid: u32) {
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setgroups(0, std::ptr::null()) != 0
+                    || libc::setgid(gid) != 0
+                    || libc::setuid(uid) != 0
+                    || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 
     fn request_identity(
@@ -1857,6 +1859,19 @@ mod linux {
             assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
             assert!(libc::WIFEXITED(status));
             assert_eq!(libc::WEXITSTATUS(status), 0);
+        }
+
+        #[test]
+        fn root_command_spawn_clears_groups_before_dropping_privilege() {
+            if unsafe { libc::geteuid() } != 0 {
+                return;
+            }
+            let mut command = Command::new("/usr/bin/id");
+            command.arg("-u").env_clear();
+            configure_exact_principal(&mut command, 65_534, 65_534);
+            let output = command.output().expect("spawn constrained child");
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "65534");
         }
 
         #[test]

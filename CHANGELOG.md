@@ -39,7 +39,10 @@
   cumulative selected-execution count, protected history, and exact cleanup. The constrained
   recovery client cannot acknowledge a terminal until the root controller has fsynced the exact
   observed result; restart then reconciles either the replayable Launcher journal or that durable
-  observation. Public recovery records are create-new, root-owned, non-secret evidence; the final
+  observation. The controller performs its protected-history child transition in one ordered
+  root boundary, clearing supplementary groups before dropping GID and UID and setting
+  `no_new_privs`, so the post-reboot query cannot fail during process creation. Public recovery
+  records are create-new, root-owned, non-secret evidence; the final
   consumer workflow has no checkout, elevation, service control, fault control, or credential
   access. Immutable Linux/x64 PID 1 execution remains required before this gate is claimed green.
 
