@@ -747,7 +747,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         "ota-authority-history.socket",
     ])?;
     verify_activated_socket(Path::new(LAUNCHER_SOCKET), job.gid, 0o660)?;
-    verify_activated_socket(Path::new(HISTORY_SOCKET_PATH), execution.gid, 0o660)?;
+    verify_activated_socket(Path::new(HISTORY_SOCKET_PATH), job.gid, 0o660)?;
     // The canonical runner cannot start until this final, durable publication succeeds.
     write_json(
         Path::new(PUBLIC_INSTALLATION_EVIDENCE),
