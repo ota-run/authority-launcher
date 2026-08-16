@@ -309,6 +309,17 @@ ota-authority-systemd-client --authority-id release --repository . -- \
   run publish --grant release
 ```
 
+Administrator-owned reboot pressure uses the separate feature-gated
+`ota-authority-systemd-recovery-controller`. The repository runner must be disabled and stopped;
+the controller arms one fixed completion, finalization-intent, or terminal-recorded fault, runs
+the installed production client under the bound job principal without implicit reconnect, and
+persists only the exact recovery request needed across reboot. After reboot it performs a
+recovery-only exchange and publishes bounded public evidence. The repository workflow can verify
+and upload that evidence but cannot arm faults, control services, reboot the host, or read
+authority state. Recovered terminal evidence is fsynced before acknowledgement, so a controller
+crash cannot erase the Launcher recovery journal without leaving an exact durable observation. See
+[`docs/independently-administered-pressure.md`](docs/independently-administered-pressure.md).
+
 The Launcher-side protected-history candidate uses the separate fixed
 `/run/ota/authority-history.sock` service and root-owned
 `/etc/ota/authority-history.json` binding. The binding is reconciled with the protected

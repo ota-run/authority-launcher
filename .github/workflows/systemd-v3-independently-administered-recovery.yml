@@ -1,0 +1,283 @@
+#                █████
+#               ░░███
+#       ██████  ███████    ██████
+#      ███░░███░░░███░    ░░░░░███
+#     ░███ ░███  ░███      ███████
+#     ░███ ░███  ░███ ███ ███░░███
+#     ░░██████   ░░█████ ░░████████
+#      ░░░░░░     ░░░░░   ░░░░░░░░
+#
+#   Copyright (C) 2026 — 2026, Ota. All Rights Reserved.
+#
+#   DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+#
+#   Licensed under the Apache License, Version 2.0. See LICENSE for the full license text.
+#   You may not use this file except in compliance with the License.
+#   Unless required by applicable law or agreed to in writing, software distributed under the
+#   License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+#   either express or implied. See the License for the specific language governing permissions
+#   and limitations under the License.
+#
+#   If you need additional information or have any questions, please email: os@ota.run
+
+name: Systemd V3 independently administered recovery
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: systemd-v3-independently-administered-recovery
+  cancel-in-progress: false
+
+jobs:
+  verify-administrator-recovery:
+    name: Verify administrator-owned reboot recovery
+    runs-on: [self-hosted, Linux, X64, ota-authority-independent]
+    timeout-minutes: 15
+    env:
+      CONTROLLER: /usr/lib/ota-authority/bin/ota-authority-systemd-recovery-controller
+      EVIDENCE_ROOT: /usr/share/ota/authority-launcher/recovery-evidence
+      INSTALLATION_EVIDENCE: /usr/share/ota/authority-launcher/installation-evidence.json
+      OTA: /usr/lib/ota-authority/bin/ota
+      PRESSURE_REPOSITORY: /srv/ota-v3-pressure
+      WORKFLOW_REVISION: ${{ github.sha }}
+      EXPECTED_CORE_REVISION: e49f21ee77e522a614a776bcf17c9f9be16c8a90
+      EXPECTED_PROTOCOL_REVISION: 04a199a1eddd72b5b61958e0fe7f2d4e662e05cf
+    steps:
+      - name: Verify administrator-owned recovery evidence
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/independently-administered-recovery
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_DIR"
+          test "$(id -u)" -ne 0
+          test "$(uname -m)" = x86_64
+          test "$(ps -p 1 -o comm=)" = systemd
+          test "$(grep -c '^executed$' "$PRESSURE_REPOSITORY/selected-work-executed")" -eq 3
+
+          python3 - "$EVIDENCE_ROOT" "$INSTALLATION_EVIDENCE" "$CONTROLLER" \
+            "$ARTIFACT_DIR" "$WORKFLOW_REVISION" "$EXPECTED_CORE_REVISION" \
+            "$EXPECTED_PROTOCOL_REVISION" <<'PY'
+          import hashlib
+          import json
+          import os
+          import stat
+          import sys
+
+          (
+              evidence_root,
+              installation_path,
+              controller_path,
+              artifact_dir,
+              workflow_revision,
+              expected_core_revision,
+              expected_protocol_revision,
+          ) = sys.argv[1:]
+          def verify_root_chain(path):
+              current = os.path.abspath(path)
+              while True:
+                  metadata = os.lstat(current)
+                  if stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+                      raise SystemExit(f"public evidence ownership chain is invalid: {path}")
+                  parent = os.path.dirname(current)
+                  if parent == current:
+                      break
+                  current = parent
+
+          def verify_public_file(path, mode):
+              verify_root_chain(os.path.dirname(path))
+              metadata = os.lstat(path)
+              if (
+                  not stat.S_ISREG(metadata.st_mode)
+                  or metadata.st_uid != 0
+                  or metadata.st_nlink != 1
+                  or stat.S_IMODE(metadata.st_mode) != mode
+              ):
+                  raise SystemExit(f"public evidence file metadata is invalid: {path}")
+
+          expected = [
+              ("execution-completion.json", "execution_completion", 1, "active_slot", "execution_completion_recorded"),
+              ("finalization-intent.json", "finalization_intent", 2, "finalization", "intent"),
+              ("terminal-recorded.json", "terminal_recorded", 3, "finalization", "terminal_issued"),
+          ]
+          expected_filenames = {item[0] for item in expected}
+          if set(os.listdir(evidence_root)) != expected_filenames:
+              raise SystemExit("recovery evidence directory contains an unexpected entry")
+          expected_evidence_keys = {
+              "schema_version", "identity", "state_identity", "prepared_state_identity",
+              "fault_observed_state_identity",
+              "fault", "launcher_request_identity", "installation_evidence_identity",
+              "controller_binary_identity", "protocol_source_revision", "core_source_revision",
+              "launcher_source_revision", "boot_id_before", "boot_id_after", "verified_at",
+              "execution_count", "archive_count", "invalid_archive_count",
+              "repository_manifest_before", "repository_manifest_after", "retained_record_kind",
+              "retained_record_stage", "retained_record_identity", "invocation_id",
+              "receipt_archive_identity", "crossing_transaction_identity", "terminal_stage",
+              "terminal_outcome", "child_reaped_or_absent", "scope_removed",
+              "cgroup_empty_or_absent", "active_slot_removed", "residual_active_records",
+              "residual_finalization_records", "residual_scope_units", "private_material_included",
+          }
+          verify_public_file(installation_path, 0o644)
+          verify_public_file(controller_path, 0o755)
+          installation = json.load(open(installation_path, encoding="utf-8"))
+          claimed_installation = installation.get("identity", "")
+          canonical_installation = dict(installation)
+          canonical_installation["identity"] = ""
+          observed_installation = "sha256:" + hashlib.sha256(
+              b"ota.authority-launcher.public-installation-evidence.v1\0"
+              + json.dumps(
+                  canonical_installation,
+                  ensure_ascii=False,
+                  sort_keys=True,
+                  separators=(",", ":"),
+              ).encode()
+          ).hexdigest()
+          precondition = installation.get("prepared_provisioning_observation", {})
+          claimed_precondition = precondition.get("identity", "")
+          canonical_precondition = dict(precondition)
+          canonical_precondition["identity"] = ""
+          observed_precondition = "sha256:" + hashlib.sha256(
+              b"ota.authority-launcher.prepared-provisioning-observation.v1\0"
+              + json.dumps(
+                  canonical_precondition,
+                  ensure_ascii=False,
+                  sort_keys=True,
+                  separators=(",", ":"),
+              ).encode()
+          ).hexdigest()
+          if (
+              claimed_installation != observed_installation
+              or claimed_precondition != observed_precondition
+              or precondition.get("runner_service_unit") != "ota-authority-pressure-runner.service"
+              or precondition.get("runner_active_state") != "inactive"
+              or precondition.get("runner_sub_state") != "dead"
+              or precondition.get("runner_main_pid") != 0
+              or precondition.get("live_principal_processes") != []
+              or precondition.get("authority_state_posture") != "fresh_managed_authority_state"
+              or precondition.get("authority_state_ancestor_posture")
+                  != "root_owned_non_writable_directory_chain_without_aliases"
+              or installation.get("launcher_source_revision") != workflow_revision
+              or installation.get("core_source_revision") != expected_core_revision
+              or installation.get("protocol_source_revision") != expected_protocol_revision
+          ):
+              raise SystemExit("installation evidence is invalid")
+          controller_digest = "sha256:" + hashlib.sha256(open(controller_path, "rb").read()).hexdigest()
+          previous_boot = None
+          receipt_identities = set()
+          crossing_identities = set()
+          for filename, fault, archive_count, retained_kind, retained_stage in expected:
+              path = os.path.join(evidence_root, filename)
+              verify_public_file(path, 0o644)
+              raw = open(path, "rb").read()
+              evidence = json.loads(raw)
+              if set(evidence) != expected_evidence_keys:
+                  raise SystemExit(f"recovery evidence fields are not canonical: {filename}")
+              claimed = evidence.get("identity", "")
+              canonical = dict(evidence)
+              canonical["identity"] = ""
+              observed = "sha256:" + hashlib.sha256(
+                  b"ota.authority-launcher.admin-recovery-evidence.v1\0"
+                  + json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+              ).hexdigest()
+              if claimed != observed:
+                  raise SystemExit(f"recovery evidence identity is invalid: {filename}")
+              if (
+                  evidence.get("schema_version") != 1
+                  or evidence.get("fault") != fault
+                  or not evidence.get("state_identity", "").startswith("sha256:")
+                  or not evidence.get("prepared_state_identity", "").startswith("sha256:")
+                  or not evidence.get("fault_observed_state_identity", "").startswith("sha256:")
+                  or evidence.get("state_identity") == evidence.get("prepared_state_identity")
+                  or evidence.get("state_identity") == evidence.get("fault_observed_state_identity")
+                  or evidence.get("prepared_state_identity") == evidence.get("fault_observed_state_identity")
+                  or evidence.get("installation_evidence_identity") != installation.get("identity")
+                  or evidence.get("controller_binary_identity") != controller_digest
+                  or evidence.get("protocol_source_revision") != installation.get("protocol_source_revision")
+                  or evidence.get("core_source_revision") != installation.get("core_source_revision")
+                  or evidence.get("launcher_source_revision") != installation.get("launcher_source_revision")
+                  or evidence.get("execution_count") != archive_count
+                  or evidence.get("archive_count") != archive_count
+                  or evidence.get("invalid_archive_count") != 0
+                  or evidence.get("repository_manifest_before") != evidence.get("repository_manifest_after")
+                  or evidence.get("retained_record_kind") != retained_kind
+                  or evidence.get("retained_record_stage") != retained_stage
+                  or not evidence.get("retained_record_identity", "").startswith("sha256:")
+                  or not evidence.get("invocation_id", "").startswith("invocation-")
+                  or not evidence.get("receipt_archive_identity", "").startswith("sha256:")
+                  or not evidence.get("crossing_transaction_identity", "").startswith("sha256:")
+                  or evidence.get("terminal_stage") != "selected_execution_completed_boundary_removed"
+                  or evidence.get("terminal_outcome") != "completed"
+                  or evidence.get("child_reaped_or_absent") is not True
+                  or evidence.get("scope_removed") is not True
+                  or evidence.get("cgroup_empty_or_absent") is not True
+                  or evidence.get("active_slot_removed") is not True
+                  or evidence.get("residual_active_records") != 0
+                  or evidence.get("residual_finalization_records") != 0
+                  or evidence.get("residual_scope_units") != []
+                  or evidence.get("private_material_included") is not False
+                  or evidence.get("boot_id_before") == evidence.get("boot_id_after")
+              ):
+                  raise SystemExit(f"recovery evidence boundary is incomplete: {filename}")
+              if previous_boot is not None and evidence.get("boot_id_before") != previous_boot:
+                  raise SystemExit(f"recovery boot chain is discontinuous: {filename}")
+              previous_boot = evidence.get("boot_id_after")
+              receipt_identities.add(evidence["receipt_archive_identity"])
+              crossing_identities.add(evidence["crossing_transaction_identity"])
+              open(os.path.join(artifact_dir, filename), "wb").write(raw)
+          if len(receipt_identities) != 3 or len(crossing_identities) != 3:
+              raise SystemExit("recovery cases did not bind distinct archives and transactions")
+          open(os.path.join(artifact_dir, "installation-evidence.json"), "wb").write(
+              open(installation_path, "rb").read()
+          )
+          PY
+
+          "$OTA" --version --json > "$ARTIFACT_DIR/ota-version.json"
+          jq -e --slurpfile installation "$INSTALLATION_EVIDENCE" \
+            '.source_build == true
+             and .dirty == false
+             and .commit == $installation[0].core_source_revision' \
+            "$ARTIFACT_DIR/ota-version.json"
+          sha256sum "$CONTROLLER" "$OTA" > "$ARTIFACT_DIR/installed-identities.txt"
+          id > "$ARTIFACT_DIR/job-principal.txt"
+          uname -a > "$ARTIFACT_DIR/kernel.txt"
+
+      - name: Reverify complete protected history
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/independently-administered-recovery
+        run: |
+          set -euo pipefail
+          (
+            cd "$PRESSURE_REPOSITORY"
+            "$OTA" receipt --history --source systemd_protected_launcher --json
+          ) > "$ARTIFACT_DIR/protected-receipt-history.json"
+          jq -e \
+            '.ok == true
+             and .history_source == "systemd_protected_launcher"
+             and .completeness_posture == "complete_selected_catalog_snapshot"
+             and .summary.archive_count == 3
+             and .summary.invalid_archive_count == 0
+             and (.archives | length) == 3
+             and (.invalid_archives | length) == 0' \
+            "$ARTIFACT_DIR/protected-receipt-history.json"
+          jq -s '[.[].receipt_archive_identity] | sort' \
+            "$ARTIFACT_DIR/execution-completion.json" \
+            "$ARTIFACT_DIR/finalization-intent.json" \
+            "$ARTIFACT_DIR/terminal-recorded.json" \
+            > "$ARTIFACT_DIR/expected-archive-identities.json"
+          jq '[.archives[].archive_identity] | sort' \
+            "$ARTIFACT_DIR/protected-receipt-history.json" \
+            > "$ARTIFACT_DIR/observed-archive-identities.json"
+          diff -u "$ARTIFACT_DIR/expected-archive-identities.json" \
+            "$ARTIFACT_DIR/observed-archive-identities.json"
+
+      - name: Upload bounded public recovery evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: independently-administered-systemd-v3-recovery
+          path: ${{ runner.temp }}/independently-administered-recovery
+          if-no-files-found: error
+          retention-days: 30

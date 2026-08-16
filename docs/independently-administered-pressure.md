@@ -61,7 +61,8 @@ run its installed services:
 ```bash
 cargo build --release --locked --bins --features \
   'protected-attestor protected-attestor-client systemd-pressure-client \
-   systemd-v3-pressure-provision systemd-decision-pressure-peer'
+   systemd-v3-pressure-provision systemd-decision-pressure-peer \
+   systemd-admin-recovery-pressure'
 ```
 
 Install the exact clean source-built Core binary separately. Do not download or rebuild Core from
@@ -201,3 +202,80 @@ through the fixed production client after the administrator declares the prepare
 Until that controller matrix is green, this lane proves only the independently prepared positive
 path. Provider-attested image identity, host isolation, and administrator independence remain
 separate stronger claims.
+
+The pressure-only `ota-authority-systemd-recovery-controller` is the canonical administrator
+controller. Install its exact reviewed binary as root at
+`/usr/lib/ota-authority/bin/ota-authority-systemd-recovery-controller`. It is not an Ota execution
+command, broker, attestor, or authority source. It can only arm the three existing root-owned
+one-shot fault markers, retain one fixed invocation, require a host reboot, and publish bounded
+non-secret evidence after recovery. Its embedded clean Launcher and linked Protocol revisions must
+exactly match the protected installation evidence or it refuses before arming a fault.
+
+The controller persists a `prepared` state before arming a marker, then atomically advances it to
+`fault_observed` only after the expected protected launcher checkpoint exists. If `arm` fails before
+the marker is consumed, inspect `status` and use `abort-prepared`. That operation removes the
+unconsumed marker and pending state only when the runner remains stopped, both principals have no
+live processes, no launcher journal or scope exists, selected work did not advance, and repository
+truth is unchanged. It refuses instead of cleaning up when partial execution is possible.
+
+Before the first case, stop and disable the repository runner so no workflow can race the
+administrator:
+
+```bash
+sudo systemctl disable --now ota-authority-pressure-runner.service
+```
+
+Run the three cases in this order. The repository task used for this matrix must append exactly one
+`executed` line to `selected-work-executed`; protected history begins empty after prepared
+provisioning.
+
+```bash
+sudo /usr/lib/ota-authority/bin/ota-authority-systemd-recovery-controller arm \
+  --fault execution-completion \
+  --authority-id platform-release-authority \
+  --repository /srv/ota-v3-pressure \
+  --job-user ota-authority-job \
+  --expected-execution-count 1 \
+  --expected-archive-count 1 -- \
+  run governed --grant platform-release-authority --receipt
+sudo /usr/lib/ota-authority/bin/ota-authority-systemd-recovery-controller reboot
+
+# Reconnect as the administrator only after the host returns.
+sudo /usr/lib/ota-authority/bin/ota-authority-systemd-recovery-controller verify
+```
+
+Repeat with `--fault finalization-intent` and expected counts `2`, then
+`--fault terminal-recorded` and expected counts `3`. Each `arm` operation:
+
+- refuses unless the canonical repository runner is disabled, inactive, dead, and has no main PID;
+- creates exactly one fixed root-owned one-shot marker;
+- drops to the configured job UID/GID with no supplementary groups or new privileges;
+- invokes the installed production client with automatic reconnect disabled;
+- requires exactly one protected active-slot or finalization record before advancing the durable
+  controller state to `fault_observed`; and
+- binds the installation identity, exact Core/Launcher/Protocol revisions, controller binary,
+  boot ID, invocation identity, repository manifest, and expected execution/archive counts.
+
+Each `verify` operation requires a changed kernel boot ID, unchanged installation/controller
+identity, the exact frozen invocation, one recovery-only client exchange, unchanged repository
+truth, the expected cumulative execution/archive counts, zero invalid archives, no residual active
+or finalization records, no Ota transient scopes, and complete terminal cleanup. It publishes one
+create-new root-owned mode-`0644` record beneath the fixed
+`/usr/share/ota/authority-launcher/recovery-evidence` directory, then removes the pending private
+controller state. Before acknowledging the recovered terminal to Launcher, the constrained client
+hands it to the root controller, which validates and fsyncs a `recovery_observed` state. A crash
+therefore leaves either Launcher’s replayable finalization journal or the exact controller-owned
+terminal needed to confirm that acknowledgement and finish evidence publication.
+
+After all three cases, re-enable the runner and dispatch
+`Systemd V3 independently administered recovery`:
+
+```bash
+sudo systemctl enable --now ota-authority-pressure-runner.service
+```
+
+The consumer workflow cannot arm faults, restart services, reboot the host, read controller state,
+or access authority credentials. It re-derives the three public evidence identities, exact boot
+chain, immutable revisions and controller binary, then independently verifies three protected
+archives with zero invalid archives. A green consumer artifact proves only this administrator-
+controlled systemd reboot/recovery matrix; it does not prove provider attestation.

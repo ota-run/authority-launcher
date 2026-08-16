@@ -58,6 +58,7 @@ systemd-pressure-client = []
 systemd-pressure-faults = []
 systemd-v3-pressure-provision = []
 systemd-decision-pressure-peer = []
+systemd-admin-recovery-pressure = []
 
 [[bin]]
 name = "ota-authority-pressure-peer"
@@ -78,6 +79,11 @@ required-features = ["protected-attestor"]
 name = "ota-authority-systemd-decision-peer"
 path = "src/bin/ota-authority-systemd-decision-peer.rs"
 required-features = ["systemd-decision-pressure-peer"]
+
+[[bin]]
+name = "ota-authority-systemd-recovery-controller"
+path = "src/bin/ota-authority-systemd-recovery-controller.rs"
+required-features = ["systemd-admin-recovery-pressure"]
 
 [profile.release]
 lto = "thin"

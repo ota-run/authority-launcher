@@ -22,6 +22,8 @@
 
 const WORKFLOW: &str =
     include_str!("../.github/workflows/systemd-v3-independently-administered.yml");
+const RECOVERY_WORKFLOW: &str =
+    include_str!("../.github/workflows/systemd-v3-independently-administered-recovery.yml");
 
 #[test]
 fn independent_pressure_workflow_retains_a_narrow_drift_guard() {
@@ -67,4 +69,43 @@ fn independent_pressure_workflow_retains_a_narrow_drift_guard() {
     assert!(WORKFLOW.contains("core_source_revision == $commit"));
     assert!(!WORKFLOW.contains("core_source_revision | startswith"));
     assert!(WORKFLOW.contains("job-principal process escaped protected runner cgroup"));
+}
+
+#[test]
+fn independent_recovery_workflow_is_consumer_only() {
+    for forbidden in [
+        "actions/checkout",
+        "rust-toolchain",
+        "cargo ",
+        "sudo",
+        "systemctl",
+        "shutdown -",
+        "chmod",
+        "chown",
+        "secrets.",
+        "tee /etc/",
+        "tee /var/lib/",
+        "pressure-exit-after",
+    ] {
+        assert!(
+            !RECOVERY_WORKFLOW.contains(forbidden),
+            "recovery consumer contains administrator operation: {forbidden}"
+        );
+    }
+
+    assert!(RECOVERY_WORKFLOW.contains("workflow_dispatch:"));
+    assert!(!RECOVERY_WORKFLOW.contains("pull_request:"));
+    assert!(RECOVERY_WORKFLOW.contains("ota-authority-independent"));
+    assert!(RECOVERY_WORKFLOW.contains("WORKFLOW_REVISION: ${{ github.sha }}"));
+    assert!(RECOVERY_WORKFLOW.contains("EXPECTED_CORE_REVISION:"));
+    assert!(RECOVERY_WORKFLOW.contains("EXPECTED_PROTOCOL_REVISION:"));
+    assert!(RECOVERY_WORKFLOW.contains("execution-completion.json"));
+    assert!(RECOVERY_WORKFLOW.contains("finalization-intent.json"));
+    assert!(RECOVERY_WORKFLOW.contains("terminal-recorded.json"));
+    assert!(RECOVERY_WORKFLOW.contains("prepared_state_identity"));
+    assert!(RECOVERY_WORKFLOW.contains("retained_record_identity"));
+    assert!(RECOVERY_WORKFLOW.contains("expected-archive-identities.json"));
+    assert!(RECOVERY_WORKFLOW.contains("--source systemd_protected_launcher"));
+    assert!(RECOVERY_WORKFLOW.contains(".summary.archive_count == 3"));
+    assert!(RECOVERY_WORKFLOW.contains(".summary.invalid_archive_count == 0"));
 }

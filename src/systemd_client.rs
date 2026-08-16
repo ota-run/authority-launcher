@@ -47,7 +47,7 @@ use ota_authority_protocol::{
     validate_launcher_invocation_request_v1, validate_launcher_output_frame_v1,
     validate_launcher_signed_execution_finalization_frame_v1, validate_launcher_terminal_frame_v1,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const SYSTEMD_LAUNCHER_SOCKET: &str = "/run/ota/authority-launcher.sock";
@@ -60,7 +60,13 @@ pub struct InvocationRequest {
     pub ota_arguments: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryPolicy {
+    Immediate,
+    AdministratorControlled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvocationResult {
     pub ok: bool,
     pub request_identity: String,
@@ -111,13 +117,61 @@ impl ClientError {
 }
 
 pub fn invoke(request: InvocationRequest) -> Result<InvocationResult, ClientError> {
+    invoke_with_recovery_policy(request, RecoveryPolicy::Immediate)
+}
+
+pub fn invoke_with_recovery_policy(
+    request: InvocationRequest,
+    recovery_policy: RecoveryPolicy,
+) -> Result<InvocationResult, ClientError> {
     let mut stdout = std::io::stdout().lock();
     let mut stderr = std::io::stderr().lock();
-    invoke_with_writers(request, &mut stdout, &mut stderr)
+    invoke_with_writers(request, recovery_policy, &mut stdout, &mut stderr)
+}
+
+pub fn recover_invocation(request: InvocationRequest) -> Result<InvocationResult, ClientError> {
+    recover_invocation_with_observer(request, |_| Ok(()))
+}
+
+pub fn recover_invocation_with_observer(
+    request: InvocationRequest,
+    observer: impl FnOnce(&InvocationResult) -> Result<(), ClientError>,
+) -> Result<InvocationResult, ClientError> {
+    validate_authority_label(&request.authority_id)?;
+    validate_ota_arguments(&request.ota_arguments)?;
+    let repository = request
+        .repository
+        .canonicalize()
+        .map_err(|_| ClientError::Usage)?;
+    let invocation = LauncherInvocationRequestV1 {
+        message_kind: LAUNCHER_INVOCATION_REQUEST.into(),
+        protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
+        authority_id: request.authority_id.clone(),
+        ota_arguments: request.ota_arguments,
+        repository_path: repository.to_string_lossy().into_owned(),
+    };
+    validate_launcher_invocation_request_v1(&invocation).map_err(|_| ClientError::Usage)?;
+    let request_identity =
+        launcher_invocation_request_identity(&invocation).map_err(|_| ClientError::Usage)?;
+    let terminal = recover_finalization(&request.authority_id, &request_identity, |terminal| {
+        observer(&InvocationResult {
+            ok: terminal.exit_code == Some(0),
+            request_identity: request_identity.clone(),
+            output_complete: false,
+            terminal: terminal.clone(),
+        })
+    })?;
+    Ok(InvocationResult {
+        ok: terminal.exit_code == Some(0),
+        request_identity,
+        output_complete: false,
+        terminal,
+    })
 }
 
 fn invoke_with_writers(
     request: InvocationRequest,
+    recovery_policy: RecoveryPolicy,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> Result<InvocationResult, ClientError> {
@@ -152,8 +206,9 @@ fn invoke_with_writers(
             output_complete: true,
             terminal,
         }),
-        Err(ClientError::ServiceUnavailable | ClientError::OutputIncomplete) => {
-            let terminal = recover_finalization(&request.authority_id, &request_identity)?;
+        Err(error) if should_attempt_recovery(&error, recovery_policy) => {
+            let terminal =
+                recover_finalization(&request.authority_id, &request_identity, |_| Ok(()))?;
             Err(if terminal.finalization.is_some() {
                 ClientError::OutputIncomplete
             } else {
@@ -162,6 +217,14 @@ fn invoke_with_writers(
         }
         Err(error) => Err(error),
     }
+}
+
+fn should_attempt_recovery(error: &ClientError, recovery_policy: RecoveryPolicy) -> bool {
+    recovery_policy == RecoveryPolicy::Immediate
+        && matches!(
+            error,
+            ClientError::ServiceUnavailable | ClientError::OutputIncomplete
+        )
 }
 
 fn read_session(
@@ -286,6 +349,7 @@ fn acknowledge_archive(
 fn recover_finalization(
     authority_id: &str,
     launcher_request_identity: &str,
+    observer: impl FnOnce(&LauncherTerminalFrameV1) -> Result<(), ClientError>,
 ) -> Result<LauncherTerminalFrameV1, ClientError> {
     let mut request = LauncherFinalizationRecoveryRequestV1 {
         schema_version: 1,
@@ -307,8 +371,27 @@ fn recover_finalization(
     if terminal.finalization.as_ref() != Some(&frame.signed_finalization.finalization) {
         return Err(ClientError::Protocol);
     }
-    acknowledge_terminal(&mut stream, &terminal)?;
+    observe_then_acknowledge_terminal(&mut stream, &terminal, observer)?;
     Ok(terminal)
+}
+
+fn observe_then_acknowledge_terminal(
+    stream: &mut UnixStream,
+    terminal: &LauncherTerminalFrameV1,
+    observer: impl FnOnce(&LauncherTerminalFrameV1) -> Result<(), ClientError>,
+) -> Result<(), ClientError> {
+    observe_then_acknowledge(terminal, observer, |terminal| {
+        acknowledge_terminal(stream, terminal)
+    })
+}
+
+fn observe_then_acknowledge<T, E>(
+    value: &T,
+    observer: impl FnOnce(&T) -> Result<(), E>,
+    acknowledger: impl FnOnce(&T) -> Result<(), E>,
+) -> Result<(), E> {
+    observer(value)?;
+    acknowledger(value)
 }
 
 fn acknowledge_terminal(
@@ -494,6 +577,60 @@ mod tests {
         );
         assert_eq!(ClientError::Protocol.execution_started(), None);
         assert_eq!(ClientError::ServiceUnavailable.execution_started(), None);
+    }
+
+    #[test]
+    fn administrator_controlled_recovery_never_reconnects_implicitly() {
+        assert!(should_attempt_recovery(
+            &ClientError::OutputIncomplete,
+            RecoveryPolicy::Immediate
+        ));
+        assert!(!should_attempt_recovery(
+            &ClientError::OutputIncomplete,
+            RecoveryPolicy::AdministratorControlled
+        ));
+        assert!(!should_attempt_recovery(
+            &ClientError::ServiceUnavailable,
+            RecoveryPolicy::AdministratorControlled
+        ));
+        assert!(!should_attempt_recovery(
+            &ClientError::Protocol,
+            RecoveryPolicy::Immediate
+        ));
+    }
+
+    #[test]
+    fn recovery_observation_must_succeed_before_terminal_acknowledgement() {
+        let order = std::cell::RefCell::new(Vec::new());
+        assert_eq!(
+            observe_then_acknowledge(
+                &"terminal",
+                |_| {
+                    order.borrow_mut().push("observe");
+                    Ok::<_, ClientError>(())
+                },
+                |_| {
+                    order.borrow_mut().push("acknowledge");
+                    Ok::<_, ClientError>(())
+                },
+            ),
+            Ok(())
+        );
+        assert_eq!(*order.borrow(), ["observe", "acknowledge"]);
+
+        let mut acknowledged = false;
+        assert_eq!(
+            observe_then_acknowledge(
+                &"terminal",
+                |_| Err(ClientError::LocalBoundary),
+                |_| {
+                    acknowledged = true;
+                    Ok(())
+                },
+            ),
+            Err(ClientError::LocalBoundary)
+        );
+        assert!(!acknowledged);
     }
 
     #[test]
