@@ -84,6 +84,7 @@ pub(crate) enum ProtectedInstallationRoleV1 {
     PolkitRule,
     NonLoginShellExecutable,
     JobRunnerExecutable,
+    ProductionClientExecutable,
     JobRunnerServiceUnit,
     JobRunnerServiceDropIn,
     HistoryClientExecutable,
@@ -433,6 +434,7 @@ fn validate_manifest_shape(
             ProtectedInstallationRoleV1::PolkitRule,
             ProtectedInstallationRoleV1::NonLoginShellExecutable,
             ProtectedInstallationRoleV1::JobRunnerExecutable,
+            ProtectedInstallationRoleV1::ProductionClientExecutable,
             ProtectedInstallationRoleV1::JobRunnerServiceUnit,
         ] {
             if !roles.contains(&required)

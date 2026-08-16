@@ -88,6 +88,8 @@ jobs:
       - name: Provision protected systemd V3 boundary
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/systemd-v3-evidence
+          EXPECTED_CORE_REVISION: ${{ steps.ota.outputs.source-git-rev }}
+          EXPECTED_PROTOCOL_REVISION: 04a199a1eddd72b5b61958e0fe7f2d4e662e05cf
           PRESSURE_REPOSITORY: /srv/ota-v3-pressure
         run: |
           set -euo pipefail
@@ -149,6 +151,9 @@ jobs:
             --broker-decision-binary /usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer \
             --ota-binary /usr/lib/ota-authority/bin/ota \
             --pressure-client-binary /usr/lib/ota-authority/bin/ota-authority-systemd-pressure-client \
+            --protocol-source-revision "$EXPECTED_PROTOCOL_REVISION" \
+            --core-source-revision "$EXPECTED_CORE_REVISION" \
+            --launcher-source-revision "$(git rev-parse HEAD)" \
             | tee "$EVIDENCE_DIR/provision.txt"
 
           sha256sum \
@@ -618,7 +623,7 @@ jobs:
             "$positive_archive_path" | awk '{print $1}')"
           set +e
           sudo systemd-run --quiet --pipe --wait --collect --service-type=exec \
-            --uid=ota-authority-exec --gid=ota-authority-exec \
+            --uid=ota-authority-job --gid=ota-authority-job \
             --working-directory="$PRESSURE_REPOSITORY" \
             --property=NoNewPrivileges=yes \
             --property=CapabilityBoundingSet= \
@@ -1506,6 +1511,8 @@ jobs:
       - name: Provision production attachment boundary
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/production-attachment-evidence
+          EXPECTED_CORE_REVISION: d9d424168b1c1dad48351651c610789e54f74dcf
+          EXPECTED_PROTOCOL_REVISION: 04a199a1eddd72b5b61958e0fe7f2d4e662e05cf
           PRESSURE_REPOSITORY: /srv/ota-production-attachment
         run: |
           set -euo pipefail
@@ -1558,6 +1565,9 @@ jobs:
             --broker-decision-binary /usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer \
             --ota-binary /usr/lib/ota-authority/bin/ota \
             --pressure-client-binary /usr/lib/ota-authority/bin/ota-authority-systemd-client \
+            --protocol-source-revision "$EXPECTED_PROTOCOL_REVISION" \
+            --core-source-revision "$EXPECTED_CORE_REVISION" \
+            --launcher-source-revision "$(git rev-parse HEAD)" \
             --production-client \
             | tee "$EVIDENCE_DIR/provision.txt"
           sudo cp /etc/ota/authority-launcher-installation.json \
@@ -1620,7 +1630,7 @@ jobs:
           archive_identity="sha256:$(sudo sha256sum "$archive_path" | awk '{print $1}')"
           set +e
           sudo systemd-run --quiet --pipe --wait --collect --service-type=exec \
-            --uid=ota-authority-exec --gid=ota-authority-exec \
+            --uid=ota-authority-job --gid=ota-authority-job \
             --working-directory="$PRESSURE_REPOSITORY" \
             --property=NoNewPrivileges=yes \
             --property=CapabilityBoundingSet= \

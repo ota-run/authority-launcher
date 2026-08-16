@@ -37,6 +37,7 @@ use ota_authority_protocol::{
     SystemdJobPrincipalRequirement, SystemdLauncherEvidenceSource, message_identity,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::config::{
@@ -279,6 +280,7 @@ fn verify_runner_service(
             "Id",
             "ActiveState",
             "ControlGroup",
+            "MainPID",
             "FragmentPath",
             "DropInPaths",
             "NoNewPrivileges",
@@ -328,11 +330,48 @@ fn verify_runner_service(
         "runner_service.peer_control_group",
         process_cgroup(peer_pid)? == control_group,
     )?;
+    let main_pid = value(&properties, "MainPID")
+        .map_err(|_| ClosedProfileObservationError::Unavailable)?
+        .parse::<u32>()
+        .map_err(|_| ClosedProfileObservationError::Unavailable)?;
+    verify_runner_executable(installation, main_pid)?;
     identity("runner-service", &properties)
 }
 
 fn runner_service_state_is_executing(state: Option<&str>) -> bool {
     matches!(state, Some("active" | "activating"))
+}
+
+fn sha256_file(path: &Path) -> Result<String, ClosedProfileObservationError> {
+    let mut file = fs::File::open(path).map_err(|_| ClosedProfileObservationError::Unavailable)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| ClosedProfileObservationError::Unavailable)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("sha256:{:x}", digest.finalize()))
+}
+
+fn verify_runner_executable(
+    installation: &ProtectedInstallationManifestV1,
+    main_pid: u32,
+) -> Result<(), ClosedProfileObservationError> {
+    let runner_identity = installation
+        .singular_identity(ProtectedInstallationRoleV1::JobRunnerExecutable)
+        .map_err(|_| ClosedProfileObservationError::Unavailable)?;
+    pressure_condition(
+        "runner_service.executable",
+        sha256_file(Path::new(format!("/proc/{main_pid}/exe").as_str()))
+            .ok()
+            .as_deref()
+            == Some(runner_identity),
+    )
 }
 
 fn pressure_condition(_name: &str, condition: bool) -> Result<(), ClosedProfileObservationError> {
@@ -1321,6 +1360,32 @@ mod tests {
         assert!(!runner_service_state_is_executing(Some("deactivating")));
         assert!(!runner_service_state_is_executing(Some("failed")));
         assert!(!runner_service_state_is_executing(None));
+    }
+
+    #[test]
+    fn runner_service_binds_the_exact_main_process_executable() {
+        use crate::installation_manifest::ProtectedInstallationFileV1;
+
+        let executable = PathBuf::from("/proc/self/exe");
+        let identity = sha256_file(&executable).expect("current executable identity");
+        let mut installation = ProtectedInstallationManifestV1 {
+            schema_version: 1,
+            identity: String::new(),
+            launcher_configuration_identity: String::new(),
+            launcher_profile_identity: String::new(),
+            job_principal_profile_identity: String::new(),
+            files: vec![ProtectedInstallationFileV1 {
+                role: ProtectedInstallationRoleV1::JobRunnerExecutable,
+                path: executable,
+                identity,
+            }],
+        };
+        assert!(verify_runner_executable(&installation, std::process::id()).is_ok());
+        installation.files[0].identity = format!("sha256:{}", "f".repeat(64));
+        assert!(matches!(
+            verify_runner_executable(&installation, std::process::id()),
+            Err(ClosedProfileObservationError::Mismatch)
+        ));
     }
 
     #[test]

@@ -111,6 +111,8 @@ enum Command {
         #[arg(long)]
         pressure_client_binary: std::path::PathBuf,
         #[arg(long)]
+        prepared_runner_binary: Option<std::path::PathBuf>,
+        #[arg(long)]
         production_client: bool,
     },
 }
@@ -135,6 +137,7 @@ fn main() -> ExitCode {
             broker_decision_binary,
             ota_binary,
             pressure_client_binary,
+            prepared_runner_binary,
             production_client,
         } => pressure_provision::provision(pressure_provision::ProvisionRequest {
             authority_id,
@@ -146,6 +149,7 @@ fn main() -> ExitCode {
             broker_decision_binary,
             ota_binary,
             pressure_client_binary,
+            prepared_runner_binary,
             production_client,
         }),
     };

@@ -1,0 +1,317 @@
+#                █████
+#               ░░███
+#       ██████  ███████    ██████
+#      ███░░███░░░███░    ░░░░░███
+#     ░███ ░███  ░███      ███████
+#     ░███ ░███  ░███ ███ ███░░███
+#     ░░██████   ░░█████ ░░████████
+#      ░░░░░░     ░░░░░   ░░░░░░░░
+#
+#   Copyright (C) 2026 — 2026, Ota. All Rights Reserved.
+#
+#   DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+#
+#   Licensed under the Apache License, Version 2.0. See LICENSE for the full license text.
+#   You may not use this file except in compliance with the License.
+#   Unless required by applicable law or agreed to in writing, software distributed under the
+#   License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+#   either express or implied. See the License for the specific language governing permissions
+#   and limitations under the License.
+#
+#   If you need additional information or have any questions, please email: os@ota.run
+
+name: Systemd V3 independently administered pressure
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: systemd-v3-independently-administered-pressure
+  cancel-in-progress: false
+
+jobs:
+  consume-prepared-boundary:
+    name: Consume administrator-prepared authority once
+    runs-on: [self-hosted, Linux, X64, ota-authority-independent]
+    timeout-minutes: 15
+    env:
+      AUTHORITY_ID: platform-release-authority
+      CLIENT: /usr/lib/ota-authority/bin/ota-authority-systemd-client
+      INSTALLATION_EVIDENCE: /usr/share/ota/authority-launcher/installation-evidence.json
+      OTA: /usr/lib/ota-authority/bin/ota
+      PRESSURE_REPOSITORY: /srv/ota-v3-pressure
+    steps:
+      - name: Verify independently prepared public boundary
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/independently-administered-evidence
+        run: |
+          set -euo pipefail
+          mkdir -p "$EVIDENCE_DIR"
+          test "$(id -u)" -ne 0
+          test "$(uname -m)" = x86_64
+          test "$(ps -p 1 -o comm=)" = systemd
+          test ! -e "$PRESSURE_REPOSITORY/selected-work-executed"
+          test ! -e "$PRESSURE_REPOSITORY/.ota"
+
+          python3 - "$INSTALLATION_EVIDENCE" "$CLIENT" "$OTA" "$PRESSURE_REPOSITORY" <<'PY'
+          import hashlib
+          import json
+          import os
+          import stat
+          import sys
+
+          manifest_path, client_path, ota_path, repository_path = sys.argv[1:]
+          expected_runner_cgroup = "/system.slice/ota-authority-pressure-runner.service"
+          for process_name in os.listdir("/proc"):
+              if not process_name.isdigit():
+                  continue
+              try:
+                  status = open(f"/proc/{process_name}/status", encoding="utf-8").read()
+                  real_uid = int(next(line for line in status.splitlines() if line.startswith("Uid:")).split()[1])
+                  if real_uid != os.getuid():
+                      continue
+                  cgroup = open(f"/proc/{process_name}/cgroup", encoding="utf-8").read().strip()
+              except (FileNotFoundError, ProcessLookupError, StopIteration):
+                  continue
+              if not cgroup.endswith(expected_runner_cgroup):
+                  raise SystemExit(f"job-principal process escaped protected runner cgroup: {process_name}")
+          current = os.path.abspath(manifest_path)
+          while True:
+              metadata = os.lstat(current)
+              if stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+                  raise SystemExit("installation evidence ownership chain is invalid")
+              parent = os.path.dirname(current)
+              if parent == current:
+                  break
+              current = parent
+          metadata = os.lstat(manifest_path)
+          if not stat.S_ISREG(metadata.st_mode):
+              raise SystemExit("installation evidence is not a regular file")
+          if metadata.st_uid != 0 or metadata.st_nlink != 1:
+              raise SystemExit("installation evidence ownership is invalid")
+          if stat.S_IMODE(metadata.st_mode) != 0o644:
+              raise SystemExit("installation evidence mode is invalid")
+          with open(manifest_path, "rb") as stream:
+              raw_manifest = stream.read()
+          evidence = json.loads(raw_manifest)
+          if evidence.get("schema_version") != 1:
+              raise SystemExit("installation evidence schema is invalid")
+          for field in ("protocol_source_revision", "core_source_revision", "launcher_source_revision"):
+              value = evidence.get(field, "")
+              if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
+                  raise SystemExit(f"installation evidence revision is invalid: {field}")
+          claimed_identity = evidence.get("identity", "")
+          canonical = dict(evidence)
+          canonical["identity"] = ""
+          canonical_bytes = json.dumps(
+              canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+          ).encode()
+          observed_identity = "sha256:" + hashlib.sha256(
+              b"ota.authority-launcher.public-installation-evidence.v1\0" + canonical_bytes
+          ).hexdigest()
+          if claimed_identity != observed_identity:
+              raise SystemExit("installation evidence identity is invalid")
+
+          precondition = evidence.get("prepared_provisioning_observation", {})
+          expected_authority_state_paths = [
+              "/etc/ota/authority-launcher-systemd.json",
+              "/etc/ota/authority-attestor.json",
+              "/etc/ota/authority-attestor-verifiers.json",
+              "/etc/ota/authority-launcher-installation.json",
+              "/usr/share/ota/authority-launcher",
+              "/etc/ota/crossing-brokers.json",
+              "/var/lib/ota/authority-attestor-signing-key",
+              "/var/lib/ota/authority-broker-signing-key",
+              "/var/lib/ota/authority-broker-pressure",
+              "/run/ota/authority-broker-pressure-scenario",
+              "/var/lib/ota/authority-attestor",
+              "/var/lib/ota/authority-launcher",
+              "/run/ota/authority-launcher",
+              "/run/ota/authority-launcher.sock",
+              "/run/ota/authority-attestor.sock",
+              "/run/ota/broker-proxy.sock",
+              "/run/ota/authority-history.sock",
+              "/etc/systemd/system/ota-authority-launcher.service",
+              "/etc/systemd/system/ota-authority-launcher.service.d/zzzz-ota-pressure-hardening.conf",
+              "/etc/systemd/system/ota-authority-launcher.socket",
+              "/etc/systemd/system/ota-authority-attestor.service",
+              "/etc/systemd/system/ota-authority-attestor.service.d/zzzz-ota-pressure-hardening.conf",
+              "/etc/systemd/system/ota-authority-attestor.socket",
+              "/etc/systemd/system/ota-authority-broker-proxy.service",
+              "/etc/systemd/system/ota-authority-broker-proxy.socket",
+              "/etc/ota/authority-history.json",
+              "/var/lib/ota/authority-launcher/history/blobs",
+              "/var/lib/ota/authority-launcher/history/catalog",
+              "/etc/systemd/system/ota-authority-history.service",
+              "/etc/systemd/system/ota-authority-history.socket",
+              "/etc/systemd/system/ota-authority-invocations.slice",
+              "/etc/polkit-1/rules.d/00-ota-authority-deny.rules",
+          ]
+          if (
+              precondition.get("schema_version") != 1
+              or precondition.get("runner_service_unit") != "ota-authority-pressure-runner.service"
+              or precondition.get("runner_active_state") != "inactive"
+              or precondition.get("runner_sub_state") != "dead"
+              or precondition.get("runner_main_pid") != 0
+              or precondition.get("runner_control_group") != ""
+              or precondition.get("runner_service_fragment_path")
+                  != "/etc/systemd/system/ota-authority-pressure-runner.service"
+              or precondition.get("runner_service_drop_in_paths")
+                  != [
+                      "/etc/systemd/system/ota-authority-pressure-runner.service.d/zzzz-ota-pressure-hardening.conf"
+                  ]
+              or precondition.get("job_uid") != os.getuid()
+              or precondition.get("execution_uid") == os.getuid()
+              or precondition.get("live_principal_processes") != []
+              or precondition.get("authority_state_posture") != "fresh_managed_authority_state"
+              or precondition.get("authority_state_ancestor_posture")
+                  != "root_owned_non_writable_directory_chain_without_aliases"
+              or precondition.get("authority_state_paths_checked")
+                  != expected_authority_state_paths
+          ):
+              raise SystemExit("prepared provisioning observation is invalid")
+          claimed_precondition_identity = precondition.get("identity", "")
+          canonical_precondition = dict(precondition)
+          canonical_precondition["identity"] = ""
+          observed_precondition_identity = "sha256:" + hashlib.sha256(
+              b"ota.authority-launcher.prepared-provisioning-observation.v1\0"
+              + json.dumps(
+                  canonical_precondition,
+                  ensure_ascii=False,
+                  sort_keys=True,
+                  separators=(",", ":"),
+              ).encode()
+          ).hexdigest()
+          if claimed_precondition_identity != observed_precondition_identity:
+              raise SystemExit("prepared provisioning observation identity is invalid")
+
+          runner_service_path = "/etc/systemd/system/ota-authority-pressure-runner.service"
+          with open(runner_service_path, encoding="utf-8") as stream:
+              runner_conditions = [
+                  line.strip()
+                  for line in stream
+                  if line.strip().startswith("ConditionPathExists=")
+              ]
+          if runner_conditions != [
+              "ConditionPathExists=/usr/share/ota/authority-launcher/installation-evidence.json"
+          ]:
+              raise SystemExit("prepared runner publication gate is invalid")
+
+          manifest = evidence.get("installation_manifest", {})
+          if manifest.get("schema_version") != 1:
+              raise SystemExit("protected installation manifest schema is invalid")
+          entries = {entry["role"]: entry for entry in manifest.get("files", [])}
+          expected = {
+              "history_client_executable": ota_path,
+              "production_client_executable": client_path,
+              "job_runner_executable": "/opt/ota-actions-runner/bin/Runner.Listener",
+              "job_runner_service_unit": "/etc/systemd/system/ota-authority-pressure-runner.service",
+              "job_runner_service_drop_in": "/etc/systemd/system/ota-authority-pressure-runner.service.d/zzzz-ota-pressure-hardening.conf",
+          }
+          for role, path in expected.items():
+              entry = entries.get(role)
+              if entry is None or entry.get("path") != path:
+                  raise SystemExit(f"missing fixed installation role: {role}")
+              file_metadata = os.lstat(path)
+              if not stat.S_ISREG(file_metadata.st_mode):
+                  raise SystemExit(f"installed role is not a regular file: {role}")
+              if file_metadata.st_uid != 0 or file_metadata.st_mode & 0o022:
+                  raise SystemExit(f"installed role is not root-protected: {role}")
+              digest = hashlib.sha256()
+              with open(path, "rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              if entry.get("identity") != f"sha256:{digest.hexdigest()}":
+                  raise SystemExit(f"installed role identity mismatch: {role}")
+          if (
+              precondition.get("runner_executable_identity")
+              != entries["job_runner_executable"].get("identity")
+              or precondition.get("runner_service_identity")
+              != entries["job_runner_service_unit"].get("identity")
+              or precondition.get("runner_drop_in_identity")
+              != entries["job_runner_service_drop_in"].get("identity")
+          ):
+              raise SystemExit("prepared runner changed after pre-mutation observation")
+
+          for root, directories, files in os.walk(repository_path, followlinks=False):
+              for path in [root, *(os.path.join(root, name) for name in directories + files)]:
+                  entry_metadata = os.lstat(path)
+                  if stat.S_ISLNK(entry_metadata.st_mode) or os.access(path, os.W_OK, effective_ids=True):
+                      raise SystemExit(f"repository entry is writable or aliased: {path}")
+                  if stat.S_ISREG(entry_metadata.st_mode) and entry_metadata.st_nlink != 1:
+                      raise SystemExit(f"repository entry has a hardlink alias: {path}")
+
+          with open(os.path.join(os.environ["EVIDENCE_DIR"], "installation-evidence.json"), "wb") as stream:
+              stream.write(raw_manifest)
+          PY
+
+          "$OTA" --version --json > "$EVIDENCE_DIR/ota-version.json"
+          jq -e --slurpfile installation "$INSTALLATION_EVIDENCE" \
+            '.source_build == true
+             and .dirty == false
+             and (.commit as $commit
+               | $installation[0].core_source_revision == $commit)' \
+            "$EVIDENCE_DIR/ota-version.json"
+          sha256sum "$CLIENT" "$OTA" > "$EVIDENCE_DIR/installed-client-identities.txt"
+          id > "$EVIDENCE_DIR/job-principal.txt"
+          uname -a > "$EVIDENCE_DIR/kernel.txt"
+
+      - name: Execute one governed invocation
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/independently-administered-evidence
+        run: |
+          set -euo pipefail
+          "$CLIENT" \
+            --authority-id "$AUTHORITY_ID" \
+            --repository "$PRESSURE_REPOSITORY" \
+            --json -- \
+            run governed --grant "$AUTHORITY_ID" --receipt \
+            > "$EVIDENCE_DIR/production-client.json"
+          jq -e \
+            '.ok == true
+             and .output_complete == true
+             and .terminal.stage == "selected_execution_completed_boundary_removed"
+             and .terminal.outcome == "completed"
+             and .terminal.exit_code == 0
+             and .terminal.finalization.child_reaped == true
+             and .terminal.finalization.scope_removed == true
+             and .terminal.finalization.cgroup_empty_or_absent == true
+             and .terminal.finalization.active_slot_removed == true' \
+            "$EVIDENCE_DIR/production-client.json"
+          test "$(cat "$PRESSURE_REPOSITORY/selected-work-executed")" = executed
+
+      - name: Reverify protected receipt history
+        env:
+          EVIDENCE_DIR: ${{ runner.temp }}/independently-administered-evidence
+        run: |
+          set -euo pipefail
+          (
+            cd "$PRESSURE_REPOSITORY"
+            "$OTA" receipt --history \
+              --source systemd_protected_launcher --json
+          ) > "$EVIDENCE_DIR/protected-receipt-history.json"
+          jq -e \
+            '.ok == true
+             and .history_source == "systemd_protected_launcher"
+             and .completeness_posture == "complete_selected_catalog_snapshot"
+             and .summary.archive_count == 1
+             and .summary.invalid_archive_count == 0
+             and (.archives | length) == 1
+             and (.invalid_archives | length) == 0
+             and (.operator_profile_identity | startswith("sha256:"))
+             and (.operator_peer_identity | startswith("sha256:"))
+             and (.repository_binding_identity | startswith("sha256:"))
+             and (.catalog_snapshot_identity | startswith("sha256:"))' \
+            "$EVIDENCE_DIR/protected-receipt-history.json"
+
+      - name: Upload bounded public evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: independently-administered-systemd-v3-evidence
+          path: ${{ runner.temp }}/independently-administered-evidence
+          if-no-files-found: error
+          retention-days: 30

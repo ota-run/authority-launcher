@@ -46,7 +46,7 @@ use ota_authority_protocol::{
     systemd_job_principal_profile_v2, systemd_launcher_profile_identity,
     systemd_launcher_profile_v3,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -76,6 +76,14 @@ const LAUNCHER_CONFIG: &str = "/etc/ota/authority-launcher-systemd.json";
 const ATTESTOR_CONFIG: &str = "/etc/ota/authority-attestor.json";
 const VERIFIER_SET: &str = "/etc/ota/authority-attestor-verifiers.json";
 const INSTALLATION_MANIFEST: &str = "/etc/ota/authority-launcher-installation.json";
+const PUBLIC_INSTALLATION_EVIDENCE_ROOT: &str = "/usr/share/ota/authority-launcher";
+const PUBLIC_INSTALLATION_EVIDENCE: &str =
+    "/usr/share/ota/authority-launcher/installation-evidence.json";
+const RUNNER_PUBLICATION_GATE: &str = PUBLIC_INSTALLATION_EVIDENCE;
+const PUBLIC_INSTALLATION_EVIDENCE_IDENTITY_DOMAIN_V1: &[u8] =
+    b"ota.authority-launcher.public-installation-evidence.v1\0";
+const PREPARED_PROVISIONING_OBSERVATION_IDENTITY_DOMAIN_V1: &[u8] =
+    b"ota.authority-launcher.prepared-provisioning-observation.v1\0";
 const BROKER_STORE: &str = "/etc/ota/crossing-brokers.json";
 const SIGNING_KEY: &str = "/var/lib/ota/authority-attestor-signing-key";
 const BROKER_SIGNING_KEY: &str = "/var/lib/ota/authority-broker-signing-key";
@@ -132,7 +140,49 @@ pub(crate) struct ProvisionRequest {
     pub broker_decision_binary: PathBuf,
     pub ota_binary: PathBuf,
     pub pressure_client_binary: PathBuf,
+    pub prepared_runner_binary: Option<PathBuf>,
     pub production_client: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct PublicInstallationEvidenceV1 {
+    schema_version: u32,
+    identity: String,
+    protocol_source_revision: String,
+    core_source_revision: String,
+    launcher_source_revision: String,
+    prepared_provisioning_observation: Option<PreparedProvisioningObservationV1>,
+    installation_manifest: ProtectedInstallationManifestV1,
+}
+
+#[derive(Clone, Serialize)]
+struct PreparedProvisioningObservationV1 {
+    schema_version: u32,
+    identity: String,
+    observed_at: String,
+    runner_service_unit: String,
+    runner_active_state: String,
+    runner_sub_state: String,
+    runner_main_pid: u32,
+    runner_control_group: String,
+    runner_service_fragment_path: String,
+    runner_service_drop_in_paths: Vec<String>,
+    runner_executable_identity: String,
+    runner_service_identity: String,
+    runner_drop_in_identity: String,
+    job_uid: u32,
+    execution_uid: u32,
+    live_principal_processes: Vec<u32>,
+    authority_state_posture: String,
+    authority_state_ancestor_posture: String,
+    authority_state_paths_checked: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct OtaBuildIdentity {
+    source_build: bool,
+    commit: Option<String>,
+    dirty: bool,
 }
 
 #[derive(Clone)]
@@ -152,17 +202,41 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     crate::validate_authority_label(request.authority_id.as_str())?;
     let job = account(request.job_user.as_str())?;
     let execution = account(request.execution_user.as_str())?;
-    if job.uid == 0 || execution.uid == 0 || (job.uid, job.gid) == (execution.uid, execution.gid) {
+    if job.uid == 0 || execution.uid == 0 || job.uid == execution.uid || job.gid == execution.gid {
         return Err(String::from(
             "pressure principals must be distinct non-root accounts",
         ));
     }
-    let repository_root = protected_directory(&request.repository_root, Some(execution.uid))?;
+    let repository_root = protected_repository_tree(&request.repository_root, &job, &execution)?;
     let launcher_binary = protected_executable(&request.launcher_binary)?;
+    if sha256_file(Path::new("/proc/self/exe"))? != sha256_file(&launcher_binary)? {
+        return Err(String::from(
+            "provisioning process does not match the installed Launcher binary",
+        ));
+    }
     let attestor_binary = protected_executable(&request.attestor_binary)?;
     let broker_decision_binary = protected_executable(&request.broker_decision_binary)?;
     let ota_binary = protected_executable(&request.ota_binary)?;
     let pressure_client_binary = protected_executable(&request.pressure_client_binary)?;
+    let prepared_runner_binary = request
+        .prepared_runner_binary
+        .as_deref()
+        .map(|path| {
+            verify_root_protected_chain(path)?;
+            let protected = protected_executable(path)?;
+            if protected != path {
+                return Err(String::from(
+                    "prepared runner executable must not use an alias",
+                ));
+            }
+            Ok(protected)
+        })
+        .transpose()?;
+    let job_runner_binary = prepared_runner_binary
+        .as_deref()
+        .unwrap_or(pressure_client_binary.as_path())
+        .to_path_buf();
+    let source_revisions = build_source_revisions(&ota_binary)?;
     for path in [
         Path::new(SYSTEMCTL),
         Path::new(PKCHECK),
@@ -175,6 +249,11 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
             "the pressure host-control socket is unavailable",
         ));
     }
+
+    let prepared_provisioning_observation = prepared_runner_binary
+        .as_deref()
+        .map(|runner| observe_prepared_provisioning_precondition(&job, &execution, runner))
+        .transpose()?;
 
     for (path, mode) in protected_directories() {
         create_root_directory(Path::new(path), mode)?;
@@ -204,6 +283,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         &broker_decision_binary,
         &ota_binary,
         &pressure_client_binary,
+        &job_runner_binary,
     );
     let read_only_paths = launcher_paths
         .iter()
@@ -225,15 +305,17 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     let attestor_socket = attestor_socket_unit();
     let broker_service = broker_proxy_service_unit(&broker_decision_binary);
     let broker_socket = broker_proxy_socket_unit();
-    let runner_service = runner_service_unit(
-        &request.authority_id,
-        &job,
-        &repository_root,
-        &pressure_client_binary,
-        request.production_client,
-    );
+    let runner_service = prepared_runner_binary.is_none().then(|| {
+        runner_service_unit(
+            &request.authority_id,
+            &job,
+            &repository_root,
+            &pressure_client_binary,
+            request.production_client,
+        )
+    });
     let history_service = history_service_unit(&launcher_binary);
-    let history_socket = history_socket_unit(execution.group.as_str());
+    let history_socket = history_socket_unit(job.group.as_str());
     write_root_file(
         Path::new(POLKIT_RULE),
         polkit_deny_rule(&job, &execution)?.as_bytes(),
@@ -269,7 +351,12 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         broker_socket.as_bytes(),
         0o644,
     )?;
-    write_root_file(Path::new(RUNNER_SERVICE), runner_service.as_bytes(), 0o644)?;
+    if let Some(runner_service) = runner_service.as_deref() {
+        write_root_file(Path::new(RUNNER_SERVICE), runner_service.as_bytes(), 0o644)?;
+    } else {
+        protected_root_file(Path::new(RUNNER_SERVICE), false)?;
+        verify_root_protected_chain(Path::new(RUNNER_SERVICE))?;
+    }
     write_root_file(
         Path::new(HISTORY_SERVICE),
         history_service.as_bytes(),
@@ -290,11 +377,16 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         attestor_hardening_drop_in().as_bytes(),
         0o644,
     )?;
-    write_root_file(
-        Path::new(RUNNER_SERVICE_DROP_IN),
-        runner_hardening_drop_in().as_bytes(),
-        0o644,
-    )?;
+    if prepared_runner_binary.is_none() {
+        write_root_file(
+            Path::new(RUNNER_SERVICE_DROP_IN),
+            runner_hardening_drop_in().as_bytes(),
+            0o644,
+        )?;
+    } else {
+        protected_root_file(Path::new(RUNNER_SERVICE_DROP_IN), false)?;
+        verify_root_protected_chain(Path::new(RUNNER_SERVICE_DROP_IN))?;
+    }
     write_root_file(
         Path::new(INVOCATION_SLICE),
         b"[Unit]\nDescription=Ota authority invocation scopes\n",
@@ -514,6 +606,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         &broker_decision_binary,
         &ota_binary,
         &pressure_client_binary,
+        &job_runner_binary,
     )
     .into_iter()
     .map(|(role, path)| {
@@ -585,8 +678,8 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     let operator_profile_identity = message_identity(
         HISTORY_OPERATOR_PROFILE_IDENTITY_DOMAIN_V1,
         &(
-            execution.uid,
-            execution.gid,
+            job.uid,
+            job.gid,
             ota_identity.as_str(),
             "primary_group_only:no_new_privs:no_process_capabilities",
         ),
@@ -597,12 +690,12 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         identity: String::new(),
         protocol_profile: ota_authority_protocol::SYSTEMD_PROTECTED_HISTORY_PROTOCOL_V1.into(),
         socket_path: PathBuf::from(HISTORY_SOCKET_PATH),
-        socket_group_gid: execution.gid,
+        socket_group_gid: job.gid,
         installation_manifest_identity: history_installation_identity,
         installed_client_path: ota_binary.clone(),
         installed_client_identity: ota_identity,
-        operator_uid: execution.uid,
-        operator_gid: execution.gid,
+        operator_uid: job.uid,
+        operator_gid: job.gid,
         operator_profile_identity,
         service_unit_identity: sha256_file(Path::new(HISTORY_SERVICE))?,
         socket_unit_identity: sha256_file(Path::new(HISTORY_SOCKET_UNIT))?,
@@ -624,7 +717,18 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     manifest.identity = protected_installation_manifest_identity(&manifest)
         .map_err(|_| String::from("installation manifest identity unavailable"))?;
     write_json(Path::new(INSTALLATION_MANIFEST), &manifest, 0o600)?;
-
+    create_root_directory(Path::new(PUBLIC_INSTALLATION_EVIDENCE_ROOT), 0o755)?;
+    verify_root_protected_chain(Path::new(PUBLIC_INSTALLATION_EVIDENCE_ROOT))?;
+    let mut public_evidence = PublicInstallationEvidenceV1 {
+        schema_version: 1,
+        identity: String::new(),
+        protocol_source_revision: source_revisions.0,
+        core_source_revision: source_revisions.1,
+        launcher_source_revision: source_revisions.2,
+        prepared_provisioning_observation,
+        installation_manifest: manifest,
+    };
+    public_evidence.identity = public_installation_evidence_identity(&public_evidence)?;
     run_systemctl(&["daemon-reload"])?;
     run_systemctl(&[
         "enable",
@@ -634,9 +738,17 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         "ota-authority-broker-proxy.socket",
         "ota-authority-history.socket",
     ])?;
+    // The canonical runner cannot start until this final, durable publication succeeds.
+    write_json(
+        Path::new(PUBLIC_INSTALLATION_EVIDENCE),
+        &public_evidence,
+        0o644,
+    )?;
+    protected_root_file(Path::new(PUBLIC_INSTALLATION_EVIDENCE), false)?;
+    verify_root_protected_chain(Path::new(PUBLIC_INSTALLATION_EVIDENCE))?;
     println!(
         "systemd-v3-pressure-provisioned authority={} launcher_config={} installation={}",
-        launcher_config.identity, LAUNCHER_CONFIG, manifest.identity
+        launcher_config.identity, LAUNCHER_CONFIG, public_evidence.installation_manifest.identity
     );
     Ok(0)
 }
@@ -647,6 +759,7 @@ fn protected_role_paths(
     broker_decision: &Path,
     ota: &Path,
     pressure_client: &Path,
+    job_runner: &Path,
 ) -> Vec<(ProtectedInstallationRoleV1, PathBuf)> {
     let mut paths = vec![
         (
@@ -727,6 +840,10 @@ fn protected_role_paths(
         ),
         (
             ProtectedInstallationRoleV1::JobRunnerExecutable,
+            job_runner.to_path_buf(),
+        ),
+        (
+            ProtectedInstallationRoleV1::ProductionClientExecutable,
             pressure_client.to_path_buf(),
         ),
         (
@@ -896,7 +1013,7 @@ fn runner_service_unit(
         )
     };
     format!(
-        "[Unit]\nDescription=Ota V3 protected-launcher pressure client\nAfter=ota-authority-launcher.socket\nRequires=ota-authority-launcher.socket\n\n[Service]\nType=oneshot\nUser={}\nGroup={}\nSupplementaryGroups=\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nRestrictSUIDSGID=yes\nRestrictNamespaces=yes\nRestrictAddressFamilies=AF_UNIX\nSyslogIdentifier=ota-authority-pressure-client\nWorkingDirectory={}\nExecStart={} {}\n",
+        "[Unit]\nDescription=Ota V3 protected-launcher pressure client\nAfter=ota-authority-launcher.socket\nRequires=ota-authority-launcher.socket\nConditionPathExists={RUNNER_PUBLICATION_GATE}\n\n[Service]\nType=oneshot\nUser={}\nGroup={}\nSupplementaryGroups=\nNoNewPrivileges=yes\nCapabilityBoundingSet=\nAmbientCapabilities=\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nRestrictSUIDSGID=yes\nRestrictNamespaces=yes\nRestrictAddressFamilies=AF_UNIX\nSyslogIdentifier=ota-authority-pressure-client\nWorkingDirectory={}\nExecStart={} {}\n",
         account.name,
         account.group,
         repository.display(),
@@ -1067,6 +1184,458 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
+fn validate_git_revision(value: &str) -> Result<(), String> {
+    if value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err(String::from(
+            "pressure source revisions must be exact lowercase Git commit identities",
+        ))
+    }
+}
+
+fn build_source_revisions(ota_binary: &Path) -> Result<(String, String, String), String> {
+    let protocol = option_env!("OTA_PROTOCOL_BUILD_REVISION")
+        .ok_or_else(|| String::from("Protocol build revision is unavailable"))?
+        .to_owned();
+    let launcher = option_env!("OTA_LAUNCHER_BUILD_COMMIT")
+        .ok_or_else(|| String::from("Launcher build revision is unavailable"))?
+        .to_owned();
+    if option_env!("OTA_LAUNCHER_BUILD_DIRTY").is_some() {
+        return Err(String::from("Launcher source build is dirty"));
+    }
+    validate_git_revision(&protocol)?;
+    validate_git_revision(&launcher)?;
+
+    let output = Command::new(ota_binary)
+        .args(["--version", "--json"])
+        .output()
+        .map_err(|_| String::from("installed Ota build identity is unavailable"))?;
+    if !output.status.success() {
+        return Err(String::from("installed Ota build identity refused"));
+    }
+    let identity: OtaBuildIdentity = serde_json::from_slice(&output.stdout)
+        .map_err(|_| String::from("installed Ota build identity is malformed"))?;
+    let core = identity
+        .commit
+        .filter(|_| identity.source_build && !identity.dirty)
+        .ok_or_else(|| String::from("installed Ota must be a clean source build"))?;
+    validate_git_revision(&core)?;
+    Ok((protocol, core, launcher))
+}
+
+fn observe_prepared_provisioning_precondition(
+    job: &Account,
+    execution: &Account,
+    runner_binary: &Path,
+) -> Result<PreparedProvisioningObservationV1, String> {
+    protected_root_file(Path::new(RUNNER_SERVICE), false)?;
+    verify_root_protected_chain(Path::new(RUNNER_SERVICE))?;
+    protected_root_file(Path::new(RUNNER_SERVICE_DROP_IN), false)?;
+    verify_root_protected_chain(Path::new(RUNNER_SERVICE_DROP_IN))?;
+    let expected_drop_ins = service_drop_in_paths(RUNNER_SERVICE_DROP_IN);
+    verify_runner_publication_gate(Path::new(RUNNER_SERVICE), expected_drop_ins.as_slice())?;
+
+    let properties = systemctl_properties(
+        "ota-authority-pressure-runner.service",
+        &[
+            "LoadState",
+            "ActiveState",
+            "SubState",
+            "MainPID",
+            "ControlGroup",
+            "FragmentPath",
+            "DropInPaths",
+        ],
+    )?;
+    let load_state = properties
+        .get("LoadState")
+        .ok_or_else(|| String::from("prepared runner load state is unavailable"))?;
+    let active_state = properties
+        .get("ActiveState")
+        .ok_or_else(|| String::from("prepared runner active state is unavailable"))?;
+    let sub_state = properties
+        .get("SubState")
+        .ok_or_else(|| String::from("prepared runner substate is unavailable"))?;
+    let main_pid = properties
+        .get("MainPID")
+        .ok_or_else(|| String::from("prepared runner main PID is unavailable"))?
+        .parse::<u32>()
+        .map_err(|_| String::from("prepared runner main PID is malformed"))?;
+    let control_group = properties
+        .get("ControlGroup")
+        .ok_or_else(|| String::from("prepared runner control group is unavailable"))?;
+    let fragment_path = properties
+        .get("FragmentPath")
+        .ok_or_else(|| String::from("prepared runner fragment path is unavailable"))?;
+    let mut loaded_drop_ins = properties
+        .get("DropInPaths")
+        .ok_or_else(|| String::from("prepared runner drop-in paths are unavailable"))?
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    loaded_drop_ins.sort();
+    let mut expected_drop_in_paths = expected_drop_ins
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    expected_drop_in_paths.sort();
+    if fragment_path != RUNNER_SERVICE || loaded_drop_ins != expected_drop_in_paths {
+        return Err(String::from(
+            "prepared runner service must use the exact fragment and drop-in set",
+        ));
+    }
+    if load_state != "loaded"
+        || active_state != "inactive"
+        || sub_state != "dead"
+        || main_pid != 0
+        || !control_group.is_empty()
+    {
+        return Err(String::from(
+            "prepared runner service must be loaded, inactive, dead, and process-free",
+        ));
+    }
+
+    let live_principal_processes = live_processes_for_uids(&[job.uid, execution.uid])?;
+    if !live_principal_processes.is_empty() {
+        return Err(String::from(
+            "prepared provisioning requires no live job or execution-principal process",
+        ));
+    }
+    let authority_state_paths_checked = managed_authority_state_paths()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    verify_managed_authority_ancestor_chains(authority_state_paths_checked.as_slice())?;
+    require_managed_authority_state_absent(authority_state_paths_checked.as_slice())?;
+
+    let observed_at = OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .map_err(|_| String::from("prepared provisioning observation clock unavailable"))?
+        .format(&Rfc3339)
+        .map_err(|_| String::from("prepared provisioning observation time unavailable"))?;
+    let mut observation = PreparedProvisioningObservationV1 {
+        schema_version: 1,
+        identity: String::new(),
+        observed_at,
+        runner_service_unit: String::from("ota-authority-pressure-runner.service"),
+        runner_active_state: active_state.clone(),
+        runner_sub_state: sub_state.clone(),
+        runner_main_pid: main_pid,
+        runner_control_group: control_group.clone(),
+        runner_service_fragment_path: fragment_path.clone(),
+        runner_service_drop_in_paths: loaded_drop_ins,
+        runner_executable_identity: sha256_file(runner_binary)?,
+        runner_service_identity: sha256_file(Path::new(RUNNER_SERVICE))?,
+        runner_drop_in_identity: sha256_file(Path::new(RUNNER_SERVICE_DROP_IN))?,
+        job_uid: job.uid,
+        execution_uid: execution.uid,
+        live_principal_processes,
+        authority_state_posture: String::from("fresh_managed_authority_state"),
+        authority_state_ancestor_posture: String::from(
+            "root_owned_non_writable_directory_chain_without_aliases",
+        ),
+        authority_state_paths_checked,
+    };
+    observation.identity = prepared_provisioning_observation_identity(&observation)?;
+    Ok(observation)
+}
+
+fn verify_runner_publication_gate(service: &Path, drop_ins: &[PathBuf]) -> Result<(), String> {
+    let expected = format!("ConditionPathExists={RUNNER_PUBLICATION_GATE}");
+    let mut conditions = Vec::new();
+    for path in std::iter::once(service).chain(drop_ins.iter().map(PathBuf::as_path)) {
+        let content = fs::read_to_string(path)
+            .map_err(|_| String::from("prepared runner unit configuration is unreadable"))?;
+        conditions.extend(
+            content
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("ConditionPathExists="))
+                .map(str::to_owned),
+        );
+    }
+    if conditions != [expected] {
+        return Err(String::from(
+            "prepared runner service must use the exact installation-evidence publication gate",
+        ));
+    }
+    Ok(())
+}
+
+fn prepared_provisioning_observation_identity(
+    observation: &PreparedProvisioningObservationV1,
+) -> Result<String, String> {
+    let mut canonical = observation.clone();
+    canonical.identity.clear();
+    message_identity(
+        PREPARED_PROVISIONING_OBSERVATION_IDENTITY_DOMAIN_V1,
+        &canonical,
+    )
+    .map_err(|_| String::from("prepared provisioning observation identity unavailable"))
+}
+
+fn systemctl_properties(unit: &str, names: &[&str]) -> Result<BTreeMap<String, String>, String> {
+    let mut command = Command::new(SYSTEMCTL);
+    command.arg("show").arg(unit).arg("--no-pager");
+    for name in names {
+        command.arg(format!("--property={name}"));
+    }
+    let output = command
+        .output()
+        .map_err(|_| String::from("prepared runner service observation unavailable"))?;
+    if !output.status.success() {
+        return Err(String::from("prepared runner service observation refused"));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| String::from("prepared runner service observation malformed"))?
+        .lines()
+        .map(|line| {
+            let (name, value) = line
+                .split_once('=')
+                .ok_or_else(|| String::from("prepared runner service property malformed"))?;
+            Ok((name.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+fn live_processes_for_uids(uids: &[u32]) -> Result<Vec<u32>, String> {
+    let mut processes = Vec::new();
+    for entry in fs::read_dir("/proc")
+        .map_err(|_| String::from("process inventory unavailable before provisioning"))?
+    {
+        let entry = entry.map_err(|_| String::from("process inventory changed unexpectedly"))?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let status = match fs::read_to_string(entry.path().join("status")) {
+            Ok(status) => status,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err(String::from(
+                    "process identity unavailable before provisioning",
+                ));
+            }
+        };
+        let uid = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or_else(|| String::from("process identity malformed before provisioning"))?;
+        if uids.contains(&uid) {
+            processes.push(pid);
+        }
+    }
+    processes.sort_unstable();
+    Ok(processes)
+}
+
+fn managed_authority_state_paths() -> Vec<&'static str> {
+    vec![
+        LAUNCHER_CONFIG,
+        ATTESTOR_CONFIG,
+        VERIFIER_SET,
+        INSTALLATION_MANIFEST,
+        PUBLIC_INSTALLATION_EVIDENCE_ROOT,
+        BROKER_STORE,
+        SIGNING_KEY,
+        BROKER_SIGNING_KEY,
+        BROKER_STATE,
+        BROKER_SCENARIO,
+        ISSUANCE_STATE,
+        LAUNCHER_STATE,
+        LAUNCHER_RUNTIME,
+        LAUNCHER_SOCKET,
+        ATTESTOR_SOCKET,
+        BROKER_PROXY_SOCKET,
+        HISTORY_SOCKET_PATH,
+        LAUNCHER_SERVICE,
+        LAUNCHER_SERVICE_DROP_IN,
+        LAUNCHER_SOCKET_UNIT,
+        ATTESTOR_SERVICE,
+        ATTESTOR_SERVICE_DROP_IN,
+        ATTESTOR_SOCKET_UNIT,
+        BROKER_PROXY_SERVICE,
+        BROKER_PROXY_SOCKET_UNIT,
+        HISTORY_BINDING_PATH,
+        HISTORY_BLOB_ROOT,
+        HISTORY_CATALOG_ROOT,
+        HISTORY_SERVICE,
+        HISTORY_SOCKET_UNIT,
+        INVOCATION_SLICE,
+        POLKIT_RULE,
+    ]
+}
+
+fn require_managed_authority_state_absent(paths: &[String]) -> Result<(), String> {
+    for path in paths {
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                return Err(String::from(
+                    "prepared provisioning requires fresh managed authority state",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(String::from(
+                    "prepared provisioning could not establish managed authority state absence",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_managed_authority_ancestor_chains(paths: &[String]) -> Result<(), String> {
+    for path in paths {
+        verify_existing_ancestor_chain_no_follow_from(Path::new("/"), Path::new(path), 0)?;
+    }
+    Ok(())
+}
+
+fn verify_existing_ancestor_chain_no_follow_from(
+    trusted_root: &Path,
+    path: &Path,
+    owner_uid: u32,
+) -> Result<(), String> {
+    if !trusted_root.is_absolute() || !path.is_absolute() || !path.starts_with(trusted_root) {
+        return Err(String::from(
+            "managed authority path is outside its trusted root",
+        ));
+    }
+    let relative = path
+        .strip_prefix(trusted_root)
+        .map_err(|_| String::from("managed authority path is outside its trusted root"))?;
+    let mut current = trusted_root.to_path_buf();
+    let mut candidates = vec![current.clone()];
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(component) => current.push(component),
+            _ => {
+                return Err(String::from(
+                    "managed authority path contains a non-canonical component",
+                ));
+            }
+        }
+        candidates.push(current.clone());
+    }
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        let metadata = match fs::symlink_metadata(candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => {
+                return Err(String::from(
+                    "managed authority ancestor metadata is unavailable",
+                ));
+            }
+        };
+        let is_final = index + 1 == candidates.len();
+        if metadata.file_type().is_symlink()
+            || (!is_final && !metadata.is_dir())
+            || metadata.uid() != owner_uid
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(String::from(
+                "managed authority ancestor chain is writable or aliased",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn protected_repository_tree(
+    path: &Path,
+    job: &Account,
+    execution: &Account,
+) -> Result<PathBuf, String> {
+    let root = protected_directory(path, Some(execution.uid))?;
+    let mut pending = vec![root.clone()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|_| String::from("pressure repository entry is unavailable"))?;
+        if metadata.file_type().is_symlink()
+            || metadata.uid() != execution.uid
+            || metadata.gid() != execution.gid
+            || metadata.mode() & 0o022 != 0
+            || metadata.uid() == job.uid
+            || metadata.gid() == job.gid
+        {
+            return Err(String::from(
+                "pressure repository tree is writable or aliased for the job principal",
+            ));
+        }
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&path)
+                .map_err(|_| String::from("pressure repository tree is unreadable"))?
+            {
+                pending.push(
+                    entry
+                        .map_err(|_| String::from("pressure repository tree is unreadable"))?
+                        .path(),
+                );
+            }
+        } else if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(String::from(
+                "pressure repository tree contains an unsupported entry",
+            ));
+        }
+    }
+    Ok(root)
+}
+
+fn protected_root_file(path: &Path, executable: bool) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| String::from("protected root file is unavailable"))?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o022 != 0
+        || (executable && metadata.mode() & 0o111 == 0)
+    {
+        return Err(String::from("protected root file identity is invalid"));
+    }
+    Ok(())
+}
+
+fn verify_root_protected_chain(path: &Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(String::from("protected path must be absolute"));
+    }
+    let mut observed = PathBuf::from("/");
+    for component in path.components().filter_map(|component| match component {
+        std::path::Component::Normal(value) => Some(value),
+        _ => None,
+    }) {
+        observed.push(component);
+        let metadata = fs::symlink_metadata(&observed)
+            .map_err(|_| String::from("protected path ownership chain is unavailable"))?;
+        if metadata.file_type().is_symlink() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0
+        {
+            return Err(String::from("protected path ownership chain is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn public_installation_evidence_identity(
+    evidence: &PublicInstallationEvidenceV1,
+) -> Result<String, String> {
+    let mut canonical = evidence.clone();
+    canonical.identity.clear();
+    message_identity(PUBLIC_INSTALLATION_EVIDENCE_IDENTITY_DOMAIN_V1, &canonical)
+        .map_err(|_| String::from("public installation evidence identity unavailable"))
+}
+
 fn random_seed() -> Result<[u8; 32], String> {
     let mut seed = [0_u8; 32];
     getrandom::getrandom(&mut seed).map_err(|_| String::from("pressure entropy unavailable"))?;
@@ -1097,6 +1666,220 @@ fn run_systemctl(arguments: &[&str]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn pressure_source_revisions_are_exact_commit_identities() {
+        assert!(validate_git_revision(&"a".repeat(40)).is_ok());
+        assert!(validate_git_revision(&"A".repeat(40)).is_err());
+        assert!(validate_git_revision(&"a".repeat(39)).is_err());
+        assert!(validate_git_revision("not-a-revision").is_err());
+    }
+
+    #[test]
+    fn public_installation_evidence_binds_every_source_revision() {
+        let mut evidence = PublicInstallationEvidenceV1 {
+            schema_version: 1,
+            identity: String::new(),
+            protocol_source_revision: "1".repeat(40),
+            core_source_revision: "2".repeat(40),
+            launcher_source_revision: "3".repeat(40),
+            prepared_provisioning_observation: None,
+            installation_manifest: ProtectedInstallationManifestV1 {
+                schema_version: 1,
+                identity: format!("sha256:{}", "4".repeat(64)),
+                launcher_configuration_identity: format!("sha256:{}", "5".repeat(64)),
+                launcher_profile_identity: format!("sha256:{}", "6".repeat(64)),
+                job_principal_profile_identity: format!("sha256:{}", "7".repeat(64)),
+                files: Vec::new(),
+            },
+        };
+        let identity = public_installation_evidence_identity(&evidence).expect("public identity");
+        evidence.identity = identity.clone();
+        assert_eq!(
+            public_installation_evidence_identity(&evidence).expect("rederived public identity"),
+            identity
+        );
+        evidence.launcher_source_revision = "8".repeat(40);
+        assert_ne!(
+            public_installation_evidence_identity(&evidence).expect("changed public identity"),
+            identity
+        );
+    }
+
+    #[test]
+    fn prepared_runner_requires_exact_publication_gate() {
+        let directory = tempfile::tempdir().expect("service directory");
+        let service = directory.path().join("runner.service");
+        fs::write(
+            &service,
+            format!("[Unit]\nConditionPathExists={RUNNER_PUBLICATION_GATE}\n"),
+        )
+        .expect("service");
+        assert!(verify_runner_publication_gate(&service, &[]).is_ok());
+
+        fs::write(
+            &service,
+            "[Unit]\nConditionPathExists=/tmp/caller-controlled\n",
+        )
+        .expect("wrong service");
+        assert!(verify_runner_publication_gate(&service, &[]).is_err());
+
+        fs::write(
+            &service,
+            format!(
+                "[Unit]\nConditionPathExists={RUNNER_PUBLICATION_GATE}\nConditionPathExists=/tmp/extra\n"
+            ),
+        )
+        .expect("ambiguous service");
+        assert!(verify_runner_publication_gate(&service, &[]).is_err());
+    }
+
+    #[test]
+    fn prepared_provisioning_observation_identity_binds_complete_state() {
+        let mut observation = PreparedProvisioningObservationV1 {
+            schema_version: 1,
+            identity: String::new(),
+            observed_at: String::from("2026-08-15T00:00:00Z"),
+            runner_service_unit: String::from("ota-authority-pressure-runner.service"),
+            runner_active_state: String::from("inactive"),
+            runner_sub_state: String::from("dead"),
+            runner_main_pid: 0,
+            runner_control_group: String::new(),
+            runner_service_fragment_path: String::from(RUNNER_SERVICE),
+            runner_service_drop_in_paths: vec![String::from(RUNNER_SERVICE_DROP_IN)],
+            runner_executable_identity: format!("sha256:{}", "1".repeat(64)),
+            runner_service_identity: format!("sha256:{}", "2".repeat(64)),
+            runner_drop_in_identity: format!("sha256:{}", "3".repeat(64)),
+            job_uid: 1001,
+            execution_uid: 1002,
+            live_principal_processes: Vec::new(),
+            authority_state_posture: String::from("fresh_managed_authority_state"),
+            authority_state_ancestor_posture: String::from(
+                "root_owned_non_writable_directory_chain_without_aliases",
+            ),
+            authority_state_paths_checked: managed_authority_state_paths()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        };
+        let identity =
+            prepared_provisioning_observation_identity(&observation).expect("observation identity");
+        observation.identity = identity.clone();
+        assert_eq!(
+            prepared_provisioning_observation_identity(&observation)
+                .expect("rederived observation identity"),
+            identity
+        );
+        observation.authority_state_posture = String::from("existing_state");
+        assert_ne!(
+            prepared_provisioning_observation_identity(&observation)
+                .expect("changed observation identity"),
+            identity
+        );
+    }
+
+    #[test]
+    fn managed_authority_state_absence_rejects_dangling_symlinks() {
+        let directory = tempfile::tempdir().expect("state directory");
+        let state = directory.path().join("managed-state");
+        symlink(directory.path().join("missing-target"), &state).expect("dangling state alias");
+        assert!(
+            require_managed_authority_state_absent(&[state.to_string_lossy().into_owned()])
+                .is_err()
+        );
+
+        fs::remove_file(&state).expect("remove alias");
+        assert!(
+            require_managed_authority_state_absent(&[state.to_string_lossy().into_owned()]).is_ok()
+        );
+    }
+
+    #[test]
+    fn managed_authority_ancestor_chain_rejects_symlinked_parent() {
+        let directory = tempfile::tempdir().expect("trusted root");
+        let metadata = fs::symlink_metadata(directory.path()).expect("trusted root metadata");
+        let redirected = directory.path().join("redirected");
+        fs::create_dir(&redirected).expect("redirect target");
+        let alias = directory.path().join("authority");
+        symlink(&redirected, &alias).expect("authority parent alias");
+        let managed = alias.join("state.json");
+        assert!(
+            verify_existing_ancestor_chain_no_follow_from(
+                directory.path(),
+                &managed,
+                metadata.uid(),
+            )
+            .is_err()
+        );
+
+        fs::remove_file(&alias).expect("remove alias");
+        fs::create_dir(&alias).expect("authority parent");
+        assert!(
+            verify_existing_ancestor_chain_no_follow_from(
+                directory.path(),
+                &managed,
+                metadata.uid(),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn repository_truth_rejects_recursive_write_and_alias_surfaces() {
+        let root = tempfile::tempdir().expect("repository");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).expect("root mode");
+        let contract = root.path().join("ota.yaml");
+        fs::write(&contract, "version: 1\n").expect("contract");
+        fs::set_permissions(&contract, fs::Permissions::from_mode(0o644)).expect("contract mode");
+        let metadata = fs::metadata(root.path()).expect("metadata");
+        let execution = Account {
+            name: String::from("execution"),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            group: String::from("execution"),
+        };
+        let job = Account {
+            name: String::from("job"),
+            uid: metadata.uid().saturating_add(1),
+            gid: metadata.gid().saturating_add(1),
+            group: String::from("job"),
+        };
+        assert!(protected_repository_tree(root.path(), &job, &execution).is_ok());
+
+        fs::set_permissions(&contract, fs::Permissions::from_mode(0o666)).expect("writable mode");
+        assert!(protected_repository_tree(root.path(), &job, &execution).is_err());
+        fs::set_permissions(&contract, fs::Permissions::from_mode(0o644)).expect("restore mode");
+
+        let alias = root.path().join("alias.yaml");
+        fs::hard_link(&contract, &alias).expect("hardlink");
+        assert!(protected_repository_tree(root.path(), &job, &execution).is_err());
+        fs::remove_file(&alias).expect("remove hardlink");
+
+        let symlink_path = root.path().join("linked.yaml");
+        symlink(&contract, &symlink_path).expect("symlink");
+        assert!(protected_repository_tree(root.path(), &job, &execution).is_err());
+    }
+
+    #[test]
+    fn prepared_runner_has_distinct_manifest_roles() {
+        let paths = protected_role_paths(
+            Path::new("/launcher"),
+            Path::new("/attestor"),
+            Path::new("/broker"),
+            Path::new("/ota"),
+            Path::new("/production-client"),
+            Path::new("/github-runner"),
+        );
+        assert!(paths.contains(&(
+            ProtectedInstallationRoleV1::JobRunnerExecutable,
+            PathBuf::from("/github-runner"),
+        )));
+        assert!(paths.contains(&(
+            ProtectedInstallationRoleV1::ProductionClientExecutable,
+            PathBuf::from("/production-client"),
+        )));
+    }
 
     #[test]
     fn generated_units_preserve_the_protected_selected_execution_boundary() {

@@ -351,6 +351,19 @@ unchanged refusal worktrees without private signing material. The workflow contr
 the authority stack, so independently administered launcher separation and provider attestation
 remain open.
 
+The next pressure lane separates those owners. An administrator prepares the host and registers a
+protected self-hosted runner; the repository workflow then invokes only the fixed production
+client and protected-history source. The runner itself must be the exact systemd service admitted
+by the closed profile; a sibling GitHub runner service cannot inherit that authority. Provisioning
+also refuses before its first authority write unless that runner is stopped, both selected
+principals are process-free, and the managed authority namespace is fresh. The runner's exact
+systemd unit remains gated on final protected installation-evidence publication throughout
+provisioning. See
+[Independently Administered Systemd Pressure](docs/independently-administered-pressure.md). The
+consumer-only workflow and runbook are candidate infrastructure until an immutable run is retained;
+they do not yet close independently administered separation, reboot recovery, or provider
+attestation.
+
 Immutable Linux/x64 PID 1
 [run 31758094819](https://github.com/ota-run/authority-launcher/actions/runs/31758094819)
 proves this pressure-only attachment and recovery path against Protocol

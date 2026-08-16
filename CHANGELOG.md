@@ -26,6 +26,22 @@
 
 ## Unreleased
 
+- Add a candidate independently administered pressure lane. Root provisioning now exposes a
+  root-owned non-secret installation-evidence copy with a protected parent chain, protected history
+  admits the hardened job principal rather than relying on root impersonation, and admission binds
+  the actual administrator-installed GitHub runner unit. Source revisions are artifact-derived and
+  repository immutability is checked recursively. A workflow substring test remains bounded drift
+  detection rather than an enforcement claim. Prepared-runner provisioning refuses before its
+  first authority write unless the canonical runner is stopped, both principals are process-free,
+  and the complete managed authority namespace is fresh. The canonical runner is gated on the
+  final public-evidence file, so it cannot start until provisioning has completed; public evidence
+  binds the pre-mutation observation. Fresh-state admission uses fail-closed filesystem metadata
+  checks, includes the protected-history runtime socket, and rejects dangling aliases.
+  Every existing ancestor of every managed path must also be a root-owned, non-writable directory
+  chain without symlinks before mutation begins.
+  The lane remains unproved until an administrator-prepared Linux/x64 PID 1 runner executes it;
+  separate administrator-driven reboot recovery and provider attestation remain open.
+
 - Prove the installed production systemd client and protected receipt-history source in immutable
   Linux/x64 PID 1 run
   [31823037642](https://github.com/ota-run/authority-launcher/actions/runs/31823037642)
