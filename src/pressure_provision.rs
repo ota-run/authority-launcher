@@ -117,8 +117,8 @@ const ORBSTACK_GLOBAL_SERVICE_DROP_IN: &str = "/run/systemd/system/service.d/zzz
 const INVOCATION_SLICE: &str = "/etc/systemd/system/ota-authority-invocations.slice";
 const NON_LOGIN_SHELL: &str = "/usr/sbin/nologin";
 const PRESSURE_BROKER_ORIGIN: &str = "https://pressure.invalid";
-// Cover the one-second approval window, the 30-second lease ceiling, and scheduling margin.
-const ATTESTATION_VALIDITY_SECONDS: u64 = 60;
+// Cover approval, the lease ceiling, and bounded post-reboot finalization recovery.
+const ATTESTATION_VALIDITY_SECONDS: u64 = 180;
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const PKCHECK: &str = "/usr/bin/pkcheck";
 const POLKIT_RULE: &str = "/etc/polkit-1/rules.d/00-ota-authority-deny.rules";

@@ -42,7 +42,9 @@
   observation. The controller performs its protected-history child transition in one ordered
   root boundary, clearing supplementary groups before dropping GID and UID and setting
   `no_new_privs`, so the post-reboot query cannot fail during process creation. Public recovery
-  records are create-new, root-owned, non-secret evidence; the final
+  pressure uses the plan's bounded 180-second attestation window so a normal reboot can issue its
+  transaction-bound finalization without weakening Core's upper-bound verification. Public
+  recovery records are create-new, root-owned, non-secret evidence; the final
   consumer workflow has no checkout, elevation, service control, fault control, or credential
   access. Immutable Linux/x64 PID 1 execution remains required before this gate is claimed green.
 
