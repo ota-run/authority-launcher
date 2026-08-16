@@ -24,6 +24,8 @@ const WORKFLOW: &str =
     include_str!("../.github/workflows/systemd-v3-independently-administered.yml");
 const RECOVERY_WORKFLOW: &str =
     include_str!("../.github/workflows/systemd-v3-independently-administered-recovery.yml");
+const RECOVERY_TRIGGER_WORKFLOW: &str =
+    include_str!("../.github/workflows/systemd-v3-independently-administered-recovery-trigger.yml");
 
 #[test]
 fn independent_pressure_workflow_retains_a_narrow_drift_guard() {
@@ -108,4 +110,41 @@ fn independent_recovery_workflow_is_consumer_only() {
     assert!(RECOVERY_WORKFLOW.contains("--source systemd_protected_launcher"));
     assert!(RECOVERY_WORKFLOW.contains(".summary.archive_count == 3"));
     assert!(RECOVERY_WORKFLOW.contains(".summary.invalid_archive_count == 0"));
+}
+
+#[test]
+fn independent_recovery_trigger_is_runner_owned_and_non_administrative() {
+    for forbidden in [
+        "actions/checkout",
+        "rust-toolchain",
+        "cargo ",
+        "sudo",
+        "systemctl",
+        "shutdown -",
+        "chmod",
+        "chown",
+        "secrets.",
+        "tee /etc/",
+        "tee /var/lib/",
+        "authority-admin-pressure",
+        "pressure-exit-after",
+        "recovery-controller",
+    ] {
+        assert!(
+            !RECOVERY_TRIGGER_WORKFLOW.contains(forbidden),
+            "recovery trigger contains administrator operation: {forbidden}"
+        );
+    }
+
+    assert!(RECOVERY_TRIGGER_WORKFLOW.contains("workflow_dispatch:"));
+    assert!(!RECOVERY_TRIGGER_WORKFLOW.contains("pull_request:"));
+    assert!(RECOVERY_TRIGGER_WORKFLOW.contains("ota-authority-independent"));
+    assert!(RECOVERY_TRIGGER_WORKFLOW.contains("ota-authority-systemd-client"));
+    assert!(RECOVERY_TRIGGER_WORKFLOW.contains("output_incomplete"));
+    assert!(
+        RECOVERY_TRIGGER_WORKFLOW.contains("execution_started")
+            && RECOVERY_TRIGGER_WORKFLOW.contains("is not True")
+    );
+    assert!(RECOVERY_TRIGGER_WORKFLOW.contains("expected_previous_execution_count"));
+    assert!(RECOVERY_TRIGGER_WORKFLOW.contains("ota-authority-pressure-runner.service"));
 }

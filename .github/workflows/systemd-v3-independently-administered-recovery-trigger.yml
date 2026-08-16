@@ -1,0 +1,95 @@
+#                █████
+#               ░░███
+#       ██████  ███████    ██████
+#      ███░░███░░░███░    ░░░░░███
+#     ░███ ░███  ░███      ███████
+#     ░███ ░███  ░███ ███ ███░░███
+#     ░░██████   ░░█████ ░░████████
+#      ░░░░░░     ░░░░░   ░░░░░░░░
+#
+#   Copyright (C) 2026 — 2026, Ota. All Rights Reserved.
+#
+#   DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+#
+#   Licensed under the Apache License, Version 2.0. See LICENSE for the full license text.
+#   You may not use this file except in compliance with the License.
+#   Unless required by applicable law or agreed to in writing, software distributed under the
+#   License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+#   either express or implied. See the License for the specific language governing permissions
+#   and limitations under the License.
+#
+#   If you need additional information or have any questions, please email: os@ota.run
+
+name: Systemd V3 administrator recovery trigger
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_previous_execution_count:
+        description: Exact successful executions before this administrator-prepared fault
+        required: true
+        type: choice
+        options:
+          - "0"
+          - "1"
+          - "2"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: systemd-v3-administrator-recovery-trigger
+  cancel-in-progress: false
+
+jobs:
+  invoke-prepared-fault:
+    name: Invoke the administrator-prepared fault once
+    runs-on: [self-hosted, Linux, X64, ota-authority-independent]
+    timeout-minutes: 10
+    env:
+      AUTHORITY_ID: platform-release-authority
+      CLIENT: /usr/lib/ota-authority/bin/ota-authority-systemd-client
+      PRESSURE_REPOSITORY: /srv/ota-v3-pressure
+      EXPECTED_PREVIOUS_EXECUTION_COUNT: ${{ inputs.expected_previous_execution_count }}
+    steps:
+      - name: Invoke the frozen production-client request
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          test "$(uname -m)" = x86_64
+          test "$(ps -p 1 -o comm=)" = systemd
+          grep -Fxq '0::/system.slice/ota-authority-pressure-runner.service' /proc/self/cgroup
+
+          sentinel="$PRESSURE_REPOSITORY/selected-work-executed"
+          previous=0
+          if test -f "$sentinel"; then
+            previous="$(grep -c '^executed$' "$sentinel")"
+          fi
+          test "$previous" -eq "$EXPECTED_PREVIOUS_EXECUTION_COUNT"
+
+          result="$RUNNER_TEMP/administrator-recovery-trigger.json"
+          set +e
+          "$CLIENT" --json \
+            --authority-id "$AUTHORITY_ID" \
+            --repository "$PRESSURE_REPOSITORY" -- \
+            run governed --grant "$AUTHORITY_ID" --receipt >"$result"
+          status=$?
+          set -e
+          cat "$result"
+          test "$status" -eq 75
+          python3 - "$result" <<'PY'
+          import json
+          import sys
+
+          evidence = json.load(open(sys.argv[1], encoding="utf-8"))
+          if (
+              evidence.get("ok") is not False
+              or evidence.get("kind") != "systemd_protected_launcher_client_refusal"
+              or evidence.get("reason") != "output_incomplete"
+              or evidence.get("execution_started") is not True
+          ):
+              raise SystemExit("the production client did not stop at the prepared recovery boundary")
+          PY
+
+          test -f "$sentinel"
+          test "$(grep -c '^executed$' "$sentinel")" -eq "$((previous + 1))"

@@ -29,14 +29,14 @@
 - Add the pressure-only administrator recovery controller and consumer workflow for the remaining
   independently administered systemd reboot gate. The controller requires the prepared repository
   runner to be disabled and stopped, arms only fixed root-owned one-shot completion,
-  finalization-intent, or terminal-recorded faults, drops to the exact job principal, and prevents
-  the production client from reconnecting before an administrator reboot. Recovery binds the same
-  invocation, installation, immutable Core/Launcher/Protocol revisions, controller binary, boot
-  transition, repository manifest, cumulative selected-execution count, protected history, and
-  exact cleanup. The constrained recovery client cannot acknowledge a terminal until the root
-  controller has fsynced the exact observed result; restart then reconciles either the replayable
-  Launcher journal or that durable observation. Public recovery records are create-new,
-  root-owned, non-secret evidence; the
+  finalization-intent, or terminal-recorded faults, but never impersonates the bound runner
+  posture. A separate no-checkout workflow invokes the frozen production-client request from the
+  exact prepared runner cgroup. Recovery binds the same invocation, installation, immutable
+  Core/Launcher/Protocol revisions, controller binary, boot transition, repository manifest,
+  cumulative selected-execution count, protected history, and exact cleanup. The constrained
+  recovery client cannot acknowledge a terminal until the root controller has fsynced the exact
+  observed result; restart then reconciles either the replayable Launcher journal or that durable
+  observation. Public recovery records are create-new, root-owned, non-secret evidence; the final
   consumer workflow has no checkout, elevation, service control, fault control, or credential
   access. Immutable Linux/x64 PID 1 execution remains required before this gate is claimed green.
 

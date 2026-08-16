@@ -211,12 +211,16 @@ one-shot fault markers, retain one fixed invocation, require a host reboot, and 
 non-secret evidence after recovery. Its embedded clean Launcher and linked Protocol revisions must
 exactly match the protected installation evidence or it refuses before arming a fault.
 
-The controller persists a `prepared` state before arming a marker, then atomically advances it to
-`fault_observed` only after the expected protected launcher checkpoint exists. If `arm` fails before
-the marker is consumed, inspect `status` and use `abort-prepared`. That operation removes the
-unconsumed marker and pending state only when the runner remains stopped, both principals have no
-live processes, no launcher journal or scope exists, selected work did not advance, and repository
-truth is unchanged. It refuses instead of cleaning up when partial execution is possible.
+The controller persists a `prepared` state before arming a marker. It never impersonates the job
+principal or invokes Ota from the administrator's process tree: that would not satisfy the bound
+runner-service profile. After `arm`, a dedicated no-checkout workflow invokes the exact production
+client from the prepared runner cgroup. The administrator then stops and disables the runner;
+`reboot` advances the state to `fault_observed` only after the expected protected launcher
+checkpoint exists. If the runner invocation has not consumed the marker, inspect `status` and use
+`abort-prepared`. That operation removes the unconsumed marker and pending state only when the
+runner remains stopped, both principals have no live processes, no launcher journal or scope
+exists, selected work did not advance, and repository truth is unchanged. It refuses instead of
+cleaning up when partial execution is possible.
 
 Before the first case, stop and disable the repository runner so no workflow can race the
 administrator:
@@ -238,25 +242,40 @@ sudo /usr/lib/ota-authority/bin/ota-authority-systemd-recovery-controller arm \
   --expected-execution-count 1 \
   --expected-archive-count 1 -- \
   run governed --grant platform-release-authority --receipt
+
+# Queue the exact trigger while the runner is still stopped, then allow that one job to run.
+gh workflow run systemd-v3-independently-administered-recovery-trigger.yml \
+  --repo ota-run/authority-launcher \
+  -f expected_previous_execution_count=0
+sudo systemctl enable --now ota-authority-pressure-runner.service
+
+# After the trigger reports the expected output_incomplete boundary:
+sudo systemctl disable --now ota-authority-pressure-runner.service
 sudo /usr/lib/ota-authority/bin/ota-authority-systemd-recovery-controller reboot
 
 # Reconnect as the administrator only after the host returns.
 sudo /usr/lib/ota-authority/bin/ota-authority-systemd-recovery-controller verify
 ```
 
-Repeat with `--fault finalization-intent` and expected counts `2`, then
-`--fault terminal-recorded` and expected counts `3`. Each `arm` operation:
+Repeat with `--fault finalization-intent`, expected counts `2`, and trigger input `1`; then use
+`--fault terminal-recorded`, expected counts `3`, and trigger input `2`. Each `arm` operation:
 
 - refuses unless the canonical repository runner is disabled, inactive, dead, and has no main PID;
 - creates exactly one fixed root-owned one-shot marker;
-- drops to the configured job UID/GID with no supplementary groups or new privileges;
-- invokes the installed production client with automatic reconnect disabled;
-- requires exactly one protected active-slot or finalization record before advancing the durable
-  controller state to `fault_observed`; and
+- never launches a job-principal process or weakens the bound runner-service profile;
 - binds the installation identity, exact Core/Launcher/Protocol revisions, controller binary,
   boot ID, invocation identity, repository manifest, and expected execution/archive counts.
 
-Each `verify` operation requires a changed kernel boot ID, unchanged installation/controller
+The trigger workflow has no checkout, authority-state, fault-marker, service-control, reboot, or
+root capability. It verifies its own process is inside the exact prepared runner cgroup, invokes
+only the frozen production-client request with automatic reconnect disabled, requires typed
+`output_incomplete` after execution started, and proves the sentinel advanced exactly once. Queue
+it before enabling the runner to minimize the admission window. Any different request may fail the
+pressure run, but it cannot satisfy the controller's frozen request and checkpoint identities.
+
+Each `reboot` requires the runner to be disabled, inactive, and free of job/execution-principal
+processes, then requires the exact retained checkpoint before restarting the host. Each `verify`
+operation requires a changed kernel boot ID, unchanged installation/controller
 identity, the exact frozen invocation, one recovery-only client exchange, unchanged repository
 truth, the expected cumulative execution/archive counts, zero invalid archives, no residual active
 or finalization records, no Ota transient scopes, and complete terminal cleanup. It publishes one

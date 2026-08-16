@@ -373,33 +373,14 @@ mod linux {
         state.identity = semantic_identity(STATE_IDENTITY_DOMAIN, &state)?;
         write_protected_json(Path::new(STATE_PATH), &state, 0o600, false)?;
         create_root_marker(Path::new(fault.marker_path()))?;
-
-        let child = invoke_as_principal(
-            job_uid,
-            job_gid,
-            InvocationRequest {
-                authority_id: state.authority_id.clone(),
-                repository: state.repository.clone(),
-                ota_arguments: state.ota_arguments.clone(),
-            },
-            ClientOperation::InvokeWithoutRecovery,
-        )?;
-        if child.ok || !matches!(child.error_reason.as_deref(), Some("output_incomplete")) {
-            return Err(String::from(
-                "the faulted production client did not stop at the expected recovery boundary; inspect the pending state and use abort-prepared only when no work or recovery state exists",
-            ));
-        }
-        state = observe_fault(state)?;
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "ok": true,
-                "stage": "fault_armed_reboot_required",
+                "stage": "fault_prepared_runner_invocation_required",
                 "fault": fault,
                 "state_identity": state.identity,
                 "launcher_request_identity": state.launcher_request_identity,
-                "retained_active_records": state.retained_active_records,
-                "retained_finalization_records": state.retained_finalization_records,
             }))
             .map_err(|_| String::from("failed to encode controller output"))?
         );
