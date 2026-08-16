@@ -181,6 +181,16 @@ Do not call the gate complete until the artifact identifies the exact immutable 
 one completed transaction, one valid protected archive, zero invalid archives, and no protected or
 private authority material.
 
+The positive gate is green in immutable Linux/x64 PID 1
+[run 31939777636](https://github.com/ota-run/authority-launcher/actions/runs/31939777636)
+against Protocol `04a199a1eddd72b5b61958e0fe7f2d4e662e05cf`, clean source-built Core
+`634a2c169e083da4e02abd72a7bf29ae388ddf3d`, and Launcher
+`ea7480e8d8b8aa214c5602628fb6dfa6382e2088`. The retained artifact binds the exact prepared-runner
+precondition and installation identities, one consumed work unit, completed selected execution,
+exact terminal cleanup, one valid protected archive, zero invalid archives, and no private key or
+reusable credential material. This evidence does not cover the separate recovery matrix below or
+provider attestation.
+
 ## Separate Administrative Recovery
 
 Crash and reboot controls cannot be driven by the repository workflow without destroying the

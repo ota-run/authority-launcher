@@ -26,7 +26,11 @@
 
 ## Unreleased
 
-- Add a candidate independently administered pressure lane. Root provisioning now exposes a
+- Prove the independently administered positive pressure lane in immutable Linux/x64 PID 1
+  [run 31939777636](https://github.com/ota-run/authority-launcher/actions/runs/31939777636)
+  against Protocol `04a199a1eddd72b5b61958e0fe7f2d4e662e05cf`, clean source-built Core
+  `634a2c169e083da4e02abd72a7bf29ae388ddf3d`, and Launcher
+  `ea7480e8d8b8aa214c5602628fb6dfa6382e2088`. Root provisioning exposes a
   root-owned non-secret installation-evidence copy with a protected parent chain, protected history
   admits the hardened job principal rather than relying on root impersonation, and admission binds
   the actual administrator-installed GitHub runner unit. Source revisions are artifact-derived and
@@ -39,8 +43,11 @@
   checks, includes the protected-history runtime socket, and rejects dangling aliases.
   Every existing ancestor of every managed path must also be a root-owned, non-writable directory
   chain without symlinks before mutation begins.
-  The lane remains unproved until an administrator-prepared Linux/x64 PID 1 runner executes it;
-  separate administrator-driven reboot recovery and provider attestation remain open.
+  The retained artifact binds a stopped/process-free prepared runner, the exact 32-path fresh-state
+  inventory, installed revisions and file identities, one consumed work unit, completed selected
+  execution, exact child/scope/cgroup/slot cleanup, one valid protected archive, zero invalid
+  archives, and no private key or reusable credential material. Separate administrator-driven
+  reboot recovery and provider attestation remain open.
 
 - Prove the installed production systemd client and protected receipt-history source in immutable
   Linux/x64 PID 1 run

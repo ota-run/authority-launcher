@@ -351,7 +351,7 @@ unchanged refusal worktrees without private signing material. The workflow contr
 the authority stack, so independently administered launcher separation and provider attestation
 remain open.
 
-The next pressure lane separates those owners. An administrator prepares the host and registers a
+The independently administered pressure lane separates those owners. An administrator prepares the host and registers a
 protected self-hosted runner; the repository workflow then invokes only the fixed production
 client and protected-history source. The runner itself must be the exact systemd service admitted
 by the closed profile; a sibling GitHub runner service cannot inherit that authority. Provisioning
@@ -359,10 +359,16 @@ also refuses before its first authority write unless that runner is stopped, bot
 principals are process-free, and the managed authority namespace is fresh. The runner's exact
 systemd unit remains gated on final protected installation-evidence publication throughout
 provisioning. See
-[Independently Administered Systemd Pressure](docs/independently-administered-pressure.md). The
-consumer-only workflow and runbook are candidate infrastructure until an immutable run is retained;
-they do not yet close independently administered separation, reboot recovery, or provider
-attestation.
+[Independently Administered Systemd Pressure](docs/independently-administered-pressure.md).
+Immutable Linux/x64 PID 1
+[run 31939777636](https://github.com/ota-run/authority-launcher/actions/runs/31939777636)
+proves that consumer-only positive path against Protocol
+`04a199a1eddd72b5b61958e0fe7f2d4e662e05cf`, clean source-built Core
+`634a2c169e083da4e02abd72a7bf29ae388ddf3d`, and Launcher
+`ea7480e8d8b8aa214c5602628fb6dfa6382e2088`. It completed one consumed work unit with exact
+child/scope/cgroup/slot cleanup and one valid protected archive with zero invalid archives. This
+closes the positive hardened-launcher separation branch only; administrator-driven reboot recovery
+and provider attestation remain open.
 
 Immutable Linux/x64 PID 1
 [run 31758094819](https://github.com/ota-run/authority-launcher/actions/runs/31758094819)
