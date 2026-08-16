@@ -65,11 +65,17 @@ jobs:
           import sys
 
           evidence = json.load(open(sys.argv[1], encoding="utf-8"))
+          bounded_disconnect = (
+              evidence.get("reason") == "launcher_service_unavailable"
+              and evidence.get("execution_started") is None
+          ) or (
+              evidence.get("reason") == "output_incomplete"
+              and evidence.get("execution_started") is True
+          )
           if (
               evidence.get("ok") is not False
               or evidence.get("kind") != "systemd_protected_launcher_client_refusal"
-              or evidence.get("reason") != "output_incomplete"
-              or evidence.get("execution_started") is not True
+              or not bounded_disconnect
           ):
-              raise SystemExit("the production client did not stop at the prepared recovery boundary")
+              raise SystemExit("the production client did not stop at a bounded recovery handoff")
           PY

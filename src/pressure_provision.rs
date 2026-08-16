@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -176,6 +176,8 @@ struct PreparedProvisioningObservationV1 {
     authority_state_posture: String,
     authority_state_ancestor_posture: String,
     authority_state_paths_checked: Vec<String>,
+    authority_unit_posture: String,
+    authority_units_checked: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -732,12 +734,20 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     run_systemctl(&["daemon-reload"])?;
     run_systemctl(&[
         "enable",
-        "--now",
         "ota-authority-launcher.socket",
         "ota-authority-attestor.socket",
         "ota-authority-broker-proxy.socket",
         "ota-authority-history.socket",
     ])?;
+    run_systemctl(&[
+        "start",
+        "ota-authority-launcher.socket",
+        "ota-authority-attestor.socket",
+        "ota-authority-broker-proxy.socket",
+        "ota-authority-history.socket",
+    ])?;
+    verify_activated_socket(Path::new(LAUNCHER_SOCKET), job.gid, 0o660)?;
+    verify_activated_socket(Path::new(HISTORY_SOCKET_PATH), execution.gid, 0o660)?;
     // The canonical runner cannot start until this final, durable publication succeeds.
     write_json(
         Path::new(PUBLIC_INSTALLATION_EVIDENCE),
@@ -1310,6 +1320,7 @@ fn observe_prepared_provisioning_precondition(
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    let authority_units_checked = require_managed_authority_units_inactive()?;
     verify_managed_authority_ancestor_chains(authority_state_paths_checked.as_slice())?;
     require_managed_authority_state_absent(authority_state_paths_checked.as_slice())?;
 
@@ -1340,6 +1351,8 @@ fn observe_prepared_provisioning_precondition(
             "root_owned_non_writable_directory_chain_without_aliases",
         ),
         authority_state_paths_checked,
+        authority_unit_posture: String::from("inactive_or_not_found_before_mutation"),
+        authority_units_checked,
     };
     observation.identity = prepared_provisioning_observation_identity(&observation)?;
     Ok(observation)
@@ -1474,6 +1487,69 @@ fn managed_authority_state_paths() -> Vec<&'static str> {
         INVOCATION_SLICE,
         POLKIT_RULE,
     ]
+}
+
+fn managed_authority_units() -> [&'static str; 8] {
+    [
+        "ota-authority-launcher.service",
+        "ota-authority-launcher.socket",
+        "ota-authority-attestor.service",
+        "ota-authority-attestor.socket",
+        "ota-authority-broker-proxy.service",
+        "ota-authority-broker-proxy.socket",
+        "ota-authority-history.service",
+        "ota-authority-history.socket",
+    ]
+}
+
+fn require_managed_authority_units_inactive() -> Result<Vec<String>, String> {
+    let mut checked = Vec::new();
+    for unit in managed_authority_units() {
+        let properties =
+            systemctl_properties(unit, &["LoadState", "ActiveState", "SubState", "MainPID"])?;
+        let load_state = properties
+            .get("LoadState")
+            .ok_or_else(|| String::from("managed authority unit load state is unavailable"))?;
+        let active_state = properties
+            .get("ActiveState")
+            .ok_or_else(|| String::from("managed authority unit active state is unavailable"))?;
+        let sub_state = properties
+            .get("SubState")
+            .ok_or_else(|| String::from("managed authority unit substate is unavailable"))?;
+        let main_pid = properties
+            .get("MainPID")
+            .ok_or_else(|| String::from("managed authority unit main PID is unavailable"))?;
+        if !matches!(load_state.as_str(), "loaded" | "not-found")
+            || active_state != "inactive"
+            || sub_state != "dead"
+            || main_pid != "0"
+        {
+            return Err(String::from(
+                "prepared provisioning requires every managed authority unit to be inactive",
+            ));
+        }
+        checked.push(unit.to_owned());
+    }
+    Ok(checked)
+}
+
+fn verify_activated_socket(
+    path: &Path,
+    expected_gid: u32,
+    expected_mode: u32,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| String::from("activated authority socket is unavailable"))?;
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != 0
+        || metadata.gid() != expected_gid
+        || metadata.mode() & 0o777 != expected_mode
+    {
+        return Err(String::from(
+            "activated authority socket does not match the protected principal binding",
+        ));
+    }
+    Ok(())
 }
 
 fn require_managed_authority_state_absent(paths: &[String]) -> Result<(), String> {
@@ -1762,6 +1838,11 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            authority_unit_posture: String::from("inactive_or_not_found_before_mutation"),
+            authority_units_checked: managed_authority_units()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
         };
         let identity =
             prepared_provisioning_observation_identity(&observation).expect("observation identity");
@@ -1792,6 +1873,23 @@ mod tests {
         fs::remove_file(&state).expect("remove alias");
         assert!(
             require_managed_authority_state_absent(&[state.to_string_lossy().into_owned()]).is_ok()
+        );
+    }
+
+    #[test]
+    fn managed_authority_unit_inventory_covers_every_activated_socket_and_service() {
+        assert_eq!(
+            managed_authority_units(),
+            [
+                "ota-authority-launcher.service",
+                "ota-authority-launcher.socket",
+                "ota-authority-attestor.service",
+                "ota-authority-attestor.socket",
+                "ota-authority-broker-proxy.service",
+                "ota-authority-broker-proxy.socket",
+                "ota-authority-history.service",
+                "ota-authority-history.socket",
+            ]
         );
     }
 

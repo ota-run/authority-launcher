@@ -157,6 +157,9 @@ runner unit to be loaded but `inactive/dead`, with `MainPID=0` and no control gr
 live job- or execution-principal process; and requires every managed Ota authority, state, runtime,
 unit, socket, history, and public-evidence path for this installation to be absent. Any prior or
 ambiguous filesystem object, including a dangling symlink, refuses instead of being overwritten.
+Every managed authority service and socket unit must also be inactive or not yet installed. After
+the protected unit files are durable, provisioning explicitly enables and starts the newly loaded
+socket units, then verifies the launcher and history socket owner, exact bound group, and mode.
 Every existing ancestor of every managed path must be a root-owned, non-writable directory and
 must not be a symlink; this is checked without following aliases before the first mutation.
 The resulting observation and exact canonical ordered checked-path set, including the protected
@@ -248,7 +251,7 @@ gh workflow run systemd-v3-independently-administered-recovery-trigger.yml \
   --repo ota-run/authority-launcher
 sudo systemctl enable --now ota-authority-pressure-runner.service
 
-# After the trigger reports the expected output_incomplete boundary:
+# After the trigger reports a bounded administrator-controlled disconnect:
 sudo systemctl disable --now ota-authority-pressure-runner.service
 sudo /usr/lib/ota-authority/bin/ota-authority-systemd-recovery-controller reboot
 
@@ -268,10 +271,18 @@ Repeat with `--fault finalization-intent` and expected counts `2`; then use
 The trigger workflow has no checkout, authority-state, fault-marker, service-control, reboot, or
 root capability. It verifies its own process is inside the exact prepared runner cgroup, invokes
 only the frozen production-client request with automatic reconnect disabled, requires typed
-`output_incomplete` after execution started, and does not read execution-principal output or
-receipt state. The root controller alone verifies cumulative execution and archive counts. Queue it
-before enabling the runner to minimize the admission window. Any different request may fail the
-pressure run, but it cannot satisfy the controller's frozen request and checkpoint identities.
+`launcher_service_unavailable` with unknown local execution posture or `output_incomplete` after
+execution started, and does not read execution-principal output or receipt state. That bounded
+disconnect is not fault proof by itself. The root controller alone verifies the exact retained
+checkpoint plus cumulative execution and archive counts. Queue the trigger before enabling the
+runner to minimize the admission window. Any different request may fail the pressure run, but it
+cannot satisfy the controller's frozen request and checkpoint identities.
+
+Prepared provisioning also requires every managed authority service and socket to be inactive
+before its first write. After installing the unit files it explicitly starts fresh socket units
+and verifies the launcher and history socket owner, exact bound group, and mode before publishing
+installation evidence. `enable --now` is intentionally insufficient here because it does not
+recreate an already-active socket after a unit update.
 
 Each `reboot` requires the runner to be disabled, inactive, and free of job/execution-principal
 processes, then requires the exact retained checkpoint before restarting the host. Each `verify`

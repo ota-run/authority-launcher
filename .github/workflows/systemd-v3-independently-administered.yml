@@ -150,6 +150,16 @@ jobs:
               "/etc/systemd/system/ota-authority-invocations.slice",
               "/etc/polkit-1/rules.d/00-ota-authority-deny.rules",
           ]
+          expected_authority_units = [
+              "ota-authority-launcher.service",
+              "ota-authority-launcher.socket",
+              "ota-authority-attestor.service",
+              "ota-authority-attestor.socket",
+              "ota-authority-broker-proxy.service",
+              "ota-authority-broker-proxy.socket",
+              "ota-authority-history.service",
+              "ota-authority-history.socket",
+          ]
           if (
               precondition.get("schema_version") != 1
               or precondition.get("runner_service_unit") != "ota-authority-pressure-runner.service"
@@ -171,6 +181,10 @@ jobs:
                   != "root_owned_non_writable_directory_chain_without_aliases"
               or precondition.get("authority_state_paths_checked")
                   != expected_authority_state_paths
+              or precondition.get("authority_unit_posture")
+                  != "inactive_or_not_found_before_mutation"
+              or precondition.get("authority_units_checked")
+                  != expected_authority_units
           ):
               raise SystemExit("prepared provisioning observation is invalid")
           claimed_precondition_identity = precondition.get("identity", "")

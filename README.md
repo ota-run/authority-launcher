@@ -316,8 +316,9 @@ persists only the exact recovery request needed across reboot. A separate no-che
 workflow invokes the installed production client from the exact bound runner cgroup; the root
 controller never impersonates that runner posture. The feature-gated trigger disables immediate
 client reconnect so the administrator-owned reboot remains the only recovery transition. The
-administrator stops the runner before reboot, then performs a recovery-only exchange and publishes
-bounded public evidence. The final
+trigger's bounded disconnect is not evidence of the fault by itself; the root controller must
+verify the exact retained checkpoint. The administrator stops the runner before reboot, then
+performs a recovery-only exchange and publishes bounded public evidence. The final
 consumer workflow can verify and upload that evidence but cannot arm faults, control services,
 reboot the host, or read authority state. Recovered terminal evidence is fsynced before
 acknowledgement, so a controller crash cannot erase the Launcher recovery journal without leaving
@@ -371,7 +372,9 @@ protected self-hosted runner; the repository workflow then invokes only the fixe
 client and protected-history source. The runner itself must be the exact systemd service admitted
 by the closed profile; a sibling GitHub runner service cannot inherit that authority. Provisioning
 also refuses before its first authority write unless that runner is stopped, both selected
-principals are process-free, and the managed authority namespace is fresh. The runner's exact
+principals are process-free, every managed authority service/socket is inactive, and the managed
+authority namespace is fresh. Activation starts freshly loaded socket units and verifies their
+exact protected group boundary before public evidence is published. The runner's exact
 systemd unit remains gated on final protected installation-evidence publication throughout
 provisioning. See
 [Independently Administered Systemd Pressure](docs/independently-administered-pressure.md).

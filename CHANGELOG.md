@@ -32,7 +32,9 @@
   finalization-intent, or terminal-recorded faults, but never impersonates the bound runner
   posture. A separate no-checkout workflow invokes the frozen production-client request from the
   exact prepared runner cgroup with immediate reconnect disabled and without reading
-  execution-principal state. Recovery binds the same invocation, installation, immutable
+  execution-principal state. Its bounded disconnect is not fault evidence without the root
+  controller's exact retained-checkpoint verification. Recovery binds the same invocation,
+  installation, immutable
   Core/Launcher/Protocol revisions, controller binary, boot transition, repository manifest,
   cumulative selected-execution count, protected history, and exact cleanup. The constrained
   recovery client cannot acknowledge a terminal until the root controller has fsynced the exact
@@ -57,7 +59,10 @@
   binds the pre-mutation observation. Fresh-state admission uses fail-closed filesystem metadata
   checks, includes the protected-history runtime socket, and rejects dangling aliases.
   Every existing ancestor of every managed path must also be a root-owned, non-writable directory
-  chain without symlinks before mutation begins.
+  chain without symlinks before mutation begins. Every managed authority service and socket must
+  be inactive before mutation; activation explicitly starts the freshly loaded socket units and
+  verifies the launcher and history socket owner, bound group, and mode before public evidence is
+  published, preventing a stale listening inode from retaining an earlier principal boundary.
   The retained artifact binds a stopped/process-free prepared runner, the exact 32-path fresh-state
   inventory, installed revisions and file identities, one consumed work unit, completed selected
   execution, exact child/scope/cgroup/slot cleanup, one valid protected archive, zero invalid

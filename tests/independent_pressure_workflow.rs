@@ -65,6 +65,7 @@ fn independent_pressure_workflow_retains_a_narrow_drift_guard() {
     assert!(WORKFLOW.contains("prepared_provisioning_observation"));
     assert!(WORKFLOW.contains("fresh_managed_authority_state"));
     assert!(WORKFLOW.contains("root_owned_non_writable_directory_chain_without_aliases"));
+    assert!(WORKFLOW.contains("inactive_or_not_found_before_mutation"));
     assert!(WORKFLOW.contains("expected_authority_state_paths"));
     assert!(WORKFLOW.contains("/run/ota/authority-history.sock"));
     assert!(WORKFLOW.contains("prepared runner publication gate is invalid"));
@@ -142,9 +143,10 @@ fn independent_recovery_trigger_is_runner_owned_and_non_administrative() {
     assert!(RECOVERY_TRIGGER_WORKFLOW.contains("ota-authority-systemd-client"));
     assert!(RECOVERY_TRIGGER_WORKFLOW.contains("--administrator-controlled-recovery"));
     assert!(RECOVERY_TRIGGER_WORKFLOW.contains("output_incomplete"));
+    assert!(RECOVERY_TRIGGER_WORKFLOW.contains("launcher_service_unavailable"));
     assert!(
         RECOVERY_TRIGGER_WORKFLOW.contains("execution_started")
-            && RECOVERY_TRIGGER_WORKFLOW.contains("is not True")
+            && RECOVERY_TRIGGER_WORKFLOW.contains("is True")
     );
     assert!(!RECOVERY_TRIGGER_WORKFLOW.contains("selected-work-executed"));
     assert!(RECOVERY_TRIGGER_WORKFLOW.contains("ota-authority-pressure-runner.service"));

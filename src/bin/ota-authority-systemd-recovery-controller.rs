@@ -1173,8 +1173,34 @@ mod linux {
                 .get("authority_state_ancestor_posture")
                 .and_then(serde_json::Value::as_str)
                 != Some("root_owned_non_writable_directory_chain_without_aliases")
+            || precondition
+                .get("authority_unit_posture")
+                .and_then(serde_json::Value::as_str)
+                != Some("inactive_or_not_found_before_mutation")
         {
             return Err(String::from("prepared provisioning observation is invalid"));
+        }
+        let expected_authority_units = [
+            "ota-authority-launcher.service",
+            "ota-authority-launcher.socket",
+            "ota-authority-attestor.service",
+            "ota-authority-attestor.socket",
+            "ota-authority-broker-proxy.service",
+            "ota-authority-broker-proxy.socket",
+            "ota-authority-history.service",
+            "ota-authority-history.socket",
+        ];
+        let observed_authority_units = precondition
+            .get("authority_units_checked")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| String::from("prepared authority unit inventory is unavailable"))?;
+        if observed_authority_units.len() != expected_authority_units.len()
+            || observed_authority_units
+                .iter()
+                .zip(expected_authority_units)
+                .any(|(observed, expected)| observed.as_str() != Some(expected))
+        {
+            return Err(String::from("prepared authority unit inventory is invalid"));
         }
         let job_uid = precondition
             .get("job_uid")
