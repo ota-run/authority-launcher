@@ -277,21 +277,14 @@ impl SystemdScopeManager {
         timeout: Duration,
     ) -> Result<(), SystemdScopeError> {
         let manager = self.manager_proxy()?;
-        let killed: Result<(), zbus::Error> =
+        let _: Result<(), zbus::Error> =
             manager.call("KillUnit", &(unit_name, "all", libc::SIGKILL));
-        if killed.is_err() {
-            return if self.scope_is_terminal(unit_name, expected_control_group) {
-                Ok(())
-            } else {
-                Err(SystemdScopeError::CleanupFailed)
-            };
-        }
-        let stopped: Result<OwnedObjectPath, zbus::Error> =
+        let _: Result<OwnedObjectPath, zbus::Error> =
             manager.call("StopUnit", &(unit_name, "replace"));
-        if stopped.is_err() && self.scope_is_terminal(unit_name, expected_control_group) {
-            return Ok(());
-        }
-        stopped.map_err(|_| SystemdScopeError::CleanupFailed)?;
+
+        // D-Bus can report either operation as failed when systemd removes the
+        // transient scope between calls. Only the observed terminal boundary is
+        // authoritative; poll for exact absence and an empty/absent cgroup.
         let deadline = Instant::now() + timeout;
         loop {
             match self.observe_existing_scope(unit_name) {
