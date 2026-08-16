@@ -26,7 +26,9 @@ use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use clap::Parser;
 #[cfg(target_os = "linux")]
-use ota_authority_launcher::systemd_client::{InvocationRequest, invoke};
+use ota_authority_launcher::systemd_client::{
+    InvocationRequest, RecoveryPolicy, invoke_with_recovery_policy,
+};
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Parser)]
@@ -38,6 +40,9 @@ struct Cli {
     repository: PathBuf,
     #[arg(long)]
     json: bool,
+    #[cfg(feature = "systemd-admin-recovery-pressure")]
+    #[arg(long)]
+    administrator_controlled_recovery: bool,
     #[arg(last = true, required = true)]
     ota_arguments: Vec<String>,
 }
@@ -52,11 +57,22 @@ fn main() -> std::process::ExitCode {
     #[cfg(target_os = "linux")]
     {
         let cli = Cli::parse();
-        match invoke(InvocationRequest {
-            authority_id: cli.authority_id,
-            repository: cli.repository,
-            ota_arguments: cli.ota_arguments,
-        }) {
+        #[cfg(feature = "systemd-admin-recovery-pressure")]
+        let recovery_policy = if cli.administrator_controlled_recovery {
+            RecoveryPolicy::AdministratorControlled
+        } else {
+            RecoveryPolicy::Immediate
+        };
+        #[cfg(not(feature = "systemd-admin-recovery-pressure"))]
+        let recovery_policy = RecoveryPolicy::Immediate;
+        match invoke_with_recovery_policy(
+            InvocationRequest {
+                authority_id: cli.authority_id,
+                repository: cli.repository,
+                ota_arguments: cli.ota_arguments,
+            },
+            recovery_policy,
+        ) {
             Ok(result) => {
                 if cli.json {
                     match serde_json::to_string_pretty(&result) {

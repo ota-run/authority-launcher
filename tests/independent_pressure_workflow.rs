@@ -140,11 +140,12 @@ fn independent_recovery_trigger_is_runner_owned_and_non_administrative() {
     assert!(!RECOVERY_TRIGGER_WORKFLOW.contains("pull_request:"));
     assert!(RECOVERY_TRIGGER_WORKFLOW.contains("ota-authority-independent"));
     assert!(RECOVERY_TRIGGER_WORKFLOW.contains("ota-authority-systemd-client"));
+    assert!(RECOVERY_TRIGGER_WORKFLOW.contains("--administrator-controlled-recovery"));
     assert!(RECOVERY_TRIGGER_WORKFLOW.contains("output_incomplete"));
     assert!(
         RECOVERY_TRIGGER_WORKFLOW.contains("execution_started")
             && RECOVERY_TRIGGER_WORKFLOW.contains("is not True")
     );
-    assert!(RECOVERY_TRIGGER_WORKFLOW.contains("expected_previous_execution_count"));
+    assert!(!RECOVERY_TRIGGER_WORKFLOW.contains("selected-work-executed"));
     assert!(RECOVERY_TRIGGER_WORKFLOW.contains("ota-authority-pressure-runner.service"));
 }

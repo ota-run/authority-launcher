@@ -24,15 +24,6 @@ name: Systemd V3 administrator recovery trigger
 
 on:
   workflow_dispatch:
-    inputs:
-      expected_previous_execution_count:
-        description: Exact successful executions before this administrator-prepared fault
-        required: true
-        type: choice
-        options:
-          - "0"
-          - "1"
-          - "2"
 
 permissions:
   contents: read
@@ -50,7 +41,6 @@ jobs:
       AUTHORITY_ID: platform-release-authority
       CLIENT: /usr/lib/ota-authority/bin/ota-authority-systemd-client
       PRESSURE_REPOSITORY: /srv/ota-v3-pressure
-      EXPECTED_PREVIOUS_EXECUTION_COUNT: ${{ inputs.expected_previous_execution_count }}
     steps:
       - name: Invoke the frozen production-client request
         run: |
@@ -60,16 +50,9 @@ jobs:
           test "$(ps -p 1 -o comm=)" = systemd
           grep -Fxq '0::/system.slice/ota-authority-pressure-runner.service' /proc/self/cgroup
 
-          sentinel="$PRESSURE_REPOSITORY/selected-work-executed"
-          previous=0
-          if test -f "$sentinel"; then
-            previous="$(grep -c '^executed$' "$sentinel")"
-          fi
-          test "$previous" -eq "$EXPECTED_PREVIOUS_EXECUTION_COUNT"
-
           result="$RUNNER_TEMP/administrator-recovery-trigger.json"
           set +e
-          "$CLIENT" --json \
+          "$CLIENT" --json --administrator-controlled-recovery \
             --authority-id "$AUTHORITY_ID" \
             --repository "$PRESSURE_REPOSITORY" -- \
             run governed --grant "$AUTHORITY_ID" --receipt >"$result"
@@ -90,6 +73,3 @@ jobs:
           ):
               raise SystemExit("the production client did not stop at the prepared recovery boundary")
           PY
-
-          test -f "$sentinel"
-          test "$(grep -c '^executed$' "$sentinel")" -eq "$((previous + 1))"

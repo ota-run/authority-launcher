@@ -31,7 +31,8 @@
   runner to be disabled and stopped, arms only fixed root-owned one-shot completion,
   finalization-intent, or terminal-recorded faults, but never impersonates the bound runner
   posture. A separate no-checkout workflow invokes the frozen production-client request from the
-  exact prepared runner cgroup. Recovery binds the same invocation, installation, immutable
+  exact prepared runner cgroup with immediate reconnect disabled and without reading
+  execution-principal state. Recovery binds the same invocation, installation, immutable
   Core/Launcher/Protocol revisions, controller binary, boot transition, repository manifest,
   cumulative selected-execution count, protected history, and exact cleanup. The constrained
   recovery client cannot acknowledge a terminal until the root controller has fsynced the exact

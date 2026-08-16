@@ -245,8 +245,7 @@ sudo /usr/lib/ota-authority/bin/ota-authority-systemd-recovery-controller arm \
 
 # Queue the exact trigger while the runner is still stopped, then allow that one job to run.
 gh workflow run systemd-v3-independently-administered-recovery-trigger.yml \
-  --repo ota-run/authority-launcher \
-  -f expected_previous_execution_count=0
+  --repo ota-run/authority-launcher
 sudo systemctl enable --now ota-authority-pressure-runner.service
 
 # After the trigger reports the expected output_incomplete boundary:
@@ -257,8 +256,8 @@ sudo /usr/lib/ota-authority/bin/ota-authority-systemd-recovery-controller reboot
 sudo /usr/lib/ota-authority/bin/ota-authority-systemd-recovery-controller verify
 ```
 
-Repeat with `--fault finalization-intent`, expected counts `2`, and trigger input `1`; then use
-`--fault terminal-recorded`, expected counts `3`, and trigger input `2`. Each `arm` operation:
+Repeat with `--fault finalization-intent` and expected counts `2`; then use
+`--fault terminal-recorded` and expected counts `3`. Each `arm` operation:
 
 - refuses unless the canonical repository runner is disabled, inactive, dead, and has no main PID;
 - creates exactly one fixed root-owned one-shot marker;
@@ -269,8 +268,9 @@ Repeat with `--fault finalization-intent`, expected counts `2`, and trigger inpu
 The trigger workflow has no checkout, authority-state, fault-marker, service-control, reboot, or
 root capability. It verifies its own process is inside the exact prepared runner cgroup, invokes
 only the frozen production-client request with automatic reconnect disabled, requires typed
-`output_incomplete` after execution started, and proves the sentinel advanced exactly once. Queue
-it before enabling the runner to minimize the admission window. Any different request may fail the
+`output_incomplete` after execution started, and does not read execution-principal output or
+receipt state. The root controller alone verifies cumulative execution and archive counts. Queue it
+before enabling the runner to minimize the admission window. Any different request may fail the
 pressure run, but it cannot satisfy the controller's frozen request and checkpoint identities.
 
 Each `reboot` requires the runner to be disabled, inactive, and free of job/execution-principal
