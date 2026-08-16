@@ -26,6 +26,9 @@
 
 ## Unreleased
 
+- Updated the public operator-reference label after the bounded V11.7 broker authority surface
+  completed its independently administered hardened-launcher acceptance gate.
+
 - Add the pressure-only administrator recovery controller and consumer workflow for the remaining
   independently administered systemd reboot gate. The controller requires the prepared repository
   runner to be disabled and stopped, arms only fixed root-owned one-shot completion,

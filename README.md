@@ -557,7 +557,7 @@ provider behavior; independent provider pressure remains a separate Core evidenc
   wire types, fixed domains, framing, identities, and conformance vectors.
 - This repository implements the privileged launcher side of that protocol.
 - The public operator reference is
-  [Broker Crossing Authority (Preview)](https://ota.run/docs/reference/broker-crossing-authority).
+  [Broker Crossing Authority](https://ota.run/docs/reference/broker-crossing-authority).
 
 ## License
 
