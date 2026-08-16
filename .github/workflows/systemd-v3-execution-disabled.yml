@@ -475,9 +475,9 @@ jobs:
             local scenario=$1
             sudo systemctl stop ota-authority-broker-proxy.service || true
             printf '%s\n' "$scenario" \
-              | sudo tee /run/ota/authority-broker-pressure-scenario >/dev/null
-            sudo chown root:root /run/ota/authority-broker-pressure-scenario
-            sudo chmod 0600 /run/ota/authority-broker-pressure-scenario
+              | sudo tee /var/lib/ota/authority-broker-pressure/scenario >/dev/null
+            sudo chown root:root /var/lib/ota/authority-broker-pressure/scenario
+            sudo chmod 0600 /var/lib/ota/authority-broker-pressure/scenario
           }
 
           run_decision_case() {
@@ -1596,8 +1596,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo install -o root -g root -m 0600 /dev/null \
-            /run/ota/authority-broker-pressure-scenario
-          printf '%s\n' allowed | sudo tee /run/ota/authority-broker-pressure-scenario >/dev/null
+            /var/lib/ota/authority-broker-pressure/scenario
+          printf '%s\n' allowed | sudo tee /var/lib/ota/authority-broker-pressure/scenario >/dev/null
           cursor=$(sudo journalctl --no-pager -n 0 --show-cursor | sed -n 's/^-- cursor: //p')
           sudo systemctl start ota-authority-pressure-runner.service
           sudo journalctl --no-pager --output=cat --after-cursor "$cursor" \

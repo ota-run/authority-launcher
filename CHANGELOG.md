@@ -65,6 +65,9 @@
   published. Loaded systemd socket inventory must have no pre-existing owner for any fixed
   authority path before mutation and exactly one canonical owner after activation, preventing a
   stale or obsolete socket unit from replacing the principal boundary on reboot.
+  The Launcher service now recreates its protected `/run` directory through systemd, and the
+  pressure broker scenario lives under its protected persistent state root so recovery does not
+  depend on volatile files surviving reboot.
   The retained artifact binds a stopped/process-free prepared runner, the exact 32-path fresh-state
   inventory, installed revisions and file identities, one consumed work unit, completed selected
   execution, exact child/scope/cgroup/slot cleanup, one valid protected archive, zero invalid

@@ -163,6 +163,10 @@ socket units, then verifies the launcher and history socket owner, exact bound g
 The pre-mutation systemd socket inventory must have no owner for any fixed authority path, and the
 post-activation inventory must name exactly one canonical unit for each path. Remove obsolete
 pressure socket units rather than allowing two units to race for one pathname across reboot.
+Launcher runtime scratch is recreated by the protected systemd service. The bounded pressure
+broker scenario is persisted under `/var/lib/ota/authority-broker-pressure/scenario`; do not place
+recovery inputs in `/run`, because reboot must destroy that filesystem without destroying the
+administrator-prepared recovery truth.
 Every existing ancestor of every managed path must be a root-owned, non-writable directory and
 must not be a symlink; this is checked without following aliases before the first mutation.
 The resulting observation and exact canonical ordered checked-path set, including the protected

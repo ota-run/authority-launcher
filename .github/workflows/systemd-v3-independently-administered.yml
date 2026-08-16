@@ -126,7 +126,7 @@ jobs:
               "/var/lib/ota/authority-attestor-signing-key",
               "/var/lib/ota/authority-broker-signing-key",
               "/var/lib/ota/authority-broker-pressure",
-              "/run/ota/authority-broker-pressure-scenario",
+              "/var/lib/ota/authority-broker-pressure/scenario",
               "/var/lib/ota/authority-attestor",
               "/var/lib/ota/authority-launcher",
               "/run/ota/authority-launcher",

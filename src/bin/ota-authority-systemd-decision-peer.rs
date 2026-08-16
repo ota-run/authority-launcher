@@ -57,7 +57,7 @@ mod linux {
     const SYSTEMD_LISTEN_FD: i32 = 3;
     const CREDENTIAL_NAME: &str = "ota-broker-ed25519";
     const KEY_ID: &str = "systemd-broker-pressure-v1";
-    const SCENARIO_PATH: &str = "/run/ota/authority-broker-pressure-scenario";
+    const SCENARIO_PATH: &str = "/var/lib/ota/authority-broker-pressure/scenario";
     const SPENT_LEASES_PATH: &str = "/var/lib/ota/authority-broker-pressure/consumed-leases.json";
     const SPENT_LEASES_LOCK_PATH: &str =
         "/var/lib/ota/authority-broker-pressure/consumed-leases.lock";
