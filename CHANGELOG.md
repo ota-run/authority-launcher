@@ -30,7 +30,7 @@
   wording, distinguish pressure-proven source from separately packaged release artifacts, and keep
   provider attestation as optional stronger hardening rather than an implied carrier property. The
   canonical verification workflow now checks the locked dependency graph with every feature gate;
-  tests requiring root-owned attestor state remain explicit root-pressure controls.
+  tests requiring root-owned attestor or spent-lease state remain explicit root-pressure controls.
 
 - Updated the public operator-reference label after the bounded V11.7 broker authority surface
   completed its independently administered hardened-launcher acceptance gate.

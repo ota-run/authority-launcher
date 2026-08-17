@@ -534,7 +534,10 @@ mod linux {
 
         #[test]
         fn spent_lease_state_refuses_exact_replay_durably() {
-            let directory = tempfile::tempdir().expect("temporary state directory");
+            if unsafe { libc::geteuid() } != 0 {
+                return;
+            }
+            let directory = tempfile::tempdir_in("/root").expect("protected temporary state");
             let lock = directory.path().join("consumed-leases.lock");
             let state = directory.path().join("consumed-leases.json");
             assert_eq!(
