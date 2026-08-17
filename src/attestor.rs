@@ -1428,6 +1428,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn producer_issues_once_with_deterministic_freshness_and_projection() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
         let state = tempfile::tempdir_in("/root").expect("protected temporary state");
         std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700))
             .expect("state permissions");
@@ -1582,6 +1585,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn producer_durably_signs_one_exact_finalization_archive_association() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
         let state = tempfile::tempdir_in("/root").expect("protected temporary state");
         std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700))
             .expect("state permissions");
