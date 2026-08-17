@@ -26,6 +26,11 @@
 
 ## Unreleased
 
+- Reconcile the README with the completed bounded systemd carrier: remove stale preview/candidate
+  wording, distinguish pressure-proven source from separately packaged release artifacts, and keep
+  provider attestation as optional stronger hardening rather than an implied carrier property. The
+  canonical verification workflow now checks the locked dependency graph with every feature gate.
+
 - Updated the public operator-reference label after the bounded V11.7 broker authority surface
   completed its independently administered hardened-launcher acceptance gate.
 
@@ -58,7 +63,7 @@
   `a348a13fd60b067266013cf8a0f047bbe274fd81`. The retained consumer artifact independently
   re-verifies all three expected protected archive identities with zero invalid or legacy archives,
   unchanged repository manifests, exact boot transitions, complete terminal cleanup, and no private
-  authority material. Provider attestation remains open.
+  authority material. This run does not claim provider attestation.
 
 - Prove the independently administered positive pressure lane in immutable Linux/x64 PID 1
   [run 31939777636](https://github.com/ota-run/authority-launcher/actions/runs/31939777636)
@@ -89,7 +94,7 @@
   inventory, installed revisions and file identities, one consumed work unit, completed selected
   execution, exact child/scope/cgroup/slot cleanup, one valid protected archive, zero invalid
   archives, and no private key or reusable credential material. The separate administrator-driven
-  reboot gate is now green in run `31953535665`; provider attestation remains open.
+  reboot gate is now green in run `31953535665`; neither run claims provider attestation.
 
 - Prove the installed production systemd client and protected receipt-history source in immutable
   Linux/x64 PID 1 run
@@ -101,7 +106,8 @@
   evidence, exact cleanup, unchanged refusal worktrees, and no private signing material. Hardened
   history reads now use an exact-basename no-follow fallback only when `openat2` is unavailable;
   owner, mode, link-count, size, and digest verification remain mandatory. Independently
-  administered launcher separation and provider attestation remain open.
+  administered launcher separation was not proved by this run, and the run does not claim provider
+  attestation. Later runs `31939777636` and `31953535665` close the hardened-launcher branch.
 
 - Made the root-only systemd pressure provisioner install the production invocation client mode,
   fixed protected-history socket/service, canonical storage roots, exact repository mapping, and

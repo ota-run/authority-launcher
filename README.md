@@ -29,12 +29,15 @@ protected, challenge-bound session for independently authorized work without exp
 credentials, signing material, or reusable authority to repository tasks.
 
 > [!IMPORTANT]
-> This repository is in early development. It does not yet provide a production-ready launcher,
-> hosted authority service, or supported release artifact.
+> This repository contains the implemented, pressure-proven Linux/systemd carrier for Ota's
+> bounded audited-crossing authority path. It is currently source-distributed: operators must pin
+> one reviewed immutable revision and provision it outside repository-controlled execution. The
+> project does not operate a hosted authority service, bundle reusable authority, or publish a
+> standalone stable release artifact yet.
 
 ## Current implementation boundary
 
-The first implementation is a Unix session-isolating exec wrapper. It:
+The portable Unix carrier is a session-isolating exec wrapper. It:
 
 - loads launcher configuration only from `/etc/ota/authority-launcher.json`;
 - reconciles the selected authority label with Ota's fixed
@@ -101,7 +104,7 @@ work, and archives bounded evidence. The authority launcher owns the privileged 
 must not carry in a normal repository process:
 
 - protected broker transport or workload credentials;
-- challenge-bound runner or provider attestation;
+- challenge-bound runtime-attestation collection and its protected producer boundary;
 - delivery of one non-inheritable launcher session to Ota; and
 - isolation of authority material from selected task processes.
 
@@ -150,17 +153,19 @@ sequenceDiagram
 ```
 
 The launcher does not decide what a repository task means. Ota Core remains the canonical owner of
-semantic scope, protocol identities, admission rules, refusal behavior, receipts, and archive
-verification.
+semantic scope, admission rules, refusal behavior, receipts, and archive verification. Core derives
+and verifies the shared Protocol identities; the launcher cannot rewrite them.
 
 ## Build and invoke
 
-The repository currently supports Rust `1.95.0` on Unix platforms:
+The repository currently supports Rust `1.95.0`. The production systemd carrier is Linux-only;
+the portable Unix wrapper and non-Linux refusal paths remain build-tested on macOS. Use the locked,
+all-feature verification surface before changing the carrier:
 
 ```sh
-cargo build --release
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
+cargo build --locked --release --all-features
+cargo test --locked --all-targets --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
 ```
 
 The launcher deliberately has no repository-controlled config flag. Its protected configuration
@@ -285,7 +290,7 @@ launcher terminal evidence separately binds Core's completion to exact child, sc
 slot cleanup. A live launcher records the exit code it observed while reaping the child. After a
 launcher restart, finalization instead records `recovered_absent_completion_bound`, binds verified
 child absence to Core's durable completion, and explicitly makes no observed-exit or child-reaped
-claim. The current candidate persists a protected finalization journal before deleting the
+claim. The implementation persists a protected finalization journal before deleting the
 active slot, asks the producer to sign the cleanup record and a separate exact archive attachment,
 reopens the private archive through the execution-principal repository descriptor, and verifies its
 owner, content identity, and transaction before atomically publishing a root-owned sidecar. Both
@@ -325,7 +330,7 @@ acknowledgement, so a controller crash cannot erase the Launcher recovery journa
 an exact durable observation. See
 [`docs/independently-administered-pressure.md`](docs/independently-administered-pressure.md).
 
-The Launcher-side protected-history candidate uses the separate fixed
+The Launcher-side protected-history service uses the separate fixed
 `/run/ota/authority-history.sock` service and root-owned
 `/etc/ota/authority-history.json` binding. The binding is reconciled with the protected
 installation manifest through a cycle-free history-installation projection. That projection
@@ -364,8 +369,8 @@ proves the installed production client and protected-history source against Prot
 `c80828aa7b64a4bb8c1d9957d937d4fae4d70828`. The retained artifacts report one valid and zero
 invalid protected archive, one catalog entry, three content-addressed objects, exact cleanup, and
 unchanged refusal worktrees without private signing material. The workflow controller provisioned
-the authority stack, so independently administered launcher separation and provider attestation
-remain open.
+the authority stack, so that run did not prove independently administered launcher separation or
+provider attestation. The separate runs below close the hardened-launcher branch.
 
 The independently administered pressure lane separates those owners. An administrator prepares the host and registers a
 protected self-hosted runner; the repository workflow then invokes only the fixed production
@@ -395,7 +400,7 @@ against Protocol `04a199a1eddd72b5b61958e0fe7f2d4e662e05cf`, clean source-built 
 execution-completion, finalization-intent, and terminal-recorded reboot cases as three valid
 protected archives with zero invalid or legacy-unverified archives, unchanged repository state,
 and zero residual child, scope, cgroup, active-slot, or finalization state. Provider attestation
-remains open.
+remains optional stronger hardening and is not implied by this carrier.
 
 Immutable Linux/x64 PID 1
 [run 31758094819](https://github.com/ota-run/authority-launcher/actions/runs/31758094819)
@@ -411,20 +416,22 @@ authorization decision/admission fails closed and enters the same exact cleanup 
 and selected-execution paths have passed immutable Linux/x64 PID 1 systemd pressure in
 [run 31664495937](https://github.com/ota-run/authority-launcher/actions/runs/31664495937),
 including completed, failed, interrupted, replay-refused, and crash-recovered execution. The run
-does not establish provider-attested separation or the newer portable launcher-finalization
-attachment candidate.
+does not establish provider-attested separation and predates the later portable
+launcher-finalization attachment proof.
 
 The follow-on portable-finalization run
 [31758094819](https://github.com/ota-run/authority-launcher/actions/runs/31758094819)
-proves that newer candidate across positive execution and completion-, finalization-, and terminal-
+proves that portable path across positive execution and completion-, finalization-, and terminal-
 crash recovery. All 21 terminal boundaries end with zero active slots, finalization journals, and
 scopes. Positive execution and those three terminal crash-recovery points each have one valid
 archive and zero invalid archives. A restart after durable Core completion uses finalization schema
 v2 to prove child absence without
 claiming that the restarted launcher observed the exit or reaped the child. Durable producer state
 retains distinct root-owned mode-`0600` cleanup-finalization and archive-attachment issuance
-records. Independently administered launcher separation and provider attestation remain open; that
-run predates the production client and protected-history proof in run `31823037642` above.
+records. Independently administered launcher separation remained open in that run; later runs
+`31939777636` and `31953535665` close the hardened-launcher branch. Provider attestation remains
+optional stronger hardening. That run predates the production client and protected-history proof
+in run `31823037642` above.
 
 The feature-gated `ota-authority-systemd-pressure-client` is the unprivileged side of that positive
 kernel proof. It connects only to `/run/ota/authority-launcher.sock`, submits one bounded
@@ -503,9 +510,10 @@ reconciliation to remove each exact slot, child, cgroup, and scope before a fres
 Artifact inspection independently re-verifies all eight public signed decisions and all five relay
 and admission identities. Fourteen complete before/after repository manifests are byte-identical,
 and no selected-work, `.ota`, lease, receipt, archive, private-key, or credential residue exists.
-This documents an unpressured local foundation only. Immutable Linux/x64 systemd pressure for the
-consumed-lease relay, selected execution, crossing receipt/archive evidence, independently
-administered provider/launcher separation, and provider attestation remain open.
+That decision-only run intentionally did not prove lease consumption, selected execution, or
+receipt/archive evidence. The later immutable runs above close those carrier boundaries and the
+independently administered hardened-launcher branch. Provider attestation remains optional
+stronger hardening rather than a property of this carrier.
 
 ## What belongs here
 
@@ -526,12 +534,13 @@ administered provider/launcher separation, and provider attestation remain open.
 - a bundled authority-enabled runner image; or
 - claims that the launcher governs raw shell execution outside adopted Ota chokepoints.
 
-The authority protocol remains canonically specified and verified by Ota Core. A managed broker,
+The authority protocol is canonically published by Ota Authority Protocol and independently
+verified by Ota Core. A managed broker,
 identity-provider integration, approval workflow, fleet administration, and audit search may be
 provided separately; the launcher remains independently inspectable and deployable open-source
 infrastructure.
 
-## First milestone
+## Completed bounded milestone
 
 The complete first milestone implements the Unix launcher-session carrier defined by Ota Core:
 
@@ -551,8 +560,8 @@ provider behavior; independent provider pressure remains a separate Core evidenc
 
 ## Relationship to Ota
 
-- [Ota Core](https://github.com/ota-run/ota) owns the protocol, scope, admission, execution, and
-  evidence model.
+- [Ota Core](https://github.com/ota-run/ota) owns semantic scope, admission, execution, evidence,
+  and independent protocol verification.
 - [Ota Authority Protocol](https://github.com/ota-run/authority-protocol) publishes the shared
   wire types, fixed domains, framing, identities, and conformance vectors.
 - This repository implements the privileged launcher side of that protocol.

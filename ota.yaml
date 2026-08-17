@@ -54,7 +54,7 @@ tasks:
     category: test
     command:
       exe: cargo
-      args: [check, --all-targets]
+      args: [check, --locked, --all-targets, --all-features]
     requirements:
       toolchains: [rust]
     safe_for_agent: true
@@ -63,7 +63,7 @@ tasks:
     category: test
     command:
       exe: cargo
-      args: [clippy, --all-targets, --, -D, warnings]
+      args: [clippy, --locked, --all-targets, --all-features, --, -D, warnings]
     requirements:
       toolchains: [rust]
     safe_for_agent: true
@@ -72,7 +72,7 @@ tasks:
     category: test
     command:
       exe: cargo
-      args: [test, --all-targets]
+      args: [test, --locked, --all-targets, --all-features]
     requirements:
       toolchains: [rust]
     safe_for_agent: true
