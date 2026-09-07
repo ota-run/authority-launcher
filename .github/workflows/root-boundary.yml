@@ -252,7 +252,8 @@ jobs:
               test -f "$repo/broker-executed"
               (
                 cd "$repo"
-                ota receipt --history --json
+                sudo -u ota-pressure \
+                  /usr/lib/ota-authority/bin/ota-pressure-core receipt --history --json
               ) > "$EVIDENCE_DIR/live.receipt-history.json"
               jq -e '.summary.archive_count == 1 and .summary.invalid_archive_count == 0' \
                 "$EVIDENCE_DIR/live.receipt-history.json"
@@ -260,7 +261,7 @@ jobs:
               if [[ "$archive_path" != /* ]]; then
                 archive_path="$repo/$archive_path"
               fi
-              jq -e '
+              sudo jq -e '
                 .receipt.crossing.authority.authority_carrier == "authority_broker" and
                 .receipt.crossing.authority.authority_separation_posture == "protected_launcher_attested_one_use" and
                 .receipt.crossing.authority.archive_evidence.admission.binding_snapshot.schema_version == 2 and
@@ -287,7 +288,8 @@ jobs:
                 .receipt.crossing.id == .receipt.crossing.authority.transaction.transaction_id and
                 .receipt.crossing.authority.transaction.identity == .receipt.crossing.authority.archive_evidence.transaction.identity
               ' "$archive_path"
-              cp "$archive_path" "$EVIDENCE_DIR/live.receipt-archive.json"
+              sudo cp "$archive_path" "$EVIDENCE_DIR/live.receipt-archive.json"
+              sudo chown "$(id -u):$(id -g)" "$EVIDENCE_DIR/live.receipt-archive.json"
             else
               if (
                 cd "$repo"
@@ -414,7 +416,7 @@ jobs:
           test "$(wc -c < "$recovery_repo/broker-executed")" -eq 1
           grep -q 'pressure-peer-scenario: recovered-consumed-status' "$recovery_second"
           grep -q 'pressure-peer-scenario: recovery-consumed-then-fresh-consumed' "$recovery_second"
-          jq -s -e '
+          sudo jq -s -e '
             map(select(
               .state == "incomplete" and
               .receipt_status == "broker_consumption_recovered_without_execution" and
@@ -424,7 +426,8 @@ jobs:
           ' "$recovery_repo"/.ota/state/crossings/*/*.json
           (
             cd "$recovery_repo"
-            ota receipt --history --json
+            sudo -u ota-pressure \
+              /usr/lib/ota-authority/bin/ota-pressure-core receipt --history --json
           ) > "$EVIDENCE_DIR/consume-recovery.receipt-history.json"
           jq -e '.summary.archive_count == 1 and .summary.invalid_archive_count == 0' \
             "$EVIDENCE_DIR/consume-recovery.receipt-history.json"
@@ -505,7 +508,8 @@ jobs:
           test "$(grep -c '^audit$' "$catch_all_repo/broker-executed")" -eq 2
           (
             cd "$catch_all_repo"
-            ota receipt --history --json
+            sudo -u ota-pressure \
+              /usr/lib/ota-authority/bin/ota-pressure-core receipt --history --json
           ) > "$EVIDENCE_DIR/catch-all.receipt-history.json"
           jq -e '.summary.archive_count == 2 and .summary.invalid_archive_count == 0' \
             "$EVIDENCE_DIR/catch-all.receipt-history.json"
@@ -515,7 +519,7 @@ jobs:
             if [[ "$archive_path" != /* ]]; then
               archive_path="$catch_all_repo/$archive_path"
             fi
-            jq -e '
+            sudo jq -e '
               .receipt.crossing.authority.authority_carrier == "authority_broker" and
               .receipt.crossing.authority.authority_separation_posture == "protected_launcher_attested_one_use" and
               .receipt.crossing.authority.archive_evidence.admission.binding_snapshot.schema_version == 2 and
@@ -525,9 +529,11 @@ jobs:
               (.receipt.crossing.authority.archive_evidence.admission.semantic_scope.breadth.effect_categories | index("repo_write") != null) and
               (.receipt.crossing.authority.archive_evidence.admission.semantic_scope.breadth.effect_categories | index("network") != null)
             ' "$archive_path"
-            jq -r '.receipt.crossing.authority.broker.work_unit_identity' "$archive_path" \
-              >> "$EVIDENCE_DIR/catch-all.work-units"
-            cp "$archive_path" "$EVIDENCE_DIR/catch-all.receipt-archive-$archive_index.json"
+            sudo jq -r '.receipt.crossing.authority.broker.work_unit_identity' "$archive_path" \
+              | tee -a "$EVIDENCE_DIR/catch-all.work-units" >/dev/null
+            sudo cp "$archive_path" "$EVIDENCE_DIR/catch-all.receipt-archive-$archive_index.json"
+            sudo chown "$(id -u):$(id -g)" \
+              "$EVIDENCE_DIR/catch-all.receipt-archive-$archive_index.json"
             archive_index=$((archive_index + 1))
           done < <(jq -r '.archives[].archive_path' "$EVIDENCE_DIR/catch-all.receipt-history.json")
           test "$archive_index" -eq 2
