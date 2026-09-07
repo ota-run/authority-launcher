@@ -28,5 +28,9 @@ pub mod attestor;
 pub mod linux_observations;
 #[cfg(target_os = "linux")]
 pub mod observation_collector;
+#[cfg(any(test, all(target_os = "linux", feature = "secret-delivery-pressure")))]
+// Step 7 pressure-only foundation; no production launcher route is authorized yet.
+#[allow(dead_code)]
+pub(crate) mod protected_launcher_capability;
 #[cfg(target_os = "linux")]
 pub mod systemd_client;

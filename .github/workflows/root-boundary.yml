@@ -74,6 +74,52 @@ jobs:
             CARGO_TARGET_DIR="$ROOT_TEST_TARGET" \
             cargo test unix::tests::root_launch_drops_uid_gid_and_supplementary_groups -- --exact
 
+      - name: Prove retained protected-launcher capability derivation
+        env:
+          CAPABILITY_TEST_TARGET: ${{ runner.temp }}/protected-launcher-capability-target
+          CAPABILITY_TEST_OUTPUT: ${{ runner.temp }}/protected-launcher-capability-test.txt
+        run: |
+          set -euo pipefail
+          verifier_source=$(mktemp)
+          binding_source=$(mktemp)
+          cleanup() {
+            rm -f "$verifier_source" "$binding_source"
+            sudo rm -f \
+              /etc/ota/secret-delivery/verifiers-v1.json \
+              /etc/ota/secret-delivery/bindings-v1.json
+            sudo rmdir /etc/ota/secret-delivery 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          printf '%s\n' '{"schema_version":1,"verifiers":[]}' > "$verifier_source"
+          printf '%s\n' '{"schema_version":1,"bindings":[]}' > "$binding_source"
+          sudo install -d -o root -g root -m 0700 /etc/ota/secret-delivery
+          sudo install -o root -g root -m 0400 \
+            "$verifier_source" /etc/ota/secret-delivery/verifiers-v1.json
+          sudo install -o root -g root -m 0400 \
+            "$binding_source" /etc/ota/secret-delivery/bindings-v1.json
+          cargo_bin_dir=$(dirname "$(command -v cargo)")
+          observed_rustup_home=$(rustup show home)
+          sudo systemd-run --quiet --wait --pipe --scope \
+            --slice=ota-authority-invocations.slice \
+            --unit=ota-authority-invocation-0123456789abcdef.scope \
+            env \
+              PATH="$cargo_bin_dir:/usr/bin:/bin" \
+              RUSTUP_HOME="$observed_rustup_home" \
+              CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+              CARGO_TARGET_DIR="$CAPABILITY_TEST_TARGET" \
+              cargo test --locked --features secret-delivery-pressure --lib \
+                protected_launcher_capability::privileged_linux_tests::retained_observation_derives_and_rejects_live_substitution \
+                -- --exact --ignored 2>&1 | tee "$CAPABILITY_TEST_OUTPUT"
+          test "$(grep -Fxc \
+            'test protected_launcher_capability::privileged_linux_tests::retained_observation_derives_and_rejects_live_substitution ... ok' \
+            "$CAPABILITY_TEST_OUTPUT")" -eq 1
+          test "$(grep -Ec \
+            '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' \
+            "$CAPABILITY_TEST_OUTPUT")" -eq 1
+          test "$(stat -c '%U:%G:%a' /etc/ota/secret-delivery)" = "root:root:700"
+          test "$(stat -c '%U:%G:%a' /etc/ota/secret-delivery/verifiers-v1.json)" = "root:root:400"
+          test "$(stat -c '%U:%G:%a' /etc/ota/secret-delivery/bindings-v1.json)" = "root:root:400"
+
       - name: Build pressure-only signed peer
         run: cargo build --features pressure-peer --bins
 

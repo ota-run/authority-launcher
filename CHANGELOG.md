@@ -26,6 +26,14 @@
 
 ## Unreleased
 
+- Pin Authority Protocol `ae3c8e99164c2d1db7f387f061f875272015bb36` and add the non-default
+  `secret-delivery-pressure` foundation for protected-launcher capability derivation. The launcher
+  can retain the two fixed root-owned authority stores through descriptor-relative `openat2`
+  resolution, observe a retained live Unix-stream descriptor and exact invocation cgroup, revalidate the
+  retained store bytes and descriptor metadata immediately before capability derivation. Raw
+  descriptor records and store bytes are not caller-supplied inputs to this path. No default
+  launcher flow or Core consumer is activated by this slice.
+
 - Reconcile the README with the completed bounded systemd carrier: remove stale preview/candidate
   wording, distinguish pressure-proven source from separately packaged release artifacts, and keep
   provider attestation as optional stronger hardening rather than an implied carrier property. The

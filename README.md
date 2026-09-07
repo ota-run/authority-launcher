@@ -284,6 +284,17 @@ hard refusal because it cannot establish child absence. An exact pre-scope child
 through Linux `pidfd`; a scope-bearing journal additionally requires the exact unit and kernel
 cgroup to be stopped and observed empty. PID reuse, identity mismatch, unsupported cleanup, or any
 uncertain outcome retains the slot and fails closed.
+
+The non-default `secret-delivery-pressure` feature contains the first protected capability
+foundation for V12.1 Step 7. It opens only the fixed verifier and binding stores beneath retained
+directory descriptors with Linux `openat2` no-symlink, no-magic-link, no-mount-crossing, and
+beneath-only resolution; requires the authority directory to be private and both stores to be
+root-owned regular mode-`0400` files; retains exact bytes and descriptor identities; and can observe
+a retained live Unix-stream session descriptor and invocation cgroup before deriving a protocol-verified
+`ProtectedLauncherCapabilityV1`. This slice does not transmit that capability to Core, request an
+OIDC token, contact Google, inject a secret, or change the default launcher path. Those remain
+separate reviewed boundaries.
+
 This path permits selected execution only after signed V3 admission and one bounded consumed
 lease. The selected Ota command creates its ordinary transaction-bound crossing receipt/archive;
 launcher terminal evidence separately binds Core's completion to exact child, scope, cgroup, and
