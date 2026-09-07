@@ -99,7 +99,7 @@ jobs:
             "$binding_source" /etc/ota/secret-delivery/bindings-v1.json
           cargo_bin_dir=$(dirname "$(command -v cargo)")
           observed_rustup_home=$(rustup show home)
-          sudo systemd-run --quiet --wait --scope \
+          sudo systemd-run --quiet --scope \
             --slice=ota-authority-invocations.slice \
             --unit=ota-authority-invocation-0123456789abcdef.scope \
             env \
