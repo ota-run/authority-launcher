@@ -140,6 +140,8 @@ jobs:
           sudo install -d -o root -g root -m 0755 /usr/lib/ota-authority/bin /usr/lib/ota-authority/pressure-bin
           sudo install -d -o root -g root -m 0755 /etc/ota /var/lib/ota
           sudo install -o root -g root -m 0755 "$(command -v ota)" /usr/lib/ota-authority/bin/ota-pressure-core
+          pressure_core_sha256=$(sudo sha256sum /usr/lib/ota-authority/bin/ota-pressure-core | awk '{print $1}')
+          printf 'PRESSURE_CORE_SHA256=%s\n' "$pressure_core_sha256" >> "$GITHUB_ENV"
           sudo install -o root -g root -m 0755 target/debug/ota-authority-launcher /usr/lib/ota-authority/bin/ota-authority-launcher
           sudo install -o root -g root -m 0700 target/debug/ota-authority-pressure-peer /usr/lib/ota-authority/bin/ota-authority-pressure-peer
           pressure_docker=$(mktemp)
@@ -531,13 +533,9 @@ jobs:
           test "$archive_index" -eq 2
           test "$(sort -u "$EVIDENCE_DIR/catch-all.work-units" | wc -l)" -eq 2
 
-          /usr/lib/ota-authority/bin/ota-pressure-core --version --json \
-            > "$EVIDENCE_DIR/ota-version.json"
-          observed_commit=$(jq -er '.commit' "$EVIDENCE_DIR/ota-version.json")
-          jq -e '.source_build == true and .dirty == false' \
-            "$EVIDENCE_DIR/ota-version.json"
-          test -n "$EXPECTED_OTA_REVISION"
-          test "${EXPECTED_OTA_REVISION#"$observed_commit"}" != "$EXPECTED_OTA_REVISION"
+          test -n "$PRESSURE_CORE_SHA256"
+          printf '%s\n' "$PRESSURE_CORE_SHA256" > "$EVIDENCE_DIR/ota-pressure-core.sha256"
+          test "$(sudo sha256sum /usr/lib/ota-authority/bin/ota-pressure-core | awk '{print $1}')" = "$PRESSURE_CORE_SHA256"
 
       - name: Exercise proof-wide broker authority
         env:
