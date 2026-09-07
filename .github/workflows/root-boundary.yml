@@ -531,7 +531,8 @@ jobs:
           test "$archive_index" -eq 2
           test "$(sort -u "$EVIDENCE_DIR/catch-all.work-units" | wc -l)" -eq 2
 
-          ota --version --json > "$EVIDENCE_DIR/ota-version.json"
+          /usr/lib/ota-authority/bin/ota-pressure-core --version --json \
+            > "$EVIDENCE_DIR/ota-version.json"
           observed_commit=$(jq -er '.commit' "$EVIDENCE_DIR/ota-version.json")
           jq -e '.source_build == true and .dirty == false' \
             "$EVIDENCE_DIR/ota-version.json"
