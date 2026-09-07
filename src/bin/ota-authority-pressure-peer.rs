@@ -70,6 +70,10 @@ const ATTESTOR_SIGNING_SEED: [u8; 32] = [10_u8; 32];
 const BROKER_KEY_ID: &str = "broker-2026-01";
 const ATTESTOR_KEY_ID: &str = "attestor-2026-01";
 const LAUNCHER_SESSION_BINDING_LABEL: &[u8] = b"ota-authority-pressure-launcher-session/v2";
+const MAXIMUM_APPROVAL_WAIT_SECONDS: i64 = 10;
+const MINIMUM_POST_APPROVAL_FRESHNESS_SECONDS: i64 = 30;
+const INSUFFICIENT_PRE_WAIT_ATTESTATION_SECONDS: i64 =
+    MAXIMUM_APPROVAL_WAIT_SECONDS + MINIMUM_POST_APPROVAL_FRESHNESS_SECONDS - 1;
 const RECOVERY_STATE_PATH: &str = "/var/lib/ota/pressure-consumption-recovery.json";
 const CATCH_ALL_STATE_PATH: &str = "/var/lib/ota/pressure-catch-all-invocation.json";
 const LATE_APPROVAL_STATE_PATH: &str = "/var/lib/ota/pressure-late-approval.json";
@@ -293,8 +297,8 @@ fn build_pressure_binding() -> Result<Value, String> {
             "lease_consumption_query": LEASE_CONSUMPTION_QUERY_DOMAIN_V1,
             "lease_consumption_status": LEASE_CONSUMPTION_STATUS_DOMAIN_V1
         },
-        "maximum_approval_wait_seconds": 2,
-        "minimum_post_approval_freshness_seconds": 30,
+        "maximum_approval_wait_seconds": MAXIMUM_APPROVAL_WAIT_SECONDS,
+        "minimum_post_approval_freshness_seconds": MINIMUM_POST_APPROVAL_FRESHNESS_SECONDS,
         "maximum_lease_seconds": 300
     });
     let binding_identity = message_identity(BROKER_BINDING_IDENTITY_DOMAIN_V2, &binding)
@@ -391,7 +395,7 @@ fn serve_session(
     }
     let attestation_lifetime_seconds = if matches!(scenario, Scenario::InsufficientPreWaitFreshness)
     {
-        31
+        INSUFFICIENT_PRE_WAIT_ATTESTATION_SECONDS
     } else {
         180
     };
@@ -415,7 +419,9 @@ fn serve_session(
                     || error.contains("Connection reset by peer") =>
             {
                 eprintln!(
-                    "pressure-peer-scenario: insufficient-pre-wait-freshness required-seconds=32 attestation-seconds=31 authorization-request=false"
+                    "pressure-peer-scenario: insufficient-pre-wait-freshness required-seconds={} attestation-seconds={} authorization-request=false",
+                    MAXIMUM_APPROVAL_WAIT_SECONDS + MINIMUM_POST_APPROVAL_FRESHNESS_SECONDS,
+                    INSUFFICIENT_PRE_WAIT_ATTESTATION_SECONDS,
                 );
                 Ok(())
             }
@@ -1237,6 +1243,18 @@ CapAmb:\t0000000000000000\n";
         assert_ne!(
             binding["broker_verifiers"][0]["public_key"],
             binding["attestation"]["verifiers"][0]["public_key"]
+        );
+        assert_eq!(
+            binding["maximum_approval_wait_seconds"],
+            MAXIMUM_APPROVAL_WAIT_SECONDS
+        );
+        assert_eq!(
+            binding["minimum_post_approval_freshness_seconds"],
+            MINIMUM_POST_APPROVAL_FRESHNESS_SECONDS
+        );
+        assert_eq!(
+            INSUFFICIENT_PRE_WAIT_ATTESTATION_SECONDS + 1,
+            MAXIMUM_APPROVAL_WAIT_SECONDS + MINIMUM_POST_APPROVAL_FRESHNESS_SECONDS
         );
 
         let mut unsigned = binding.clone();

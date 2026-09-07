@@ -349,7 +349,7 @@ jobs:
                 insufficient-pre-wait-freshness)
                   test ! -e "$repo/.ota"
                   grep -q 'crossing_broker_admission_refused' "$output"
-                  grep -q 'pressure-peer-scenario: insufficient-pre-wait-freshness required-seconds=32 attestation-seconds=31 authorization-request=false' "$output"
+                  grep -q 'pressure-peer-scenario: insufficient-pre-wait-freshness required-seconds=40 attestation-seconds=39 authorization-request=false' "$output"
                   ;;
                 pending-ambiguous)
                   test ! -e "$repo/.ota"
