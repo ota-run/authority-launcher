@@ -81,6 +81,12 @@ fn independent_pressure_workflow_retains_a_narrow_drift_guard() {
         !WORKFLOW.contains("-- --json run governed"),
         "the client JSON flag must remain before its delimiter"
     );
+    assert!(
+        !WORKFLOW.contains("cat \"$PRESSURE_REPOSITORY/selected-work-executed\""),
+        "the job principal must not read execution-principal output directly"
+    );
+    assert!(WORKFLOW.contains("--slurpfile client \"$EVIDENCE_DIR/production-client.json\""));
+    assert!(WORKFLOW.contains(".archives[0].archive_identity == $receipt_archive_identity"));
 }
 
 #[test]

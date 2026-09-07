@@ -306,7 +306,6 @@ jobs:
              and .terminal.finalization.cgroup_empty_or_absent == true
              and .terminal.finalization.active_slot_removed == true' \
             "$EVIDENCE_DIR/production-client.json"
-          test "$(cat "$PRESSURE_REPOSITORY/selected-work-executed")" = executed
 
       - name: Reverify protected receipt history
         env:
@@ -318,18 +317,21 @@ jobs:
             "$OTA" receipt --history \
               --source systemd_protected_launcher --json
           ) > "$EVIDENCE_DIR/protected-receipt-history.json"
-          jq -e \
-            '.ok == true
+          jq -e --slurpfile client "$EVIDENCE_DIR/production-client.json" \
+            '($client[0].terminal.finalization.completion.receipt_archive_identity
+              as $receipt_archive_identity
+              | .ok == true
              and .history_source == "systemd_protected_launcher"
              and .completeness_posture == "complete_selected_catalog_snapshot"
              and .summary.archive_count == 1
              and .summary.invalid_archive_count == 0
              and (.archives | length) == 1
              and (.invalid_archives | length) == 0
+             and .archives[0].archive_identity == $receipt_archive_identity
              and (.operator_profile_identity | startswith("sha256:"))
              and (.operator_peer_identity | startswith("sha256:"))
              and (.repository_binding_identity | startswith("sha256:"))
-             and (.catalog_snapshot_identity | startswith("sha256:"))' \
+             and (.catalog_snapshot_identity | startswith("sha256:")))' \
             "$EVIDENCE_DIR/protected-receipt-history.json"
 
       - name: Upload bounded public evidence
