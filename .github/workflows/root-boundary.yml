@@ -99,7 +99,7 @@ jobs:
             "$binding_source" /etc/ota/secret-delivery/bindings-v1.json
           cargo_bin_dir=$(dirname "$(command -v cargo)")
           observed_rustup_home=$(rustup show home)
-          sudo systemd-run --quiet --wait --pipe --scope \
+          sudo systemd-run --quiet --wait --scope \
             --slice=ota-authority-invocations.slice \
             --unit=ota-authority-invocation-0123456789abcdef.scope \
             env \
@@ -107,9 +107,10 @@ jobs:
               RUSTUP_HOME="$observed_rustup_home" \
               CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
               CARGO_TARGET_DIR="$CAPABILITY_TEST_TARGET" \
-              cargo test --locked --features secret-delivery-pressure --lib \
-                protected_launcher_capability::privileged_linux_tests::retained_observation_derives_and_rejects_live_substitution \
-                -- --exact --ignored 2>&1 | tee "$CAPABILITY_TEST_OUTPUT"
+              /bin/bash -c \
+                'cargo test --locked --features secret-delivery-pressure --lib protected_launcher_capability::privileged_linux_tests::retained_observation_derives_and_rejects_live_substitution -- --exact --ignored > "$1" 2>&1' \
+                _ "$CAPABILITY_TEST_OUTPUT"
+          cat "$CAPABILITY_TEST_OUTPUT"
           test "$(grep -Fxc \
             'test protected_launcher_capability::privileged_linux_tests::retained_observation_derives_and_rejects_live_substitution ... ok' \
             "$CAPABILITY_TEST_OUTPUT")" -eq 1
