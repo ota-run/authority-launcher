@@ -118,8 +118,8 @@ jobs:
             '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' \
             "$CAPABILITY_TEST_OUTPUT")" -eq 1
           test "$(stat -c '%U:%G:%a' /etc/ota/secret-delivery)" = "root:root:700"
-          test "$(stat -c '%U:%G:%a' /etc/ota/secret-delivery/verifiers-v1.json)" = "root:root:400"
-          test "$(stat -c '%U:%G:%a' /etc/ota/secret-delivery/bindings-v1.json)" = "root:root:400"
+          test "$(sudo stat -c '%U:%G:%a' /etc/ota/secret-delivery/verifiers-v1.json)" = "root:root:400"
+          test "$(sudo stat -c '%U:%G:%a' /etc/ota/secret-delivery/bindings-v1.json)" = "root:root:400"
 
       - name: Build pressure-only signed peer
         run: cargo build --features pressure-peer --bins
