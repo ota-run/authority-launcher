@@ -416,14 +416,17 @@ jobs:
           test "$(wc -c < "$recovery_repo/broker-executed")" -eq 1
           grep -q 'pressure-peer-scenario: recovered-consumed-status' "$recovery_second"
           grep -q 'pressure-peer-scenario: recovery-consumed-then-fresh-consumed' "$recovery_second"
-          sudo jq -s -e '
+          recovery_state_dir="$recovery_repo/.ota/state/crossings"
+          test "$(sudo find "$recovery_state_dir" -mindepth 2 -maxdepth 2 -type f -name '*.json' -print | wc -l)" -ge 1
+          sudo find "$recovery_state_dir" -mindepth 2 -maxdepth 2 -type f -name '*.json' \
+            -exec jq -s -e '
             map(select(
               .state == "incomplete" and
               .receipt_status == "broker_consumption_recovered_without_execution" and
               .broker_consumption.consume_response.payload.state == "consumed" and
               .broker_consumption_recovery.status.payload.status.state == "consumed"
             )) | length == 1
-          ' "$recovery_repo"/.ota/state/crossings/*/*.json
+          ' {} +
           (
             cd "$recovery_repo"
             sudo -u ota-pressure \
