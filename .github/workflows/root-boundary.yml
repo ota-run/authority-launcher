@@ -535,7 +535,13 @@ jobs:
 
           test -n "$PRESSURE_CORE_SHA256"
           printf '%s\n' "$PRESSURE_CORE_SHA256" > "$EVIDENCE_DIR/ota-pressure-core.sha256"
-          test "$(sudo sha256sum /usr/lib/ota-authority/bin/ota-pressure-core | awk '{print $1}')" = "$PRESSURE_CORE_SHA256"
+          observed_pressure_core_sha256=$(sudo sha256sum /usr/lib/ota-authority/bin/ota-pressure-core | awk '{print $1}')
+          printf 'expected=%s\nobserved=%s\n' \
+            "$PRESSURE_CORE_SHA256" "$observed_pressure_core_sha256" \
+            > "$EVIDENCE_DIR/ota-pressure-core-integrity.txt"
+          sudo stat -c '%U:%G:%a:%s' /usr/lib/ota-authority/bin/ota-pressure-core \
+            | tee -a "$EVIDENCE_DIR/ota-pressure-core-integrity.txt" >/dev/null
+          test "$observed_pressure_core_sha256" = "$PRESSURE_CORE_SHA256"
 
       - name: Exercise proof-wide broker authority
         env:
