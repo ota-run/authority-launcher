@@ -138,6 +138,19 @@ reusable credentials. The envelope and every parent component are
 root-owned and non-writable; the file is regular, singularly linked, mode `0644`, and exists only
 so the unprivileged workflow can bind retained evidence to the administrator-installed clients.
 
+## Retain Hosted Evidence
+
+GitHub Actions retains the hosted evidence artifact for only 30 days. Preserve the exact public ZIP
+outside Actions retention before treating a run as a durable review record. The completed bounded
+governed-invocation witness is retained at
+[`docs/pressure/retained-artifacts/systemd-v3-independently-administered-34159892077.zip`](pressure/retained-artifacts/systemd-v3-independently-administered-34159892077.zip).
+Its SHA-256 is `0b15512fe736bee4b35a2dd205a5e9e3d68a9af496ee86f812c364b4f322258f`; see the adjacent
+artifact index for its source run, revision, and content limits.
+
+Runner-group access is intentionally not represented as a run-bound fact. Independently check its
+current GitHub configuration against the exact two-repository and four branch-pinned workflow list
+below; it is mutable operational configuration, not retained hosted-artifact evidence.
+
 ## Register The Runner
 
 Register the runner at the `ota-run` organization level in a dedicated runner group as
