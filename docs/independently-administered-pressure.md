@@ -140,9 +140,23 @@ so the unprivileged workflow can bind retained evidence to the administrator-ins
 
 ## Register The Runner
 
-Register the repository-scoped GitHub Actions runner for `ota-run/authority-launcher` as
-`ota-authority-job`, install the canonical unit above, provision while that unit is stopped, then
-enable it with these labels:
+Register the runner at the `ota-run` organization level in a dedicated runner group as
+`ota-authority-job`. Restrict that group to exactly `ota-run/authority-launcher` and
+`ota-run/ota`: Launcher owns the protected-runner pressure workflows, while Core owns the
+no-checkout OIDC endpoint-compatibility workflow. A repository-scoped Launcher runner cannot
+execute the Core workflow. Do not grant the group access to other repositories or use it for
+general CI. Because both repositories are public, enable public-repository access only together
+with workflow restrictions. Allow exactly these branch-pinned workflow references:
+
+```text
+ota-run/ota/.github/workflows/secret-delivery-oidc-endpoint-evidence.yml@refs/heads/1.6.28-implementation
+ota-run/authority-launcher/.github/workflows/systemd-v3-independently-administered.yml@refs/heads/1.6.28-implementation
+ota-run/authority-launcher/.github/workflows/systemd-v3-independently-administered-recovery.yml@refs/heads/1.6.28-implementation
+ota-run/authority-launcher/.github/workflows/systemd-v3-independently-administered-recovery-trigger.yml@refs/heads/1.6.28-implementation
+```
+
+Install the canonical unit above, provision while that unit is stopped, then enable it with these
+labels:
 
 ```text
 self-hosted, Linux, X64, ota-authority-independent

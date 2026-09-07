@@ -73,6 +73,14 @@ fn independent_pressure_workflow_retains_a_narrow_drift_guard() {
     assert!(WORKFLOW.contains("core_source_revision == $commit"));
     assert!(!WORKFLOW.contains("core_source_revision | startswith"));
     assert!(WORKFLOW.contains("job-principal process escaped protected runner cgroup"));
+    assert!(WORKFLOW.contains(concat!(
+        "--repository \"$PRESSURE_REPOSITORY\" \\\n",
+        "            --json -- run governed --grant \"$AUTHORITY_ID\" --receipt"
+    )));
+    assert!(
+        !WORKFLOW.contains("-- --json run governed"),
+        "the client JSON flag must remain before its delimiter"
+    );
 }
 
 #[test]
@@ -142,7 +150,19 @@ fn independent_recovery_trigger_is_runner_owned_and_non_administrative() {
     assert!(!RECOVERY_TRIGGER_WORKFLOW.contains("pull_request:"));
     assert!(RECOVERY_TRIGGER_WORKFLOW.contains("ota-authority-independent"));
     assert!(RECOVERY_TRIGGER_WORKFLOW.contains("ota-authority-systemd-client"));
-    assert!(RECOVERY_TRIGGER_WORKFLOW.contains("--administrator-controlled-recovery"));
+    assert!(RECOVERY_TRIGGER_WORKFLOW.contains(concat!(
+        "--repository \"$PRESSURE_REPOSITORY\" \\\n",
+        "            --json --administrator-controlled-recovery -- \\\n",
+        "            run governed --grant \"$AUTHORITY_ID\" --receipt"
+    )));
+    assert!(
+        !RECOVERY_TRIGGER_WORKFLOW.contains("-- --json"),
+        "the client JSON flag must remain before its delimiter"
+    );
+    assert!(
+        !RECOVERY_TRIGGER_WORKFLOW.contains("-- --administrator-controlled-recovery"),
+        "the recovery policy must remain client-owned before its delimiter"
+    );
     assert!(RECOVERY_TRIGGER_WORKFLOW.contains("output_incomplete"));
     assert!(RECOVERY_TRIGGER_WORKFLOW.contains("launcher_service_unavailable"));
     assert!(

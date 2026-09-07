@@ -280,6 +280,8 @@ jobs:
                | $installation[0].core_source_revision == $commit)' \
             "$EVIDENCE_DIR/ota-version.json"
           sha256sum "$CLIENT" "$OTA" > "$EVIDENCE_DIR/installed-client-identities.txt"
+          "$CLIENT" --help | tee "$EVIDENCE_DIR/production-client-help.txt"
+          grep -F -- '--json' "$EVIDENCE_DIR/production-client-help.txt" >/dev/null
           id > "$EVIDENCE_DIR/job-principal.txt"
           uname -a > "$EVIDENCE_DIR/kernel.txt"
 
@@ -291,8 +293,7 @@ jobs:
           "$CLIENT" \
             --authority-id "$AUTHORITY_ID" \
             --repository "$PRESSURE_REPOSITORY" \
-            --json -- \
-            run governed --grant "$AUTHORITY_ID" --receipt \
+            --json -- run governed --grant "$AUTHORITY_ID" --receipt \
             > "$EVIDENCE_DIR/production-client.json"
           jq -e \
             '.ok == true
