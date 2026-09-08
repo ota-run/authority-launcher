@@ -38,15 +38,14 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::attestation_client::{load_producer_binding, request_capability_observation_signature};
-use crate::installation_manifest::load_capability_projection_verifier;
+use crate::installation_manifest::{
+    CAPABILITY_OBSERVATION_REPLAY_DIRECTORY, load_capability_projection_verifier,
+};
 use crate::protected_launcher_capability::{
     ProtectedLauncherCapabilityContextV1, ProtectedLauncherCapabilityError,
     RetainedProtectedLauncherObservationV1, derive_protected_launcher_capability_v1,
     open_protected_directory_chain, open_root, openat2_beneath, openat2_beneath_with_mode,
 };
-
-pub(crate) const CAPABILITY_OBSERVATION_REPLAY_DIRECTORY: &str =
-    "/var/lib/ota/authority-launcher/capability-observation-replay";
 
 #[derive(Debug, Error)]
 pub(crate) enum ProtectedCapabilityObservationError {

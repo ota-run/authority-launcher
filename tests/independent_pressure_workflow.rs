@@ -68,6 +68,7 @@ fn independent_pressure_workflow_retains_a_narrow_drift_guard() {
     assert!(WORKFLOW.contains("inactive_or_not_found_before_mutation"));
     assert!(WORKFLOW.contains("no_loaded_systemd_socket_unit_owns_managed_path_before_mutation"));
     assert!(WORKFLOW.contains("expected_authority_state_paths"));
+    assert!(WORKFLOW.contains("\"/var/lib/ota/authority-launcher/capability-observation-replay\""));
     assert!(WORKFLOW.contains("/run/ota/authority-history.sock"));
     assert!(WORKFLOW.contains("prepared runner publication gate is invalid"));
     assert!(WORKFLOW.contains("core_source_revision == $commit"));

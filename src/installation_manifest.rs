@@ -46,6 +46,8 @@ pub(crate) const SYSTEMD_INSTALLATION_MANIFEST_PATH: &str =
     "/etc/ota/authority-launcher-installation.json";
 pub(crate) const CAPABILITY_PROJECTION_VERIFIER_PATH: &str =
     "/usr/share/ota/authority-launcher/capability-projection-verifier-v1.json";
+pub(crate) const CAPABILITY_OBSERVATION_REPLAY_DIRECTORY: &str =
+    "/var/lib/ota/authority-launcher/capability-observation-replay";
 const INSTALLATION_MANIFEST_IDENTITY_DOMAIN_V1: &str =
     "ota.authority-launcher.installation-manifest.v1\0";
 const HISTORY_INSTALLATION_IDENTITY_DOMAIN_V1: &str =
