@@ -1510,7 +1510,6 @@ fn managed_authority_state_paths() -> Vec<&'static str> {
         VERIFIER_SET,
         INSTALLATION_MANIFEST,
         PUBLIC_INSTALLATION_EVIDENCE_ROOT,
-        CAPABILITY_OBSERVATION_REPLAY_DIRECTORY,
         BROKER_STORE,
         SIGNING_KEY,
         BROKER_SIGNING_KEY,
@@ -1518,6 +1517,7 @@ fn managed_authority_state_paths() -> Vec<&'static str> {
         BROKER_SCENARIO,
         ISSUANCE_STATE,
         LAUNCHER_STATE,
+        CAPABILITY_OBSERVATION_REPLAY_DIRECTORY,
         LAUNCHER_RUNTIME,
         LAUNCHER_SOCKET,
         ATTESTOR_SOCKET,
@@ -2170,7 +2170,11 @@ mod tests {
         assert!(
             protected_directories().contains(&(CAPABILITY_OBSERVATION_REPLAY_DIRECTORY, 0o700))
         );
-        assert!(managed_authority_state_paths().contains(&CAPABILITY_OBSERVATION_REPLAY_DIRECTORY));
+        assert!(
+            managed_authority_state_paths()
+                .windows(2)
+                .any(|paths| paths == [LAUNCHER_STATE, CAPABILITY_OBSERVATION_REPLAY_DIRECTORY])
+        );
         assert!(protected_directories().contains(&(HISTORY_BLOB_ROOT, 0o700)));
         assert!(protected_directories().contains(&(HISTORY_CATALOG_ROOT, 0o700)));
         assert!(
