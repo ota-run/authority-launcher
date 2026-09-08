@@ -99,6 +99,7 @@ jobs:
             "$binding_source" /etc/ota/secret-delivery/bindings-v1.json
           cargo_bin_dir=$(dirname "$(command -v cargo)")
           observed_rustup_home=$(rustup show home)
+          capability_test_status=0
           sudo systemd-run --quiet --scope \
             --slice=ota-authority-invocations.slice \
             --unit=ota-authority-invocation-0123456789abcdef.scope \
@@ -109,8 +110,9 @@ jobs:
               CARGO_TARGET_DIR="$CAPABILITY_TEST_TARGET" \
               /bin/bash -c \
                 'cargo test --locked --features secret-delivery-pressure,protected-attestor --lib protected_launcher_capability::privileged_linux_tests::retained_observation_derives_and_rejects_live_substitution -- --exact --ignored > "$1" 2>&1' \
-                _ "$CAPABILITY_TEST_OUTPUT"
+                _ "$CAPABILITY_TEST_OUTPUT" || capability_test_status=$?
           cat "$CAPABILITY_TEST_OUTPUT"
+          test "$capability_test_status" -eq 0
           test "$(grep -Fxc \
             'test protected_launcher_capability::privileged_linux_tests::retained_observation_derives_and_rejects_live_substitution ... ok' \
             "$CAPABILITY_TEST_OUTPUT")" -eq 1
