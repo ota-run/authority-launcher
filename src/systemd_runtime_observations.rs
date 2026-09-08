@@ -33,7 +33,10 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::config::SystemdLauncherServiceConfigV1;
-use crate::installation_manifest::{ProtectedInstallationManifestV1, ProtectedInstallationRoleV1};
+use crate::installation_manifest::{
+    CAPABILITY_OBSERVATION_REPLAY_DIRECTORY, ProtectedInstallationManifestV1,
+    ProtectedInstallationRoleV1,
+};
 
 const LAUNCHER_SERVICE_UNIT: &str = "ota-authority-launcher.service";
 const LAUNCHER_SOCKET_UNIT: &str = "ota-authority-launcher.socket";
@@ -309,21 +312,11 @@ fn verify_service_properties(
         "RestrictAddressFamilies",
         &["AF_INET", "AF_INET6", "AF_UNIX"],
     )?;
-    let mut writable = vec![
-        Path::new("/run/ota/authority-launcher"),
-        Path::new("/var/lib/ota/authority-launcher"),
-    ];
-    if installation
+    let include_history = installation
         .optional_singular_path(ProtectedInstallationRoleV1::HistoryBinding)
         .map_err(|_| SystemdRuntimeObservationError::Mismatch)?
-        .is_some()
-    {
-        writable.extend([
-            Path::new(crate::protected_history::HISTORY_BLOB_ROOT),
-            Path::new(crate::protected_history::HISTORY_CATALOG_ROOT),
-        ]);
-    }
-    writable.extend(config.allowed_repository_roots.iter().map(PathBuf::as_path));
+        .is_some();
+    let writable = launcher_writable_paths(&config.allowed_repository_roots, include_history);
     require_path_set(values, "ReadWritePaths", writable)?;
     let mut read_only = vec![Path::new("/etc/ota")];
     read_only.extend(installation.files.iter().map(|entry| entry.path.as_path()));
@@ -332,6 +325,25 @@ fn verify_service_properties(
     read_only.push(Path::new(SYSTEMD_ATTESTOR_SOCKET_PATH_V1));
     require_path_set(values, "ReadOnlyPaths", read_only)?;
     Ok(())
+}
+
+fn launcher_writable_paths(
+    allowed_repository_roots: &[PathBuf],
+    include_history: bool,
+) -> Vec<&Path> {
+    let mut writable = vec![
+        Path::new("/run/ota/authority-launcher"),
+        Path::new("/var/lib/ota/authority-launcher"),
+        Path::new(CAPABILITY_OBSERVATION_REPLAY_DIRECTORY),
+    ];
+    if include_history {
+        writable.extend([
+            Path::new(crate::protected_history::HISTORY_BLOB_ROOT),
+            Path::new(crate::protected_history::HISTORY_CATALOG_ROOT),
+        ]);
+    }
+    writable.extend(allowed_repository_roots.iter().map(PathBuf::as_path));
+    writable
 }
 
 fn verify_socket_properties(
@@ -542,6 +554,20 @@ mod tests {
                 &["cap_kill", "cap_setuid", "cap_sys_ptrace"],
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn launcher_runtime_writable_paths_include_the_capability_replay_store() {
+        let repositories = vec![PathBuf::from("/srv/repository")];
+        assert_eq!(
+            launcher_writable_paths(&repositories, false),
+            vec![
+                Path::new("/run/ota/authority-launcher"),
+                Path::new("/var/lib/ota/authority-launcher"),
+                Path::new(CAPABILITY_OBSERVATION_REPLAY_DIRECTORY),
+                Path::new("/srv/repository"),
+            ]
         );
     }
 }
