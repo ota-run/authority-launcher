@@ -39,12 +39,17 @@ use ota_authority_protocol::{
     CHALLENGE_REQUEST_DOMAIN_V1, LEASE_CONSUME_DOMAIN_V1, LEASE_CONSUME_RESPONSE_DOMAIN_V1,
     LEASE_CONSUMPTION_QUERY_DOMAIN_V1, LEASE_CONSUMPTION_STATUS_DOMAIN_V1,
     LEASE_ISSUANCE_DOMAIN_V1, LauncherAttestationProducerBindingV1, LauncherWorkingDirectoryV1,
-    SYSTEMD_JOB_PRINCIPAL_PROFILE_ID_V2, SYSTEMD_LAUNCHER_PROFILE_ID_V3,
-    SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1, SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3,
+    PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_PROJECTION_KEY_USAGE_V1,
+    PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_SIGNATURE_DOMAIN_V1,
+    PROTECTED_LAUNCHER_CAPABILITY_PROJECTION_VERIFIER,
+    ProtectedLauncherCapabilityProjectionVerifierV1, SYSTEMD_JOB_PRINCIPAL_PROFILE_ID_V2,
+    SYSTEMD_LAUNCHER_PROFILE_ID_V3, SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1,
+    SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3,
     launcher_attestation_producer_binding_v1_identity, launcher_working_directory_identity,
-    message_identity, sha256_identity, systemd_job_principal_profile_identity,
-    systemd_job_principal_profile_v2, systemd_launcher_profile_identity,
-    systemd_launcher_profile_v3,
+    message_identity, protected_launcher_capability_projection_key_identity_v1,
+    protected_launcher_capability_projection_verifier_v1_identity, sha256_identity,
+    systemd_job_principal_profile_identity, systemd_job_principal_profile_v2,
+    systemd_launcher_profile_identity, systemd_launcher_profile_v3,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -59,7 +64,8 @@ use crate::config::{
     systemd_launcher_service_config_identity,
 };
 use crate::installation_manifest::{
-    ProtectedInstallationFileV1, ProtectedInstallationManifestV1, ProtectedInstallationRoleV1,
+    CAPABILITY_PROJECTION_VERIFIER_PATH, ProtectedInstallationFileV1,
+    ProtectedInstallationManifestV1, ProtectedInstallationRoleV1,
     broker_proxy_installation_identity, protected_history_installation_identity,
     protected_installation_manifest_identity,
 };
@@ -412,11 +418,36 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         "verifiers": [{
             "key_id": "systemd-attestor-pressure-v1",
             "algorithm": "ed25519",
-            "public_key": public_key,
+            "public_key": public_key.clone(),
             "public_key_identity": public_key_identity,
         }]
     });
     write_json(Path::new(VERIFIER_SET), &verifier_set, 0o644)?;
+    let mut capability_projection_verifier = ProtectedLauncherCapabilityProjectionVerifierV1 {
+        schema_version: 1,
+        record_kind: PROTECTED_LAUNCHER_CAPABILITY_PROJECTION_VERIFIER.into(),
+        identity: String::new(),
+        public_key: public_key.clone(),
+        key_identity: protected_launcher_capability_projection_key_identity_v1(&public_key)
+            .map_err(|_| String::from("capability projection key identity unavailable"))?,
+        key_usage: PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_PROJECTION_KEY_USAGE_V1.into(),
+        signature_domain: std::str::from_utf8(
+            PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_SIGNATURE_DOMAIN_V1,
+        )
+        .map_err(|_| String::from("capability projection signature domain unavailable"))?
+        .into(),
+    };
+    capability_projection_verifier.identity =
+        protected_launcher_capability_projection_verifier_v1_identity(
+            &capability_projection_verifier,
+        )
+        .map_err(|_| String::from("capability projection verifier identity unavailable"))?;
+    create_root_directory(Path::new(PUBLIC_INSTALLATION_EVIDENCE_ROOT), 0o755)?;
+    write_json(
+        Path::new(CAPABILITY_PROJECTION_VERIFIER_PATH),
+        &capability_projection_verifier,
+        0o644,
+    )?;
 
     let launcher_service_identity = sha256_file(Path::new(LAUNCHER_SERVICE))?;
     let launcher_socket_identity = sha256_file(Path::new(LAUNCHER_SOCKET_UNIT))?;
@@ -827,6 +858,10 @@ fn protected_role_paths(
         (
             ProtectedInstallationRoleV1::AttestorVerifierSet,
             PathBuf::from(VERIFIER_SET),
+        ),
+        (
+            ProtectedInstallationRoleV1::CapabilityProjectionVerifier,
+            PathBuf::from(CAPABILITY_PROJECTION_VERIFIER_PATH),
         ),
         (
             ProtectedInstallationRoleV1::AttestorServiceUnit,

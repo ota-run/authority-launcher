@@ -26,13 +26,17 @@
 
 ## Unreleased
 
-- Pin Authority Protocol `ae3c8e99164c2d1db7f387f061f875272015bb36` and add the non-default
-  `secret-delivery-pressure` foundation for protected-launcher capability derivation. The launcher
-  can retain the two fixed root-owned authority stores through descriptor-relative `openat2`
-  resolution, observe a retained live Unix-stream descriptor and exact invocation cgroup, revalidate the
-  retained store bytes and descriptor metadata immediately before capability derivation. Raw
-  descriptor records and store bytes are not caller-supplied inputs to this path. No default
-  launcher flow or Core consumer is activated by this slice.
+- Pin Authority Protocol `e0af492ba8a6fbe01e805c79762909c9cda28198` and add the Linux
+  protected-attestor foundation for protected-launcher capability observation. The launcher can
+  retain the two fixed root-owned authority stores through descriptor-relative `openat2`
+  resolution, observe a retained live Unix-stream descriptor and exact invocation cgroup, and
+  revalidate retained store bytes and descriptor metadata immediately before capability derivation.
+  A fixed root-owned replay store reserves a fresh Protocol challenge before derivation and records
+  its consumed protected capability and public projection identities only after the separately
+  protected Attestor signs and Launcher reconciles the exact Protocol request and response. Raw
+  descriptor records, store bytes, and capability identity are not
+  caller-supplied inputs or public projection fields. No default launcher flow, Core consumer,
+  provider contact, or secret delivery is activated by this foundation.
 
 - Reconcile the README with the completed bounded systemd carrier: remove stale preview/candidate
   wording, distinguish pressure-proven source from separately packaged release artifacts, and keep

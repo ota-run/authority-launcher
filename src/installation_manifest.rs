@@ -26,11 +26,14 @@
 //! identities only, never producer credentials or private key material.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Seek;
 use std::path::{Path, PathBuf};
 
 use ota_authority_protocol::{
-    message_identity, systemd_job_principal_profile_identity, systemd_job_principal_profile_v2,
+    ProtectedLauncherCapabilityProjectionVerifierV1, message_identity,
+    systemd_job_principal_profile_identity, systemd_job_principal_profile_v2,
     systemd_launcher_profile_identity, systemd_launcher_profile_v3,
+    validate_protected_launcher_capability_projection_verifier_v1,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -41,6 +44,8 @@ use crate::config::{
 
 pub(crate) const SYSTEMD_INSTALLATION_MANIFEST_PATH: &str =
     "/etc/ota/authority-launcher-installation.json";
+pub(crate) const CAPABILITY_PROJECTION_VERIFIER_PATH: &str =
+    "/usr/share/ota/authority-launcher/capability-projection-verifier-v1.json";
 const INSTALLATION_MANIFEST_IDENTITY_DOMAIN_V1: &str =
     "ota.authority-launcher.installation-manifest.v1\0";
 const HISTORY_INSTALLATION_IDENTITY_DOMAIN_V1: &str =
@@ -74,6 +79,7 @@ pub(crate) enum ProtectedInstallationRoleV1 {
     AttestorExecutable,
     AttestorConfiguration,
     AttestorVerifierSet,
+    CapabilityProjectionVerifier,
     AttestorServiceUnit,
     AttestorServiceDropIn,
     AttestorSocketUnit,
@@ -91,6 +97,58 @@ pub(crate) enum ProtectedInstallationRoleV1 {
     HistoryBinding,
     HistoryServiceUnit,
     HistorySocketUnit,
+}
+
+#[allow(dead_code)] // Used by the library-owned protected observation service path.
+pub(crate) fn load_capability_projection_verifier()
+-> Result<ProtectedLauncherCapabilityProjectionVerifierV1, InstallationManifestError> {
+    load_capability_projection_verifier_at(
+        Path::new(SYSTEMD_INSTALLATION_MANIFEST_PATH),
+        Path::new(CAPABILITY_PROJECTION_VERIFIER_PATH),
+        0,
+        Path::new("/"),
+    )
+}
+
+#[allow(dead_code)]
+fn load_capability_projection_verifier_at(
+    manifest_path: &Path,
+    verifier_path: &Path,
+    expected_owner_uid: u32,
+    trusted_root: &Path,
+) -> Result<ProtectedLauncherCapabilityProjectionVerifierV1, InstallationManifestError> {
+    let manifest_file = open_protected_file(manifest_path, expected_owner_uid, trusted_root)
+        .map_err(map_config_error)?;
+    let manifest: ProtectedInstallationManifestV1 =
+        serde_json::from_reader(manifest_file).map_err(|_| InstallationManifestError::Malformed)?;
+    if manifest.schema_version != 1
+        || manifest.identity != protected_installation_manifest_identity(&manifest)?
+    {
+        return Err(InstallationManifestError::Mismatch);
+    }
+    require_exact_singular_path(
+        &manifest,
+        ProtectedInstallationRoleV1::CapabilityProjectionVerifier,
+        verifier_path,
+    )?;
+
+    let mut verifier_file = open_protected_file(verifier_path, expected_owner_uid, trusted_root)
+        .map_err(map_config_error)?;
+    let verifier_file_identity =
+        sha256_file_identity(&mut verifier_file).map_err(map_config_error)?;
+    if manifest.singular_identity(ProtectedInstallationRoleV1::CapabilityProjectionVerifier)?
+        != verifier_file_identity
+    {
+        return Err(InstallationManifestError::Mismatch);
+    }
+    verifier_file
+        .rewind()
+        .map_err(|_| InstallationManifestError::Unavailable)?;
+    let verifier: ProtectedLauncherCapabilityProjectionVerifierV1 =
+        serde_json::from_reader(verifier_file).map_err(|_| InstallationManifestError::Malformed)?;
+    validate_protected_launcher_capability_projection_verifier_v1(&verifier)
+        .map_err(|_| InstallationManifestError::Malformed)?;
+    Ok(verifier)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -526,12 +584,105 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ed25519_dalek::SigningKey;
+    use ota_authority_protocol::{
+        PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_PROJECTION_KEY_USAGE_V1,
+        PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_SIGNATURE_DOMAIN_V1,
+        PROTECTED_LAUNCHER_CAPABILITY_PROJECTION_VERIFIER,
+        protected_launcher_capability_projection_key_identity_v1,
+        protected_launcher_capability_projection_verifier_v1_identity,
+    };
     use tempfile::tempdir;
 
     use super::*;
     use crate::config::{
         RunAs, SessionPeer, SystemdPrincipalMappingV1, systemd_launcher_service_config_identity,
     };
+
+    #[test]
+    fn capability_projection_verifier_is_bound_to_protected_installation() {
+        let root = tempdir().expect("temporary protected root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("protected root permissions");
+        let owner = unsafe { libc::geteuid() };
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes());
+        let mut verifier = ProtectedLauncherCapabilityProjectionVerifierV1 {
+            schema_version: 1,
+            record_kind: PROTECTED_LAUNCHER_CAPABILITY_PROJECTION_VERIFIER.into(),
+            identity: String::new(),
+            public_key: public_key.clone(),
+            key_identity: protected_launcher_capability_projection_key_identity_v1(&public_key)
+                .expect("key identity"),
+            key_usage: PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_PROJECTION_KEY_USAGE_V1.into(),
+            signature_domain: std::str::from_utf8(
+                PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_SIGNATURE_DOMAIN_V1,
+            )
+            .expect("signature domain")
+            .into(),
+        };
+        verifier.identity =
+            protected_launcher_capability_projection_verifier_v1_identity(&verifier)
+                .expect("verifier identity");
+        let verifier_path = root.path().join("capability-verifier.json");
+        fs::write(
+            &verifier_path,
+            serde_json::to_vec(&verifier).expect("serialized verifier"),
+        )
+        .expect("verifier file");
+        fs::set_permissions(&verifier_path, fs::Permissions::from_mode(0o600))
+            .expect("verifier permissions");
+        let mut verifier_file =
+            open_protected_file(&verifier_path, owner, root.path()).expect("protected verifier");
+        let verifier_file_identity =
+            sha256_file_identity(&mut verifier_file).expect("verifier file identity");
+        let mut manifest = ProtectedInstallationManifestV1 {
+            schema_version: 1,
+            identity: String::new(),
+            launcher_configuration_identity: format!("sha256:{}", "1".repeat(64)),
+            launcher_profile_identity: format!("sha256:{}", "2".repeat(64)),
+            job_principal_profile_identity: format!("sha256:{}", "3".repeat(64)),
+            files: vec![ProtectedInstallationFileV1 {
+                role: ProtectedInstallationRoleV1::CapabilityProjectionVerifier,
+                path: verifier_path.clone(),
+                identity: verifier_file_identity,
+            }],
+        };
+        manifest.identity =
+            protected_installation_manifest_identity(&manifest).expect("manifest identity");
+        let manifest_path = root.path().join("installation.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("serialized manifest"),
+        )
+        .expect("manifest file");
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
+            .expect("manifest permissions");
+
+        assert_eq!(
+            load_capability_projection_verifier_at(
+                &manifest_path,
+                &verifier_path,
+                owner,
+                root.path(),
+            )
+            .expect("bound verifier"),
+            verifier
+        );
+
+        fs::write(&verifier_path, b"{}").expect("substitute verifier");
+        assert_eq!(
+            load_capability_projection_verifier_at(
+                &manifest_path,
+                &verifier_path,
+                owner,
+                root.path(),
+            ),
+            Err(InstallationManifestError::Mismatch)
+        );
+    }
 
     #[test]
     fn history_installation_projection_breaks_the_binding_manifest_hash_cycle() {

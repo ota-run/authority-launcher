@@ -111,6 +111,10 @@ pub(crate) struct RetainedProtectedLauncherObservationV1 {
 }
 
 #[cfg(target_os = "linux")]
+type ReobservedProtectedLauncherState<'a> =
+    ([ProtectedLauncherDescriptorV1; 4], &'a [u8], &'a [u8]);
+
+#[cfg(target_os = "linux")]
 impl RetainedProtectedLauncherObservationV1 {
     pub(crate) fn observe(
         stores: ProtectedAuthorityStoresV1,
@@ -129,8 +133,7 @@ impl RetainedProtectedLauncherObservationV1 {
     fn reobserve(
         &mut self,
         scope: &LauncherSystemdScopeV1,
-    ) -> Result<([ProtectedLauncherDescriptorV1; 4], &[u8], &[u8]), ProtectedLauncherCapabilityError>
-    {
+    ) -> Result<ReobservedProtectedLauncherState<'_>, ProtectedLauncherCapabilityError> {
         self.stores.revalidate()?;
         self.cgroup.revalidate(scope)?;
         let session_descriptor = observe_launcher_session_descriptor_v1(&self.session)?;
@@ -499,7 +502,7 @@ fn socket_option_int(
 }
 
 #[cfg(target_os = "linux")]
-fn open_root(
+pub(crate) fn open_root(
     path: &Path,
     expected_uid: u32,
     expected_gid: u32,
@@ -521,7 +524,7 @@ fn open_root(
 }
 
 #[cfg(target_os = "linux")]
-fn open_protected_directory_chain(
+pub(crate) fn open_protected_directory_chain(
     root: RawFd,
     path: &Path,
     expected_uid: u32,
@@ -697,10 +700,19 @@ struct OpenHow {
 }
 
 #[cfg(target_os = "linux")]
-fn openat2_beneath(
+pub(crate) fn openat2_beneath(
     parent: RawFd,
     name: &[u8],
     flags: i32,
+) -> Result<OwnedFd, ProtectedLauncherCapabilityError> {
+    openat2_beneath_with_mode(parent, name, flags, 0)
+}
+
+pub(crate) fn openat2_beneath_with_mode(
+    parent: RawFd,
+    name: &[u8],
+    flags: i32,
+    mode: u64,
 ) -> Result<OwnedFd, ProtectedLauncherCapabilityError> {
     const RESOLVE_NO_XDEV: u64 = 0x01;
     const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
@@ -709,7 +721,7 @@ fn openat2_beneath(
     let name = CString::new(name).map_err(|_| ProtectedLauncherCapabilityError::Unprotected)?;
     let how = OpenHow {
         flags: flags as u64,
-        mode: 0,
+        mode,
         resolve: RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
     };
     let descriptor = unsafe {
@@ -930,15 +942,29 @@ mod linux_tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux", feature = "secret-delivery-pressure"))]
+#[cfg(all(
+    test,
+    target_os = "linux",
+    feature = "secret-delivery-pressure",
+    feature = "protected-attestor"
+))]
 mod privileged_linux_tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
 
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ed25519_dalek::SigningKey;
     use ota_authority_protocol::*;
 
     use super::*;
+    use crate::attestation_client::verify_capability_observation_signature_response;
+    use crate::attestor::AttestationIssuer;
+    use crate::protected_capability_observation::{
+        ProtectedCapabilityObservationError, ProtectedCapabilityObservationReplayStoreV1,
+        derive_and_sign_capability_observation_for_test_v1,
+    };
 
     struct CapabilityFixture {
         request: LauncherInvocationRequestV1,
@@ -1160,12 +1186,68 @@ mod privileged_linux_tests {
             .expect("retained observation")
     }
 
+    fn observation_request(
+        nonce: &[u8; 32],
+        attempt: &str,
+    ) -> ProtectedLauncherCapabilityObservationRequestV1 {
+        let mut challenge = ProtectedLauncherCapabilityObservationChallengeV1 {
+            schema_version: 1,
+            message_kind: PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_CHALLENGE.into(),
+            identity: String::new(),
+            workflow_run_id: "34153231585".into(),
+            workflow_run_attempt: attempt.into(),
+            workflow_reference: "ota-run/ota/.github/workflows/secret-delivery-oidc-endpoint-evidence.yml@refs/heads/1.6.28-implementation".into(),
+            nonce_commitment: protected_launcher_capability_observation_nonce_commitment_v1(nonce)
+                .expect("nonce commitment"),
+            issued_at_unix_seconds: 1_788_800_000,
+            expires_at_unix_seconds: 1_788_800_300,
+        };
+        challenge.identity =
+            protected_launcher_capability_observation_challenge_v1_identity(&challenge)
+                .expect("challenge identity");
+        let mut request = ProtectedLauncherCapabilityObservationRequestV1 {
+            schema_version: 1,
+            message_kind: PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_REQUEST.into(),
+            identity: String::new(),
+            challenge,
+            nonce: URL_SAFE_NO_PAD.encode(nonce),
+            runner_version: "2.337.0".into(),
+        };
+        request.identity = protected_launcher_capability_observation_request_v1_identity(&request)
+            .expect("request identity");
+        request
+    }
+
+    fn projection_verifier(
+        signing_key: &SigningKey,
+    ) -> ProtectedLauncherCapabilityProjectionVerifierV1 {
+        let public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes());
+        let mut verifier = ProtectedLauncherCapabilityProjectionVerifierV1 {
+            schema_version: 1,
+            record_kind: PROTECTED_LAUNCHER_CAPABILITY_PROJECTION_VERIFIER.into(),
+            identity: String::new(),
+            public_key: public_key.clone(),
+            key_identity: protected_launcher_capability_projection_key_identity_v1(&public_key)
+                .expect("key identity"),
+            key_usage: PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_PROJECTION_KEY_USAGE_V1.into(),
+            signature_domain: std::str::from_utf8(
+                PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_SIGNATURE_DOMAIN_V1,
+            )
+            .expect("signature domain")
+            .into(),
+        };
+        verifier.identity =
+            protected_launcher_capability_projection_verifier_v1_identity(&verifier)
+                .expect("verifier identity");
+        verifier
+    }
+
     #[test]
     #[ignore = "requires root-owned stores and a real transient systemd cgroup-v2 scope"]
     fn retained_observation_derives_and_rejects_live_substitution() {
         let fixture = fixture();
         let mut retained = observation(&fixture.scope);
-        derive_protected_launcher_capability_v1(&fixture.context(), &mut retained)
+        let capability = derive_protected_launcher_capability_v1(&fixture.context(), &mut retained)
             .expect("live capability");
 
         let verifier_path =
@@ -1207,5 +1289,132 @@ mod privileged_linux_tests {
             derive_protected_launcher_capability_v1(&fixture.context(), &mut substituted_cgroup,)
                 .is_err()
         );
+
+        let replay_directory = tempfile::tempdir_in("/root").expect("protected replay directory");
+        fs::set_permissions(replay_directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("replay directory mode");
+        let replay = ProtectedCapabilityObservationReplayStoreV1::open_for_test(
+            replay_directory.path(),
+            0,
+            0,
+        )
+        .expect("replay store");
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let issuer = AttestationIssuer::for_capability_observation_test(signing_key.clone());
+        let binding = issuer.capability_observation_binding_for_test();
+        let verifier = projection_verifier(&signing_key);
+        let request = observation_request(&[7_u8; 32], "1");
+        let response = derive_and_sign_capability_observation_for_test_v1(
+            &replay,
+            &request,
+            request.challenge.issued_at_unix_seconds,
+            &binding,
+            &verifier,
+            &fixture.context(),
+            &mut retained,
+            |_, verifier, signing_request| {
+                let response = issuer
+                    .issue_capability_observation_for_test(signing_request, verifier)
+                    .map_err(|_| ProtectedCapabilityObservationError::SignerAuthorityUnavailable)?;
+                verify_capability_observation_signature_response(
+                    verifier,
+                    signing_request,
+                    &response,
+                )
+                .map_err(|_| ProtectedCapabilityObservationError::SignerAuthorityUnavailable)?;
+                Ok(response)
+            },
+        )
+        .expect("complete protected observation transaction");
+        assert_eq!(response.request_identity, request.identity);
+        assert_eq!(
+            response.projection.payload.challenge_identity,
+            request.challenge.identity
+        );
+        let response_json = serde_json::to_string(&response).expect("response JSON");
+        assert!(!response_json.contains(&request.nonce));
+        assert!(!response_json.contains(&capability.identity));
+        assert!(matches!(
+            derive_and_sign_capability_observation_for_test_v1(
+                &replay,
+                &request,
+                request.challenge.issued_at_unix_seconds,
+                &binding,
+                &verifier,
+                &fixture.context(),
+                &mut retained,
+                |_, verifier, signing_request| {
+                    issuer
+                        .issue_capability_observation_for_test(signing_request, verifier)
+                        .map_err(|_| {
+                            ProtectedCapabilityObservationError::SignerAuthorityUnavailable
+                        })
+                },
+            ),
+            Err(ProtectedCapabilityObservationError::ReplayDetected)
+        ));
+
+        let wrong_key = SigningKey::from_bytes(&[8_u8; 32]);
+        let wrong_verifier = projection_verifier(&wrong_key);
+        let substituted_signer_request = observation_request(&[8_u8; 32], "2");
+        assert!(matches!(
+            derive_and_sign_capability_observation_for_test_v1(
+                &replay,
+                &substituted_signer_request,
+                substituted_signer_request.challenge.issued_at_unix_seconds,
+                &binding,
+                &wrong_verifier,
+                &fixture.context(),
+                &mut retained,
+                |_, verifier, signing_request| {
+                    issuer
+                        .issue_capability_observation_for_test(signing_request, verifier)
+                        .map_err(|_| {
+                            ProtectedCapabilityObservationError::SignerAuthorityUnavailable
+                        })
+                },
+            ),
+            Err(ProtectedCapabilityObservationError::SignerAuthorityUnavailable)
+        ));
+        assert!(matches!(
+            derive_and_sign_capability_observation_for_test_v1(
+                &replay,
+                &substituted_signer_request,
+                substituted_signer_request.challenge.issued_at_unix_seconds,
+                &binding,
+                &verifier,
+                &fixture.context(),
+                &mut retained,
+                |_, verifier, signing_request| {
+                    issuer
+                        .issue_capability_observation_for_test(signing_request, verifier)
+                        .map_err(|_| {
+                            ProtectedCapabilityObservationError::SignerAuthorityUnavailable
+                        })
+                },
+            ),
+            Err(ProtectedCapabilityObservationError::ReplayDetected)
+        ));
+
+        let expired_request = observation_request(&[9_u8; 32], "3");
+        assert!(matches!(
+            derive_and_sign_capability_observation_for_test_v1(
+                &replay,
+                &expired_request,
+                expired_request.challenge.expires_at_unix_seconds + 1,
+                &binding,
+                &verifier,
+                &fixture.context(),
+                &mut retained,
+                |_, verifier, signing_request| {
+                    issuer
+                        .issue_capability_observation_for_test(signing_request, verifier)
+                        .map_err(|_| {
+                            ProtectedCapabilityObservationError::SignerAuthorityUnavailable
+                        })
+                },
+            ),
+            Err(ProtectedCapabilityObservationError::InvalidChallenge)
+        ));
     }
 }

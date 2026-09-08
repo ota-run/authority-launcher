@@ -108,7 +108,7 @@ jobs:
               CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
               CARGO_TARGET_DIR="$CAPABILITY_TEST_TARGET" \
               /bin/bash -c \
-                'cargo test --locked --features secret-delivery-pressure --lib protected_launcher_capability::privileged_linux_tests::retained_observation_derives_and_rejects_live_substitution -- --exact --ignored > "$1" 2>&1' \
+                'cargo test --locked --features secret-delivery-pressure,protected-attestor --lib protected_launcher_capability::privileged_linux_tests::retained_observation_derives_and_rejects_live_substitution -- --exact --ignored > "$1" 2>&1' \
                 _ "$CAPABILITY_TEST_OUTPUT"
           cat "$CAPABILITY_TEST_OUTPUT"
           test "$(grep -Fxc \

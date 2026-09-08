@@ -38,7 +38,10 @@ use ota_authority_protocol::{
     LauncherAttestationProducerBindingV1, LauncherAttestationSigningRequestV1,
     LauncherAttestationSigningResponseV1, LauncherFinalizationArchiveSigningRequestV1,
     LauncherFinalizationArchiveSigningResponseV1, LauncherFinalizationSigningRequestV1,
-    LauncherFinalizationSigningResponseV1, SignedLauncherAttestationV3,
+    LauncherFinalizationSigningResponseV1, ProtectedLauncherCapabilityObservationProjectionV1,
+    ProtectedLauncherCapabilityObservationSigningRequestV1,
+    ProtectedLauncherCapabilityObservationSigningResponseV1,
+    ProtectedLauncherCapabilityProjectionVerifierV1, SignedLauncherAttestationV3,
     SignedLauncherExecutionFinalizationV1, SignedLauncherFinalizationArchiveV1, domain_separated,
     launcher_attestation_claims_v3, launcher_attestation_claims_v3_identity,
     launcher_attestation_producer_binding_v1_identity,
@@ -48,11 +51,15 @@ use ota_authority_protocol::{
     launcher_finalization_archive_signing_request_v1_identity,
     launcher_finalization_archive_signing_response_v1_identity,
     launcher_finalization_signing_request_v1_identity,
-    launcher_finalization_signing_response_v1_identity, sha256_identity,
+    launcher_finalization_signing_response_v1_identity,
+    protected_launcher_capability_observation_signature_message_v1,
+    protected_launcher_capability_projection_key_identity_v1,
+    reconcile_protected_launcher_capability_observation_signing_response_v1, sha256_identity,
     signed_launcher_execution_finalization_v1_identity,
     signed_launcher_finalization_archive_v1_identity,
     validate_launcher_attestation_producer_binding_v1,
     validate_launcher_attestation_signing_request_v1,
+    validate_protected_launcher_capability_observation_signing_request_v1,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -63,6 +70,9 @@ use time::format_description::well_known::Rfc3339;
 use zbus::blocking::{Proxy, connection::Builder};
 #[cfg(target_os = "linux")]
 use zbus::zvariant::OwnedObjectPath;
+
+#[cfg(target_os = "linux")]
+use crate::installation_manifest::load_capability_projection_verifier;
 
 pub const ATTESTOR_CONFIG_PATH: &str = "/etc/ota/authority-attestor.json";
 
@@ -125,7 +135,7 @@ struct PersistedFinalizationArchiveIssuanceV1 {
     response_bytes: Vec<u8>,
 }
 
-struct AttestationIssuer {
+pub(crate) struct AttestationIssuer {
     binding: LauncherAttestationProducerBindingV1,
     signing_key: SigningKey,
 }
@@ -149,6 +159,108 @@ impl AttestationIssuer {
             binding,
             signing_key,
         })
+    }
+
+    pub(crate) fn reconcile_capability_observation_verifier(
+        &self,
+        verifier: &ProtectedLauncherCapabilityProjectionVerifierV1,
+    ) -> Result<String, AttestorError> {
+        let public_key = URL_SAFE_NO_PAD.encode(self.signing_key.verifying_key().to_bytes());
+        let key_identity = protected_launcher_capability_projection_key_identity_v1(&public_key)
+            .map_err(|_| AttestorError::CredentialMismatch)?;
+        if verifier.public_key != public_key || verifier.key_identity != key_identity {
+            return Err(AttestorError::CredentialMismatch);
+        }
+        Ok(key_identity)
+    }
+
+    fn issue_capability_observation(
+        &self,
+        request: &ProtectedLauncherCapabilityObservationSigningRequestV1,
+        verifier: &ProtectedLauncherCapabilityProjectionVerifierV1,
+    ) -> Result<ProtectedLauncherCapabilityObservationSigningResponseV1, AttestorError> {
+        validate_protected_launcher_capability_observation_signing_request_v1(request)
+            .map_err(|_| AttestorError::InvalidRequest)?;
+        if request.producer_binding_identity != self.binding.identity
+            || request.verifier_identity != verifier.identity
+            || request.payload.signing_key_identity
+                != self.reconcile_capability_observation_verifier(verifier)?
+        {
+            return Err(AttestorError::InvalidRequest);
+        }
+        let message = protected_launcher_capability_observation_signature_message_v1(
+            &request.projection_identity,
+        )
+        .map_err(|_| AttestorError::InvalidRequest)?;
+        let response = ProtectedLauncherCapabilityObservationSigningResponseV1 {
+            schema_version: 1,
+            message_kind:
+                ota_authority_protocol::PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_SIGNING_RESPONSE
+                    .into(),
+            request_identity: request.identity.clone(),
+            projection: ProtectedLauncherCapabilityObservationProjectionV1 {
+                payload: request.payload.clone(),
+                projection_identity: request.projection_identity.clone(),
+                signature: URL_SAFE_NO_PAD.encode(self.signing_key.sign(&message).to_bytes()),
+            },
+        };
+        reconcile_protected_launcher_capability_observation_signing_response_v1(request, &response)
+            .map_err(|_| AttestorError::InvalidRequest)?;
+        Ok(response)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_capability_observation_test(signing_key: SigningKey) -> Self {
+        let public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes());
+        let mut binding = LauncherAttestationProducerBindingV1 {
+            schema_version: 1,
+            identity: String::new(),
+            producer_id: "test-attestor".into(),
+            socket_path: "/run/ota/test-attestor.sock".into(),
+            service_unit: "test-attestor.service".into(),
+            launcher_service_unit: "test-launcher.service".into(),
+            launcher_service_binding_identity: format!("sha256:{}", "1".repeat(64)),
+            launcher_configuration_identity: format!("sha256:{}", "2".repeat(64)),
+            launcher_profile_identity: format!("sha256:{}", "3".repeat(64)),
+            launcher_executable_identity: format!("sha256:{}", "4".repeat(64)),
+            producer_executable_identity: format!("sha256:{}", "5".repeat(64)),
+            verifier_key_set_identity: format!("sha256:{}", "6".repeat(64)),
+            signing_key_id: "test-key".into(),
+            signing_public_key: public_key.clone(),
+            signing_public_key_identity: sha256_identity(&signing_key.verifying_key().to_bytes()),
+            signing_key_not_before: "2026-01-01T00:00:00Z".into(),
+            signing_key_not_after: "2027-01-01T00:00:00Z".into(),
+            issuer: "test-issuer".into(),
+            audience: "test-audience".into(),
+            maximum_attestation_age_seconds: 300,
+            verifier_maximum_age_seconds: 300,
+            maximum_request_bytes: 65_536,
+            read_write_timeout_seconds: 5,
+            issuance_state_directory: "/var/lib/ota/test-attestor".into(),
+            signing_credential_name: "test-key".into(),
+        };
+        binding.identity = launcher_attestation_producer_binding_v1_identity(&binding)
+            .expect("test producer binding identity");
+        Self {
+            binding,
+            signing_key,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capability_observation_binding_for_test(
+        &self,
+    ) -> LauncherAttestationProducerBindingV1 {
+        self.binding.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn issue_capability_observation_for_test(
+        &self,
+        request: &ProtectedLauncherCapabilityObservationSigningRequestV1,
+        verifier: &ProtectedLauncherCapabilityProjectionVerifierV1,
+    ) -> Result<ProtectedLauncherCapabilityObservationSigningResponseV1, AttestorError> {
+        self.issue_capability_observation(request, verifier)
     }
 
     fn validate_request(
@@ -878,6 +990,15 @@ fn serve_seqpacket_once(issuer: &AttestationIssuer) -> Result<(), AttestorError>
                     || revalidate_peer(&connection, &peer, &issuer.binding),
                 ),
             )?
+        }
+        ota_authority_protocol::PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_SIGNING_REQUEST => {
+            let request: ProtectedLauncherCapabilityObservationSigningRequestV1 =
+                serde_json::from_slice(&request_bytes)
+                    .map_err(|_| AttestorError::InvalidRequest)?;
+            let verifier = load_capability_projection_verifier()
+                .map_err(|_| AttestorError::ConfigUnprotected)?;
+            let response = issuer.issue_capability_observation(&request, &verifier)?;
+            serde_jcs::to_vec(&response).map_err(|_| AttestorError::InvalidRequest)?
         }
         _ => return Err(AttestorError::InvalidRequest),
     };

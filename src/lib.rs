@@ -25,11 +25,21 @@ pub mod attestation_client;
 #[cfg(feature = "protected-attestor")]
 pub mod attestor;
 #[cfg(target_os = "linux")]
+#[allow(dead_code)] // Shared protected verifier loading for the Step 7 observation service.
+pub(crate) mod config;
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+// Shared protected installation reconciliation for the Step 7 observation service.
+pub(crate) mod installation_manifest;
+#[cfg(target_os = "linux")]
 pub mod linux_observations;
 #[cfg(target_os = "linux")]
 pub mod observation_collector;
-#[cfg(any(test, all(target_os = "linux", feature = "secret-delivery-pressure")))]
-// Step 7 pressure-only foundation; no production launcher route is authorized yet.
+#[cfg(all(target_os = "linux", feature = "protected-attestor"))]
+#[allow(dead_code)] // Step 7 foundation; no Core-facing observation route is active yet.
+pub(crate) mod protected_capability_observation;
+#[cfg(target_os = "linux")]
+// The future protected Launcher observation service remains the only caller.
 #[allow(dead_code)]
 pub(crate) mod protected_launcher_capability;
 #[cfg(target_os = "linux")]
