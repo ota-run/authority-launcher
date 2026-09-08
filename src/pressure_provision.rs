@@ -2151,10 +2151,21 @@ mod tests {
         assert!(service.contains(&format!(
             "InaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}"
         )));
-        assert!(service.contains(CAPABILITY_OBSERVATION_REPLAY_DIRECTORY));
+        assert!(service.lines().any(|line| line
+            == format!(
+                "ReadWritePaths={LAUNCHER_RUNTIME} {LAUNCHER_STATE} \
+                 {CAPABILITY_OBSERVATION_REPLAY_DIRECTORY} /srv/ota-pressure \
+                 {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}"
+            )));
         assert!(
             launcher_hardening_drop_in(Path::new("/srv/repository"), &[])
-                .contains(CAPABILITY_OBSERVATION_REPLAY_DIRECTORY)
+                .lines()
+                .any(|line| line
+                    == format!(
+                        "ReadWritePaths={LAUNCHER_RUNTIME} {LAUNCHER_STATE} \
+                         {CAPABILITY_OBSERVATION_REPLAY_DIRECTORY} /srv/repository \
+                         {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}"
+                    ))
         );
         assert!(!service.contains("authority-broker execute"));
         let broker = broker_proxy_service_unit(Path::new(
