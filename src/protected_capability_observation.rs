@@ -22,7 +22,7 @@ use ota_authority_protocol::{
     ProtectedLauncherCapabilityObservationSigningRequestV1,
     ProtectedLauncherCapabilityObservationSigningResponseV1,
     ProtectedLauncherCapabilityObservationTargetV1,
-    ProtectedLauncherCapabilityProjectionVerifierV1,
+    ProtectedLauncherCapabilityProjectionVerifierV1, launcher_invocation_request_identity,
     protected_launcher_capability_observation_challenge_v1_identity,
     protected_launcher_capability_observation_nonce_commitment_v1,
     protected_launcher_capability_observation_projection_v1_identity,
@@ -271,6 +271,11 @@ where
         ProtectedCapabilityObservationError,
     >,
 {
+    let observed_launcher_request_identity = launcher_invocation_request_identity(context.request)
+        .map_err(|_| ProtectedCapabilityObservationError::InvalidChallenge)?;
+    if request.expected_launcher_request_identity != observed_launcher_request_identity {
+        return Err(ProtectedCapabilityObservationError::InvalidChallenge);
+    }
     let nonce = URL_SAFE_NO_PAD
         .decode(&request.nonce)
         .map_err(|_| ProtectedCapabilityObservationError::InvalidChallenge)?;

@@ -1189,6 +1189,7 @@ mod privileged_linux_tests {
     fn observation_request(
         nonce: &[u8; 32],
         attempt: &str,
+        expected_launcher_request_identity: &str,
     ) -> ProtectedLauncherCapabilityObservationRequestV1 {
         let mut challenge = ProtectedLauncherCapabilityObservationChallengeV1 {
             schema_version: 1,
@@ -1212,6 +1213,7 @@ mod privileged_linux_tests {
             challenge,
             nonce: URL_SAFE_NO_PAD.encode(nonce),
             runner_version: "2.337.0".into(),
+            expected_launcher_request_identity: expected_launcher_request_identity.into(),
         };
         request.identity = protected_launcher_capability_observation_request_v1_identity(&request)
             .expect("request identity");
@@ -1303,7 +1305,23 @@ mod privileged_linux_tests {
         let issuer = AttestationIssuer::for_capability_observation_test(signing_key.clone());
         let binding = issuer.capability_observation_binding_for_test();
         let verifier = projection_verifier(&signing_key);
-        let request = observation_request(&[7_u8; 32], "1");
+        let request_identity = launcher_invocation_request_identity(&fixture.request)
+            .expect("launcher request identity");
+        let mismatched_request = observation_request(&[6_u8; 32], "4", &identity('f'));
+        assert!(matches!(
+            derive_and_sign_capability_observation_for_test_v1(
+                &replay,
+                &mismatched_request,
+                mismatched_request.challenge.issued_at_unix_seconds,
+                &binding,
+                &verifier,
+                &fixture.context(),
+                &mut retained,
+                |_, _, _| unreachable!("mismatched invocation must refuse before signing"),
+            ),
+            Err(ProtectedCapabilityObservationError::InvalidChallenge)
+        ));
+        let request = observation_request(&[7_u8; 32], "1", &request_identity);
         let response = derive_and_sign_capability_observation_for_test_v1(
             &replay,
             &request,
@@ -1356,7 +1374,7 @@ mod privileged_linux_tests {
 
         let wrong_key = SigningKey::from_bytes(&[8_u8; 32]);
         let wrong_verifier = projection_verifier(&wrong_key);
-        let substituted_signer_request = observation_request(&[8_u8; 32], "2");
+        let substituted_signer_request = observation_request(&[8_u8; 32], "2", &request_identity);
         assert!(matches!(
             derive_and_sign_capability_observation_for_test_v1(
                 &replay,
@@ -1396,7 +1414,7 @@ mod privileged_linux_tests {
             Err(ProtectedCapabilityObservationError::ReplayDetected)
         ));
 
-        let expired_request = observation_request(&[9_u8; 32], "3");
+        let expired_request = observation_request(&[9_u8; 32], "3", &request_identity);
         assert!(matches!(
             derive_and_sign_capability_observation_for_test_v1(
                 &replay,
