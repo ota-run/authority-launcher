@@ -16,3 +16,21 @@ The ZIP contains only the public workflow evidence inspected for this bounded in
 identity, installed-client identity/help, host kernel posture, terminal client result, and protected
 receipt-history reconciliation. It contains no secret values, private authority bytes, reusable
 credentials, OIDC tokens, provider response, or provider-delivery evidence.
+
+## Capability Observation Replay-Store Reconciliation
+
+- Source run: https://github.com/ota-run/authority-launcher/actions/runs/34241049867
+- Source job: https://github.com/ota-run/authority-launcher/actions/runs/34241049867/job/102111003771
+- Source artifact: `independently-administered-systemd-v3-evidence`
+- Launcher revision: `8ca4763c1e5c6ef5ac06c2be5b778c49344c5030`
+- Protocol revision: `e0af492ba8a6fbe01e805c79762909c9cda28198`
+- Core revision: `f921209561b26f38cdb74c5f20f71e0b6734ae0d`
+- Retained file: `systemd-v3-independently-administered-34241049867.zip`
+- SHA-256: `090f3ac9fa2b516370b8d844520d4759bce877fae7b0f6a541bd5e23539d6496`
+
+The eight-file ZIP proves one bounded independently administered governed invocation and reconciles
+the fixed replay-store path across fresh-state inventory and effective systemd runtime observation.
+It records completed execution, terminal cleanup, and one valid protected receipt archive with zero
+invalid archives. It does not prove capability-observation production routing, accepted-session
+provenance, provider contact, OIDC exchange, secret materialization or delivery, Step 8, V12.2, or
+general repository or agent governance.

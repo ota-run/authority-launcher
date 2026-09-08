@@ -37,6 +37,14 @@
   descriptor records, store bytes, and capability identity are not
   caller-supplied inputs or public projection fields. No default launcher flow, Core consumer,
   provider contact, or secret delivery is activated by this foundation.
+  Immutable Linux/x64 PID 1
+  [run 34241049867](https://github.com/ota-run/authority-launcher/actions/runs/34241049867),
+  job `102111003771`, binds Launcher `8ca4763c1e5c6ef5ac06c2be5b778c49344c5030`, Protocol
+  `e0af492ba8a6fbe01e805c79762909c9cda28198`, and Core
+  `f921209561b26f38cdb74c5f20f71e0b6734ae0d`. It reconciles the fixed replay path across the
+  fresh managed-state inventory and effective systemd runtime while one bounded governed
+  invocation completes with terminal cleanup and one valid protected receipt archive. This is not
+  capability-observation routing, provider-contact, OIDC, materialization, or delivery evidence.
 
 - Reconcile the README with the completed bounded systemd carrier: remove stale preview/candidate
   wording, distinguish pressure-proven source from separately packaged release artifacts, and keep

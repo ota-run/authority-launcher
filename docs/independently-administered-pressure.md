@@ -147,6 +147,18 @@ governed-invocation witness is retained at
 Its SHA-256 is `0b15512fe736bee4b35a2dd205a5e9e3d68a9af496ee86f812c364b4f322258f`; see the adjacent
 artifact index for its source run, revision, and content limits.
 
+The later replay-store provisioning and runtime-reconciliation witness is retained at
+[`docs/pressure/retained-artifacts/systemd-v3-independently-administered-34241049867.zip`](pressure/retained-artifacts/systemd-v3-independently-administered-34241049867.zip).
+Its SHA-256 is `090f3ac9fa2b516370b8d844520d4759bce877fae7b0f6a541bd5e23539d6496`.
+Run `34241049867`, job `102111003771`, binds Launcher
+`8ca4763c1e5c6ef5ac06c2be5b778c49344c5030`, Protocol
+`e0af492ba8a6fbe01e805c79762909c9cda28198`, and Core
+`f921209561b26f38cdb74c5f20f71e0b6734ae0d`. It proves the fixed replay path is present in the
+exact fresh-state inventory and accepted by effective systemd runtime reconciliation while one
+bounded governed invocation completes with terminal cleanup and one valid protected receipt
+archive. It does not prove capability-observation production routing, provider contact, OIDC
+exchange, secret materialization, or secret delivery.
+
 Runner-group access is intentionally not represented as a run-bound fact. Independently check its
 current GitHub configuration against the exact two-repository and four branch-pinned workflow list
 below; it is mutable operational configuration, not retained hosted-artifact evidence.

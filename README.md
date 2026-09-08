@@ -414,6 +414,18 @@ and zero residual child, scope, cgroup, active-slot, or finalization state. Prov
 remains optional stronger hardening and is not implied by this carrier.
 
 Immutable Linux/x64 PID 1
+[run 34241049867](https://github.com/ota-run/authority-launcher/actions/runs/34241049867),
+job `102111003771`, proves the fixed capability-observation replay path is reconciled across the
+fresh managed-state inventory and effective Launcher `ReadWritePaths` at exact Launcher
+`8ca4763c1e5c6ef5ac06c2be5b778c49344c5030`, Protocol
+`e0af492ba8a6fbe01e805c79762909c9cda28198`, and Core
+`f921209561b26f38cdb74c5f20f71e0b6734ae0d`. The same bounded invocation completed with exact
+child, scope, cgroup, and active-slot cleanup and one valid protected receipt archive with zero
+invalid archives. The retained artifact does not prove production capability-observation routing,
+accepted-session provenance, provider contact, OIDC exchange, secret materialization or delivery,
+Step 8, V12.2, or general governance.
+
+Immutable Linux/x64 PID 1
 [run 31758094819](https://github.com/ota-run/authority-launcher/actions/runs/31758094819)
 proves this pressure-only attachment and recovery path against Protocol
 `3e912f721ba9673090d14bcf5f88a2ee27a6b58a`, Core
