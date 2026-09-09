@@ -295,7 +295,7 @@ where
             os: "linux".into(),
             architecture: "x64".into(),
         },
-        capability_class: "systemd_protected_launcher_v3".into(),
+        capability_class: "systemd_protected_launcher_v4".into(),
         runner_version: request.runner_version.clone(),
         signing_key_identity: verifier.key_identity.clone(),
     };

@@ -87,15 +87,12 @@ struct RetainedProtectedLauncherBootV1 {
 
 #[cfg(target_os = "linux")]
 impl RetainedProtectedLauncherBootV1 {
-    fn observe() -> Result<Self, ProtectedLauncherCapabilityError> {
-        let proc_root = open_root(Path::new("/proc"), 0, 0)?;
-        verify_procfs_root(proc_root.as_raw_fd())?;
-        let descriptor = openat2_beneath(
-            proc_root.as_raw_fd(),
-            PROC_BOOT_ID_PATH,
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-        )?;
-        let file = File::from(descriptor);
+    pub(crate) fn from_manager_file(file: File) -> Result<Self, ProtectedLauncherCapabilityError> {
+        verify_procfs_root(file.as_raw_fd())?;
+        let descriptor_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        if descriptor_flags < 0 || descriptor_flags & libc::O_ACCMODE != libc::O_RDONLY {
+            return Err(ProtectedLauncherCapabilityError::Unprotected);
+        }
         let (device, inode, mode, value, identity) = observe_boot_file(&file)?;
         Ok(Self {
             file,
@@ -105,6 +102,19 @@ impl RetainedProtectedLauncherBootV1 {
             value,
             identity,
         })
+    }
+
+    #[cfg(test)]
+    fn observe_fixture() -> Result<Self, ProtectedLauncherCapabilityError> {
+        let proc_root = open_root(Path::new("/proc"), 0, 0)?;
+        verify_procfs_root(proc_root.as_raw_fd())?;
+        let descriptor = openat2_beneath(
+            proc_root.as_raw_fd(),
+            PROC_BOOT_ID_PATH,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )?;
+        let file = File::from(descriptor);
+        Self::from_manager_file(file)
     }
 
     fn reobserve(&self) -> Result<&str, ProtectedLauncherCapabilityError> {
@@ -141,6 +151,7 @@ enum RetainedProtectedLauncherAuthoritySourceV1 {
 impl RetainedProtectedLauncherAuthorityContextV1 {
     pub(crate) fn acquire(
         authority: RetainedProtectedLauncherAuthorityInstallationV1,
+        boot_file: File,
     ) -> Result<Self, ProtectedLauncherCapabilityError> {
         let authority_identity = authority
             .reconcile()
@@ -163,7 +174,7 @@ impl RetainedProtectedLauncherAuthorityContextV1 {
             authority_identity,
             invocation_nonce,
             invocation_nonce_identity,
-            boot: RetainedProtectedLauncherBootV1::observe()?,
+            boot: RetainedProtectedLauncherBootV1::from_manager_file(boot_file)?,
         })
     }
 
@@ -209,7 +220,7 @@ impl RetainedProtectedLauncherAuthorityContextV1 {
                 &invocation_nonce,
             )
             .map_err(|_| ProtectedLauncherCapabilityError::Unprotected)?,
-            boot: RetainedProtectedLauncherBootV1::observe()?,
+            boot: RetainedProtectedLauncherBootV1::observe_fixture()?,
         })
     }
 
@@ -1311,7 +1322,7 @@ mod privileged_linux_tests {
         };
         process_posture.identity =
             ota_process_posture_identity(&process_posture).expect("process posture identity");
-        let launcher_profile = systemd_launcher_profile_v3();
+        let launcher_profile = systemd_launcher_profile_v4();
         let launcher_profile_identity = systemd_launcher_profile_identity(&launcher_profile)
             .expect("launcher profile identity");
         let mut foundation = SystemdProtectedLauncherInstanceEvidenceV1 {
@@ -1397,7 +1408,7 @@ mod privileged_linux_tests {
                 os: String::from("linux"),
                 architecture: String::from("x86_64"),
                 execution_mode: String::from("native"),
-                launcher_class: String::from("systemd_protected_launcher_v3"),
+                launcher_class: String::from("systemd_protected_launcher_v4"),
             },
         };
         implementation_subject.identity =

@@ -1437,7 +1437,7 @@ mod tests {
         UnixPrincipalIdentity, encode_frame, launcher_principal_mapping_identity,
         launcher_working_directory_identity, systemd_job_principal_profile_identity,
         systemd_job_principal_profile_v2, systemd_launcher_profile_identity,
-        systemd_launcher_profile_v3, systemd_protected_launcher_instance_v2_identity,
+        systemd_launcher_profile_v4, systemd_protected_launcher_instance_v2_identity,
         systemd_protected_launcher_instance_v3_foundation_identity,
     };
     use tempfile::tempdir;
@@ -1480,7 +1480,7 @@ mod tests {
             saved_gid: gid,
             filesystem_gid: gid,
         };
-        let launcher_profile = systemd_launcher_profile_v3();
+        let launcher_profile = systemd_launcher_profile_v4();
         let job_profile = systemd_job_principal_profile_v2();
         let launcher_profile_identity = systemd_launcher_profile_identity(&launcher_profile)
             .expect("launcher profile identity");
@@ -2418,6 +2418,9 @@ mod tests {
             owner_uid: metadata.uid(),
         };
         let executable = File::open("/bin/true").expect("test executable");
+        let boot_file = File::open("/proc/sys/kernel/random/boot_id")
+            .expect("manager-opened boot descriptor fixture");
+        let boot_object = descriptor_object(boot_file.as_raw_fd()).expect("boot descriptor object");
         let config = SystemdLauncherServiceConfigV1 {
             schema_version: 1,
             identity: identity('a'),
@@ -2460,6 +2463,20 @@ mod tests {
         )
         .expect("prepare stopped child");
         assert!(PathBuf::from(format!("/proc/{}", child.record.pid)).exists());
+        assert!(
+            std::fs::read_dir(format!("/proc/{}/fd", child.record.pid))
+                .expect("stopped child descriptor table")
+                .filter_map(Result::ok)
+                .all(|entry| {
+                    let metadata = entry.metadata().expect("child descriptor metadata");
+                    DescriptorObject {
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                        file_type: metadata.mode() & libc::S_IFMT,
+                    } != boot_object
+                }),
+            "the manager-opened boot descriptor must not enter the selected child"
+        );
         child.terminate_and_reap().expect("cleanup child");
         assert!(!PathBuf::from(format!("/proc/{}", child.record.pid)).exists());
 

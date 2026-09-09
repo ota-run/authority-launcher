@@ -31,6 +31,7 @@
 
 use std::cell::RefCell;
 use std::env;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -69,7 +70,7 @@ use ota_authority_protocol::{
     launcher_finalization_signing_request_v1_identity, launcher_invocation_request_identity,
     launcher_terminal_persistence_v1_identity, launcher_working_directory_identity,
     systemd_job_principal_profile_identity, systemd_job_principal_profile_v2,
-    systemd_launcher_profile_identity, systemd_launcher_profile_v3,
+    systemd_launcher_profile_identity, systemd_launcher_profile_v4,
     systemd_protected_launcher_instance_v3_foundation_identity,
     validate_launcher_invocation_request_v1, validate_launcher_terminal_frame_v1,
 };
@@ -103,6 +104,8 @@ use crate::systemd_scope::{ScopeBoundary, SystemdScopeError, SystemdScopeManager
 use crate::target_directory::{TargetDirectoryError, open_repository_directory};
 
 const SYSTEMD_LISTEN_FD: RawFd = 3;
+const LAUNCHER_LISTENER_FD_NAME: &str = "ota-launcher-listener";
+const BOOT_ID_FD_NAME: &str = "ota-boot-id";
 const ACTIVE_SLOT_DIRECTORY: &str = "/var/lib/ota/authority-launcher/active";
 const FINALIZATION_DIRECTORY: &str = "/var/lib/ota/authority-launcher/finalization";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -227,8 +230,9 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
         .map_err(|_| SystemdServiceError::InstallationIdentityUnavailable)?;
     let installation = load_protected_installation_manifest(config, &launcher_executable)
         .map_err(|_| SystemdServiceError::InstallationIdentityUnavailable)?;
-    let listener =
-        inherited_systemd_listener(config.socket_path.as_path(), config.socket_group_gid)?;
+    let inherited =
+        inherited_systemd_descriptors(config.socket_path.as_path(), config.socket_group_gid)?;
+    let listener = inherited.listener;
     reconcile_active_slots(
         Path::new(ACTIVE_SLOT_DIRECTORY),
         0,
@@ -260,6 +264,7 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
             &installation,
             &loaded.ota_binary,
             &launcher_executable,
+            &inherited.boot_file,
             &mut stream,
             &peer,
             mapping,
@@ -442,6 +447,7 @@ fn serve_capability_observation(
     installation: &ProtectedInstallationManifestV1,
     ota_binary: &std::fs::File,
     launcher_executable: &Path,
+    boot_file: &File,
     stream: &mut UnixStream,
     peer: &ObservedSessionPeer,
     mapping: &crate::config::SystemdPrincipalMappingV1,
@@ -462,6 +468,9 @@ fn serve_capability_observation(
     let authority =
         crate::protected_launcher_capability::RetainedProtectedLauncherAuthorityContextV1::acquire(
             authority,
+            boot_file
+                .try_clone()
+                .map_err(|_| SystemdServiceError::RetainedAuthorityContextUnavailable)?,
         )
         .map_err(|_| SystemdServiceError::RetainedAuthorityContextUnavailable)?;
     let replay =
@@ -527,7 +536,7 @@ fn serve_capability_observation(
                 )
                 .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
             let launcher_profile_identity =
-                systemd_launcher_profile_identity(&systemd_launcher_profile_v3())
+                systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
                     .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
             let launcher_executable_identity = installation
                 .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
@@ -965,7 +974,7 @@ fn produce_attestation(
     let producer = ota_authority_launcher::attestation_client::load_producer_binding()
         .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
     let launcher_profile_identity =
-        systemd_launcher_profile_identity(&systemd_launcher_profile_v3())
+        systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
             .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
     let launcher_executable_identity = installation
         .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
@@ -1032,7 +1041,7 @@ fn collect_launcher_instance(
 ) -> Result<ota_authority_protocol::SystemdProtectedLauncherInstanceEvidenceV2, SystemdServiceError>
 {
     let launcher_profile_identity =
-        systemd_launcher_profile_identity(&systemd_launcher_profile_v3())
+        systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
             .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
     let job_profile_identity =
         systemd_job_principal_profile_identity(&systemd_job_principal_profile_v2())
@@ -1621,21 +1630,65 @@ fn map_target_directory_error(error: TargetDirectoryError) -> SystemdServiceErro
     }
 }
 
-fn inherited_systemd_listener(
-    expected_path: &Path,
-    expected_group_gid: u32,
-) -> Result<UnixListener, SystemdServiceError> {
-    let expected_pid = unsafe { libc::getpid() }.to_string();
-    if env::var("LISTEN_PID").ok().as_deref() != Some(expected_pid.as_str())
-        || env::var("LISTEN_FDS").ok().as_deref() != Some("1")
+struct InheritedSystemdDescriptors {
+    listener: UnixListener,
+    boot_file: File,
+}
+
+fn inherited_systemd_descriptor_roles(
+    listen_fds: &str,
+    listen_fd_names: &str,
+) -> Result<(RawFd, RawFd), SystemdServiceError> {
+    if listen_fds != "2" {
+        return Err(SystemdServiceError::ListenerUnavailable);
+    }
+    let names = listen_fd_names.split(':').collect::<Vec<_>>();
+    if names.len() != 2
+        || names.iter().any(|name| name.is_empty())
+        || names
+            .iter()
+            .filter(|name| **name == LAUNCHER_LISTENER_FD_NAME)
+            .count()
+            != 1
+        || names
+            .iter()
+            .filter(|name| **name == BOOT_ID_FD_NAME)
+            .count()
+            != 1
     {
         return Err(SystemdServiceError::ListenerUnavailable);
     }
-    set_cloexec(SYSTEMD_LISTEN_FD)?;
-    verify_listener_socket(SYSTEMD_LISTEN_FD)?;
+    let descriptor_for = |role: &str| {
+        names
+            .iter()
+            .position(|name| *name == role)
+            .map(|index| SYSTEMD_LISTEN_FD + index as RawFd)
+            .ok_or(SystemdServiceError::ListenerUnavailable)
+    };
+    Ok((
+        descriptor_for(LAUNCHER_LISTENER_FD_NAME)?,
+        descriptor_for(BOOT_ID_FD_NAME)?,
+    ))
+}
+
+fn inherited_systemd_descriptors(
+    expected_path: &Path,
+    expected_group_gid: u32,
+) -> Result<InheritedSystemdDescriptors, SystemdServiceError> {
+    let expected_pid = unsafe { libc::getpid() }.to_string();
+    if env::var("LISTEN_PID").ok().as_deref() != Some(expected_pid.as_str()) {
+        return Err(SystemdServiceError::ListenerUnavailable);
+    }
+    let listen_fds =
+        env::var("LISTEN_FDS").map_err(|_| SystemdServiceError::ListenerUnavailable)?;
+    let names = env::var("LISTEN_FDNAMES").map_err(|_| SystemdServiceError::ListenerUnavailable)?;
+    let (listener_fd, boot_fd) = inherited_systemd_descriptor_roles(&listen_fds, &names)?;
+    set_cloexec(listener_fd)?;
+    set_cloexec(boot_fd)?;
+    verify_listener_socket(listener_fd)?;
     // SAFETY: the descriptor was verified as a listening AF_UNIX stream and ownership transfers
     // once to the returned listener.
-    let listener = unsafe { UnixListener::from_raw_fd(SYSTEMD_LISTEN_FD) };
+    let listener = unsafe { UnixListener::from_raw_fd(listener_fd) };
     if listener
         .local_addr()
         .ok()
@@ -1645,7 +1698,11 @@ fn inherited_systemd_listener(
         return Err(SystemdServiceError::ListenerUnavailable);
     }
     verify_listener_path(&listener, expected_path, expected_group_gid)?;
-    Ok(listener)
+    let boot_file = unsafe { File::from_raw_fd(boot_fd) };
+    Ok(InheritedSystemdDescriptors {
+        listener,
+        boot_file,
+    })
 }
 
 fn verify_listener_path(
@@ -1818,7 +1875,7 @@ fn sign_execution_finalization(
     let producer = ota_authority_launcher::attestation_client::load_producer_binding()
         .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
     let launcher_profile_identity =
-        systemd_launcher_profile_identity(&systemd_launcher_profile_v3())
+        systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
             .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
     let launcher_executable_identity = installation
         .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
@@ -2305,6 +2362,35 @@ mod tests {
 
     fn test_identity(character: char) -> String {
         format!("sha256:{}", character.to_string().repeat(64))
+    }
+
+    #[test]
+    fn inherited_descriptor_roles_are_exact_and_order_independent() {
+        assert_eq!(
+            inherited_systemd_descriptor_roles("2", "ota-launcher-listener:ota-boot-id")
+                .expect("canonical descriptor order"),
+            (3, 4)
+        );
+        assert_eq!(
+            inherited_systemd_descriptor_roles("2", "ota-boot-id:ota-launcher-listener")
+                .expect("reversed descriptor order"),
+            (4, 3)
+        );
+
+        for (count, names) in [
+            ("1", "ota-launcher-listener"),
+            ("3", "ota-launcher-listener:ota-boot-id:extra"),
+            ("2", "ota-launcher-listener"),
+            ("2", "ota-launcher-listener:"),
+            ("2", "ota-launcher-listener:ota-launcher-listener"),
+            ("2", "ota-boot-id:ota-boot-id"),
+            ("2", "ota-launcher-listener:substituted-boot-id"),
+        ] {
+            assert!(
+                inherited_systemd_descriptor_roles(count, names).is_err(),
+                "descriptor set {count} {names} must refuse"
+            );
+        }
     }
 
     fn record_allowed_consumption_intent(active_slot: &mut ActiveSlot) {

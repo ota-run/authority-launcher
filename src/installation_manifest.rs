@@ -37,7 +37,7 @@ use ota_authority_protocol::{
     protected_launcher_implementation_subject_v1_identity,
     runner_administrator_authority_v1_identity, systemd_job_principal_profile_identity,
     systemd_job_principal_profile_v2, systemd_launcher_profile_identity,
-    systemd_launcher_profile_v3, validate_protected_launcher_capability_projection_verifier_v1,
+    systemd_launcher_profile_v4, validate_protected_launcher_capability_projection_verifier_v1,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -759,7 +759,7 @@ fn validate_manifest_shape(
         || manifest.identity != protected_installation_manifest_identity(manifest)?
         || manifest.launcher_configuration_identity != config.identity
         || manifest.launcher_profile_identity
-            != systemd_launcher_profile_identity(&systemd_launcher_profile_v3())
+            != systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
                 .map_err(|_| InstallationManifestError::Malformed)?
         || manifest.job_principal_profile_identity
             != systemd_job_principal_profile_identity(&systemd_job_principal_profile_v2())
@@ -1170,7 +1170,7 @@ mod tests {
         let protocol_source_revision = env!("OTA_PROTOCOL_BUILD_REVISION").to_owned();
         let core_source_revision = "2".repeat(40);
         let launcher_profile_identity =
-            systemd_launcher_profile_identity(&systemd_launcher_profile_v3())
+            systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
                 .expect("launcher profile identity");
         let mut administrator = RunnerAdministratorAuthorityV1 {
             schema_version: 1,
@@ -1221,7 +1221,7 @@ mod tests {
                 os: String::from("linux"),
                 architecture: String::from("x86_64"),
                 execution_mode: String::from("native"),
-                launcher_class: String::from("systemd_protected_launcher_v3"),
+                launcher_class: String::from("systemd_protected_launcher_v4"),
             },
         };
         subject.identity = protected_launcher_implementation_subject_v1_identity(&subject)
@@ -1291,7 +1291,7 @@ mod tests {
             identity: String::new(),
             launcher_configuration_identity: config.identity.clone(),
             launcher_profile_identity: systemd_launcher_profile_identity(
-                &systemd_launcher_profile_v3(),
+                &systemd_launcher_profile_v4(),
             )
             .expect("launcher profile identity"),
             job_principal_profile_identity: systemd_job_principal_profile_identity(

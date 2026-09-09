@@ -31,7 +31,7 @@ use ota_authority_protocol::{
     SystemdJobPrincipalRequirementDefinition, SystemdLauncherEvidenceSource,
     SystemdLauncherObservation, SystemdProtectedLauncherInstanceEvidenceV1,
     SystemdProtectedLauncherInstanceEvidenceV2, systemd_job_principal_profile_v2,
-    systemd_launcher_profile_identity, systemd_launcher_profile_v3,
+    systemd_launcher_profile_identity, systemd_launcher_profile_v4,
     systemd_protected_launcher_instance_v2_identity,
     systemd_protected_launcher_instance_v3_foundation_identity,
 };
@@ -67,7 +67,7 @@ pub fn collect_closed_profile(
     mut instance_v1: SystemdProtectedLauncherInstanceEvidenceV1,
     probe: &mut impl ClosedProfileProbe,
 ) -> Result<SystemdProtectedLauncherInstanceEvidenceV2, ObservationCollectionError> {
-    let launcher_profile = systemd_launcher_profile_v3();
+    let launcher_profile = systemd_launcher_profile_v4();
     instance_v1.systemd_launcher_profile_identity =
         systemd_launcher_profile_identity(&launcher_profile)
             .map_err(|_| ObservationCollectionError::InvalidInstance)?;
@@ -117,7 +117,7 @@ mod tests {
         SystemdJobPrincipalRequirement, SystemdProtectedLauncherInstanceEvidenceV1,
         UnixPrincipalIdentity, launcher_principal_mapping_identity, ota_process_posture_identity,
         systemd_job_principal_profile_identity, systemd_job_principal_profile_v2,
-        systemd_launcher_profile_identity, systemd_launcher_profile_v3,
+        systemd_launcher_profile_identity, systemd_launcher_profile_v4,
     };
 
     use super::*;
@@ -164,7 +164,7 @@ mod tests {
         let collected = collect_closed_profile(instance(), &mut probe).expect("complete profile");
         assert_eq!(
             probe.launcher_calls,
-            systemd_launcher_profile_v3().evidence_sources
+            systemd_launcher_profile_v4().evidence_sources
         );
         assert_eq!(
             probe.job_calls,
@@ -176,7 +176,7 @@ mod tests {
         );
         assert_eq!(
             collected.instance_v1.systemd_launcher_profile_identity,
-            systemd_launcher_profile_identity(&systemd_launcher_profile_v3())
+            systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
                 .expect("profile identity")
         );
     }

@@ -46,7 +46,7 @@ use ota_authority_protocol::{
     ProtectedLauncherAuthorityContextV1, ProtectedLauncherCapabilityProjectionVerifierV1,
     ProtectedLauncherImplementationSubjectV1, ProtectedLauncherImplementationTargetV1,
     RUNNER_ADMINISTRATOR_AUTHORITY, RunnerAdministratorAuthorityV1,
-    SYSTEMD_JOB_PRINCIPAL_PROFILE_ID_V2, SYSTEMD_LAUNCHER_PROFILE_ID_V3,
+    SYSTEMD_JOB_PRINCIPAL_PROFILE_ID_V2, SYSTEMD_LAUNCHER_PROFILE_ID_V4,
     SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1,
     SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3,
     launcher_attestation_producer_binding_v1_identity, launcher_working_directory_identity,
@@ -56,7 +56,7 @@ use ota_authority_protocol::{
     protected_launcher_implementation_subject_v1_identity,
     runner_administrator_authority_v1_identity, sha256_identity,
     systemd_job_principal_profile_identity, systemd_job_principal_profile_v2,
-    systemd_launcher_profile_identity, systemd_launcher_profile_v3,
+    systemd_launcher_profile_identity, systemd_launcher_profile_v4,
 };
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -226,6 +226,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
             "root is required for systemd V3 pressure provisioning",
         ));
     }
+    validate_systemd_manager_version()?;
     crate::validate_authority_label(request.authority_id.as_str())?;
     let job = account(request.job_user.as_str())?;
     let execution = account(request.execution_user.as_str())?;
@@ -483,7 +484,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     let broker_socket_identity = sha256_file(Path::new(BROKER_PROXY_SOCKET_UNIT))?;
     let verifier_set_identity = sha256_file(Path::new(VERIFIER_SET))?;
     let launcher_profile_identity =
-        systemd_launcher_profile_identity(&systemd_launcher_profile_v3())
+        systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
             .map_err(|_| String::from("launcher profile identity unavailable"))?;
     let job_profile_identity =
         systemd_job_principal_profile_identity(&systemd_job_principal_profile_v2())
@@ -536,7 +537,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
             os: String::from("linux"),
             architecture: String::from("x86_64"),
             execution_mode: String::from("native"),
-            launcher_class: String::from("systemd_protected_launcher_v3"),
+            launcher_class: String::from("systemd_protected_launcher_v4"),
         },
     };
     implementation_subject.identity =
@@ -690,7 +691,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         "attestation": {
             "protocol_version": SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3,
             "adapter": SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1,
-            "systemd_launcher_profile_id": SYSTEMD_LAUNCHER_PROFILE_ID_V3,
+            "systemd_launcher_profile_id": SYSTEMD_LAUNCHER_PROFILE_ID_V4,
             "systemd_launcher_profile_identity": launcher_profile_identity,
             "systemd_job_principal_profile_id": SYSTEMD_JOB_PRINCIPAL_PROFILE_ID_V2,
             "systemd_job_principal_profile_identity": job_profile_identity,
@@ -1073,7 +1074,7 @@ fn protected_directories() -> [(&'static str, u32); 13] {
 
 fn launcher_service_unit(launcher: &Path, repository: &Path, read_only: &[String]) -> String {
     format!(
-        "[Unit]\nDescription=Ota protected authority launcher\nRequires=ota-authority-launcher.socket ota-authority-attestor.socket\nAfter=ota-authority-launcher.socket ota-authority-attestor.socket\n\n[Service]\nType=simple\nExecStart={} serve-systemd\nUser=root\nGroup=root\nUMask=0077\nRuntimeDirectory=ota/authority-launcher\nRuntimeDirectoryMode=0700\nNoNewPrivileges=no\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths={}\nReadWritePaths={} {} {} {} {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}\n",
+        "[Unit]\nDescription=Ota protected authority launcher\nRequires=ota-authority-launcher.socket ota-authority-attestor.socket\nAfter=ota-authority-launcher.socket ota-authority-attestor.socket\n\n[Service]\nType=simple\nExecStart={} serve-systemd\nUser=root\nGroup=root\nUMask=0077\nRuntimeDirectory=ota/authority-launcher\nRuntimeDirectoryMode=0700\nNoNewPrivileges=no\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nOpenFile=/proc/sys/kernel/random/boot_id:ota-boot-id:read-only\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths={}\nReadWritePaths={} {} {} {} {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}\n",
         launcher.display(),
         read_only.join(" "),
         LAUNCHER_RUNTIME,
@@ -1085,7 +1086,7 @@ fn launcher_service_unit(launcher: &Path, repository: &Path, read_only: &[String
 
 fn launcher_hardening_drop_in(repository: &Path, read_only: &[String]) -> String {
     format!(
-        "[Service]\nUser=root\nGroup=root\nUMask=0077\nRuntimeDirectory=ota/authority-launcher\nRuntimeDirectoryMode=0700\nNoNewPrivileges=no\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths=\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths=\nReadOnlyPaths={}\nReadWritePaths=\nReadWritePaths={} {} {} {} {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}\n",
+        "[Service]\nUser=root\nGroup=root\nUMask=0077\nRuntimeDirectory=ota/authority-launcher\nRuntimeDirectoryMode=0700\nNoNewPrivileges=no\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nOpenFile=\nOpenFile=/proc/sys/kernel/random/boot_id:ota-boot-id:read-only\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths=\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths=\nReadOnlyPaths={}\nReadWritePaths=\nReadWritePaths={} {} {} {} {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}\n",
         read_only.join(" "),
         LAUNCHER_RUNTIME,
         LAUNCHER_STATE,
@@ -1096,7 +1097,7 @@ fn launcher_hardening_drop_in(repository: &Path, read_only: &[String]) -> String
 
 fn launcher_socket_unit(group: &str) -> String {
     format!(
-        "[Unit]\nDescription=Ota protected authority launcher socket\n\n[Socket]\nListenStream={LAUNCHER_SOCKET}\nSocketUser=root\nSocketGroup={group}\nSocketMode=0660\nAccept=no\nRemoveOnStop=yes\nService=ota-authority-launcher.service\n\n[Install]\nWantedBy=sockets.target\n"
+        "[Unit]\nDescription=Ota protected authority launcher socket\n\n[Socket]\nListenStream={LAUNCHER_SOCKET}\nFileDescriptorName=ota-launcher-listener\nSocketUser=root\nSocketGroup={group}\nSocketMode=0660\nAccept=no\nRemoveOnStop=yes\nService=ota-authority-launcher.service\n\n[Install]\nWantedBy=sockets.target\n"
     )
 }
 
@@ -1358,6 +1359,37 @@ fn validate_protected_launcher_core_version(value: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn validate_systemd_manager_version() -> Result<(), String> {
+    let output = Command::new(SYSTEMCTL)
+        .arg("--version")
+        .env_clear()
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|_| String::from("systemd manager version is unavailable"))?;
+    if !output.status.success() {
+        return Err(String::from("systemd manager version was refused"));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| String::from("systemd manager version is malformed"))?;
+    let version = parse_systemd_manager_version(&stdout)?;
+    if version < 253 {
+        return Err(String::from(
+            "systemd 253 or newer is required for protected boot observation",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_systemd_manager_version(stdout: &str) -> Result<u32, String> {
+    stdout
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("systemd "))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| String::from("systemd manager version is malformed"))
 }
 
 fn build_source_revisions(ota_binary: &Path) -> Result<(String, String, String, String), String> {
@@ -2280,6 +2312,22 @@ mod tests {
         );
         assert!(service.contains("serve-systemd"));
         assert!(service.contains("NoNewPrivileges=no"));
+        assert!(service.contains("ProtectProc=invisible"));
+        assert!(service.contains("ProcSubset=pid"));
+        assert!(service.contains("OpenFile=/proc/sys/kernel/random/boot_id:ota-boot-id:read-only"));
+        assert_eq!(
+            service
+                .lines()
+                .filter(|line| line.starts_with("OpenFile="))
+                .count(),
+            1
+        );
+        let drop_in = launcher_hardening_drop_in(Path::new("/srv/repository"), &[]);
+        assert!(drop_in.contains("ProcSubset=pid"));
+        assert!(drop_in.contains("OpenFile=/proc/sys/kernel/random/boot_id:ota-boot-id:read-only"));
+        assert!(
+            launcher_socket_unit("ota-job").contains("FileDescriptorName=ota-launcher-listener")
+        );
         assert!(runner_hardening_drop_in().contains("NoNewPrivileges=yes"));
         assert!(runner_hardening_drop_in().contains("CapabilityBoundingSet=\n"));
         assert!(service.contains("RestrictSUIDSGID=no"));
@@ -2395,6 +2443,23 @@ mod tests {
             )
             .contains("--json -- run governed --grant release --receipt")
         );
+    }
+
+    #[test]
+    fn protected_boot_observation_requires_canonical_systemd_version_output() {
+        assert_eq!(
+            parse_systemd_manager_version("systemd 253 (253.1-1)\nPAM ACL\n")
+                .expect("minimum supported systemd"),
+            253
+        );
+        assert_eq!(
+            parse_systemd_manager_version("systemd 257 (257.5-2)\nPAM ACL\n")
+                .expect("newer supported systemd"),
+            257
+        );
+        for malformed in ["", "systemd\n", "systemd banana\n", "systemctl 257\n"] {
+            assert!(parse_systemd_manager_version(malformed).is_err());
+        }
     }
 
     #[test]

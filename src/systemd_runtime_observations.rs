@@ -103,6 +103,7 @@ pub(crate) fn verify_systemd_runtime(
             "ProtectControlGroups",
             "ProtectProc",
             "ProcSubset",
+            "OpenFile",
             "RestrictNamespaces",
             "SystemCallArchitectures",
             "CapabilityBoundingSet",
@@ -131,6 +132,7 @@ pub(crate) fn verify_systemd_runtime(
             "SocketMode",
             "RemoveOnStop",
             "Triggers",
+            "FileDescriptorName",
         ],
     )?;
     verify_socket_properties(config, installation, &socket)?;
@@ -272,6 +274,10 @@ fn verify_service_properties(
         ("ProtectControlGroups", "yes"),
         ("ProtectProc", "invisible"),
         ("ProcSubset", "pid"),
+        (
+            "OpenFile",
+            "/proc/sys/kernel/random/boot_id:ota-boot-id:read-only",
+        ),
         ("RestrictNamespaces", "yes"),
         ("SystemCallArchitectures", "native"),
         ("AmbientCapabilities", "cap_setuid"),
@@ -361,6 +367,7 @@ fn verify_socket_properties(
         ("SocketMode", "0660"),
         ("RemoveOnStop", "yes"),
         ("Triggers", LAUNCHER_SERVICE_UNIT),
+        ("FileDescriptorName", "ota-launcher-listener"),
     ] {
         require(values, name, expected)?;
     }
@@ -515,6 +522,7 @@ mod tests {
             ("SocketMode".into(), "0660".into()),
             ("RemoveOnStop".into(), "yes".into()),
             ("Triggers".into(), LAUNCHER_SERVICE_UNIT.into()),
+            ("FileDescriptorName".into(), "ota-launcher-listener".into()),
         ]);
         for (name, expected) in [
             ("Id", LAUNCHER_SOCKET_UNIT),
@@ -524,11 +532,15 @@ mod tests {
             ("SocketMode", "0660"),
             ("RemoveOnStop", "yes"),
             ("Triggers", LAUNCHER_SERVICE_UNIT),
+            ("FileDescriptorName", "ota-launcher-listener"),
         ] {
             require(&values, name, expected).expect("matching socket property");
         }
         values.insert("Triggers".into(), "other.service".into());
         assert!(require(&values, "Triggers", LAUNCHER_SERVICE_UNIT).is_err());
+        values.insert("Triggers".into(), LAUNCHER_SERVICE_UNIT.into());
+        values.insert("FileDescriptorName".into(), "substituted".into());
+        assert!(require(&values, "FileDescriptorName", "ota-launcher-listener").is_err());
     }
 
     #[test]

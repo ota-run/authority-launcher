@@ -26,6 +26,16 @@
 
 ## Unreleased
 
+- Pin Authority Protocol `af543445446790b01529b6150f8219b3dec351f7` and implement the
+  `ota.authority-launcher.systemd/v4` protected boot-observation profile. The Launcher keeps
+  `ProtectProc=invisible` and `ProcSubset=pid`; systemd 253 or newer opens the canonical boot ID
+  read-only with `OpenFile=` and passes it beside the socket-activated listener under two exact
+  descriptor names. Launcher reconciles the complete named descriptor set, retains and reobserves
+  the procfs boot file, and excludes it from the selected child's exact descriptor table. V3
+  remains historical and is not reinterpreted. This activates no OIDC request, provider contact,
+  materialization, secret delivery, Step 8, or V12.2 capability. Immutable Linux/X64 execution is
+  still required.
+
 - Reconcile optional `sudo` installation aliases to one protected canonical executable across
   pressure provisioning, the installation manifest, generated systemd read-only paths, and live
   closed-profile observation. Hosted run
@@ -41,13 +51,13 @@
   [34356604479](https://github.com/ota-run/authority-launcher/actions/runs/34356604479)
   completed at exact Launcher `22f17eff3e005bb4544d583d0743721835539d0a`.
 
-- Pin Authority Protocol `58526f3f29299873e345352963e30b8a1677044f` and add the protected
+- Add the protected
   Launcher authority-context foundation. Root provisioning writes one closed administrator and
   installed implementation-subject record, binds it as a singular protected installation role,
   and reconciles its exact Launcher/Ota artifacts and build identities before use. The
   crate-private capability constructor now accepts that retained context, a Launcher-generated
-  256-bit invocation nonce, and a retained, immediately reobserved boot ID opened beneath verified
-  procfs instead of four caller-supplied identity strings. The feature-gated production
+  256-bit invocation nonce, and a retained, immediately reobserved boot ID instead of four
+  caller-supplied identity strings. The feature-gated production
   observation route now accepts only the closed invocation-bound Protocol probe on the existing
   protected socket, derives and signs one public projection from the retained stopped child,
   cgroup, session, authority, and store observations, then confirms child and scope cleanup without

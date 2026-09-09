@@ -1536,7 +1536,7 @@ mod tests {
         launcher_execution_completion_v1_identity, launcher_execution_finalization_v1_identity,
         launcher_principal_mapping_identity, ota_process_posture_identity, sha256_identity,
         systemd_job_principal_profile_identity, systemd_job_principal_profile_v2,
-        systemd_launcher_profile_identity, systemd_launcher_profile_v3,
+        systemd_launcher_profile_identity, systemd_launcher_profile_v4,
         systemd_protected_launcher_instance_v2_identity,
         systemd_protected_launcher_instance_v3_foundation_identity,
     };
@@ -1952,7 +1952,7 @@ mod tests {
             principal_mapping: mapping,
             process_posture: posture,
             systemd_launcher_profile_identity: systemd_launcher_profile_identity(
-                &systemd_launcher_profile_v3(),
+                &systemd_launcher_profile_v4(),
             )
             .expect("launcher profile identity"),
             systemd_job_principal_profile_identity: systemd_job_principal_profile_identity(
@@ -1970,7 +1970,7 @@ mod tests {
             schema_version: 3,
             identity: String::new(),
             instance_v1: instance,
-            launcher_observations: systemd_launcher_profile_v3()
+            launcher_observations: systemd_launcher_profile_v4()
                 .evidence_sources
                 .into_iter()
                 .map(|source| SystemdLauncherObservation {

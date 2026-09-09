@@ -57,7 +57,7 @@ producer binding and independently checks the response projection, identity, sig
 key validity, and freshness.
 
 The protected systemd launcher collects the complete ordered
-`ota.authority-launcher.systemd/v3` and `ota.authority-job-principal.systemd/v2` observation sets and
+`ota.authority-launcher.systemd/v4` and `ota.authority-job-principal.systemd/v2` observation sets and
 invokes that producer. It verifies protected installation identities, exact systemd runtime
 properties, process containment, account/sudo/Polkit posture, protected-path and host-socket access,
 and Ota process-access denial before relaying the independently verified signed V3 attestation to
@@ -78,6 +78,14 @@ prepares the stopped Ota child and transient scope, derives the protected capabi
 live observations, delegates only projection signing to the Attestor, cleans up the child and
 scope, and returns only the signed public projection. This route does not authorize execution or
 contact OIDC or another provider.
+
+The V4 service retains `ProtectProc=invisible` and `ProcSubset=pid`. On systemd 253 or newer, the
+manager opens `/proc/sys/kernel/random/boot_id` read-only through `OpenFile=` and passes it as
+`ota-boot-id`; the socket unit names its listener `ota-launcher-listener`. Launcher requires exactly
+those two named descriptors for its current process, accepts either descriptor ordering, and
+reobserves the boot descriptor as read-only procfs before capability reconciliation. The selected
+child's complete stopped descriptor table is independently restricted to its six declared roles,
+so the boot descriptor is not inherited. No other service unit receives a wider procfs view.
 
 The pressure provisioner installs fixed root-owned `0400` empty verifier and binding snapshots
 beneath `/etc/ota/secret-delivery` so that capability observation can bind their exact descriptors
@@ -307,15 +315,15 @@ a retained live Unix-stream session descriptor and invocation cgroup before deri
 OIDC token, contact Google, inject a secret, or change the default launcher path. Those remain
 separate reviewed boundaries.
 
-The same inactive foundation loads one administrator-installed
+The same protected observation route loads one administrator-installed
 `ProtectedLauncherAuthorityContextV1` whose file identity is a singular protected-installation
 role. It reconciles the exact installed Launcher and Ota artifacts, source-bound build identities,
 Protocol revision, compatibility range, launcher profile, and Linux/x86_64 target before capability
 use. The root Launcher generates the invocation nonce itself and observes the canonical boot UUID
-through a retained descriptor beneath a verified procfs root, rechecking both immediately before
-capability reconciliation. Repository, workflow, environment, and request values cannot provide
-those identities. This is context and observation ownership only, not an active service route or
-provider evidence.
+through the retained manager-opened V4 descriptor, rechecking its procfs, access-mode, metadata,
+content, and identity immediately before capability reconciliation. Repository, workflow,
+environment, and request values cannot provide those identities. This is context and observation
+ownership only, not provider evidence.
 
 This path permits selected execution only after signed V3 admission and one bounded consumed
 lease. The selected Ota command creates its ordinary transaction-bound crossing receipt/archive;
