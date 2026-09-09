@@ -24,6 +24,12 @@
 mod active_slot;
 #[cfg(target_os = "linux")]
 mod archive_attachment;
+#[cfg(all(target_os = "linux", feature = "protected-attestor"))]
+#[allow(dead_code)]
+mod attestation_client;
+#[cfg(all(target_os = "linux", feature = "protected-attestor"))]
+#[allow(dead_code)]
+mod attestor;
 #[cfg(target_os = "linux")]
 mod closed_profile_observations;
 #[cfg(unix)]
@@ -36,10 +42,16 @@ mod installation_manifest;
 mod prepared_child;
 #[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
 mod pressure_provision;
+#[cfg(all(target_os = "linux", feature = "protected-attestor"))]
+#[allow(dead_code)]
+mod protected_capability_observation;
 #[cfg(target_os = "linux")]
 mod protected_history;
 #[cfg(target_os = "linux")]
 mod protected_history_service;
+#[cfg(all(target_os = "linux", feature = "protected-attestor"))]
+#[allow(dead_code)]
+mod protected_launcher_capability;
 #[cfg(test)]
 mod reference_peer;
 #[cfg(target_os = "linux")]

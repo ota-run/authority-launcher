@@ -72,6 +72,13 @@ transaction-bound completion over the private session; the launcher persists it 
 acknowledgement, reconciles the observed child exit, removes the exact scope and empty cgroup,
 reaps the child, removes the slot, and only then emits terminal finalization evidence.
 
+With `protected-attestor` enabled, the same protected socket also accepts the closed Protocol
+capability-observation probe. It binds Core's fresh challenge to one exact launcher invocation,
+prepares the stopped Ota child and transient scope, derives the protected capability from retained
+live observations, delegates only projection signing to the Attestor, cleans up the child and
+scope, and returns only the signed public projection. This route does not authorize execution or
+contact OIDC or another provider.
+
 The feature-gated `ota-authority-pressure-peer` binary is an exception for conformance testing
 only. It uses fixed public test keys and deterministic scenarios to exercise protocol v2 through a
 real launcher/Core process chain. The hosted lane runs Core as a dedicated non-root principal with

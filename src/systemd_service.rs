@@ -73,6 +73,12 @@ use ota_authority_protocol::{
     systemd_protected_launcher_instance_v3_foundation_identity,
     validate_launcher_invocation_request_v1, validate_launcher_terminal_frame_v1,
 };
+#[cfg(feature = "protected-attestor")]
+use ota_authority_protocol::{
+    ProtectedLauncherCapabilityObservationProbeRequestV1,
+    ProtectedLauncherCapabilityObservationResponseV1,
+    protected_launcher_capability_observation_probe_request_v1_identity,
+};
 use thiserror::Error;
 
 use crate::active_slot::{ActiveSlot, ActiveSlotError};
@@ -198,6 +204,8 @@ enum BoundaryAdmission {
 
 enum InitialClientRequest {
     Invocation(LauncherInvocationRequestV1),
+    #[cfg(feature = "protected-attestor")]
+    CapabilityObservation(Box<ProtectedLauncherCapabilityObservationProbeRequestV1>),
     FinalizationArchive(LauncherFinalizationArchiveRequestV1),
     FinalizationRecovery(LauncherFinalizationRecoveryRequestV1),
 }
@@ -234,6 +242,24 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
     let peer =
         observe_connected_peer(&stream).map_err(|_| SystemdServiceError::PeerPostureUnavailable)?;
     let initial_request = receive_initial_request(&mut stream, config.maximum_request_bytes)?;
+    #[cfg(feature = "protected-attestor")]
+    if let InitialClientRequest::CapabilityObservation(request) = initial_request {
+        let mapping = select_mapping(config, &request.invocation, &peer)?;
+        reconcile_connected_peer(&peer, mapping.job_peer.uid, mapping.job_peer.gid)
+            .map_err(|_| SystemdServiceError::PeerPostureUnavailable)?;
+        verify_peer_process_status(&peer)
+            .map_err(|_| SystemdServiceError::PeerPostureUnavailable)?;
+        return serve_capability_observation(
+            config,
+            &installation,
+            &loaded.ota_binary,
+            &launcher_executable,
+            &mut stream,
+            &peer,
+            mapping,
+            *request,
+        );
+    }
     if let InitialClientRequest::FinalizationRecovery(request) = &initial_request {
         let mapping = select_mapping_for_authority(config, request.authority_id.as_str(), &peer)?;
         reconcile_connected_peer(&peer, mapping.job_peer.uid, mapping.job_peer.gid)
@@ -401,6 +427,145 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
             Err(error)
         }
     }
+}
+
+#[cfg(feature = "protected-attestor")]
+#[allow(clippy::too_many_arguments)]
+fn serve_capability_observation(
+    config: &SystemdLauncherServiceConfigV1,
+    installation: &ProtectedInstallationManifestV1,
+    ota_binary: &std::fs::File,
+    launcher_executable: &Path,
+    stream: &mut UnixStream,
+    peer: &ObservedSessionPeer,
+    mapping: &crate::config::SystemdPrincipalMappingV1,
+    request: ProtectedLauncherCapabilityObservationProbeRequestV1,
+) -> Result<u8, SystemdServiceError> {
+    validate_requested_command(&request.invocation)?;
+    let repository = open_repository_directory(
+        config,
+        &mapping.execution,
+        request.invocation.repository_path.as_str(),
+    )
+    .map_err(map_target_directory_error)?;
+    let authority = crate::installation_manifest::load_protected_launcher_authority_context(
+        config,
+        launcher_executable,
+    )
+    .map_err(|_| SystemdServiceError::InstallationIdentityUnavailable)?;
+    let authority =
+        crate::protected_launcher_capability::RetainedProtectedLauncherAuthorityContextV1::acquire(
+            authority,
+        )
+        .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    let replay =
+        crate::protected_capability_observation::ProtectedCapabilityObservationReplayStoreV1::open(
+        )
+        .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    let response = RefCell::new(None::<ProtectedLauncherCapabilityObservationResponseV1>);
+    let invocation_id = fresh_invocation_id()?;
+    let scope_manager = SystemdScopeManager::connect().map_err(map_systemd_scope_error)?;
+    let boundary = prepare_disabled_child_boundary_with_scope(
+        config,
+        ota_binary,
+        &repository,
+        mapping,
+        &request.invocation,
+        invocation_id.as_str(),
+        Path::new(ACTIVE_SLOT_DIRECTORY),
+        0,
+        Path::new("/"),
+        &scope_manager,
+        |child, principal_mapping, scope, _active_slot| {
+            let posture = child
+                .resume_and_receive_process_posture(
+                    principal_mapping.identity.as_str(),
+                    Duration::from_secs(config.maximum_startup_seconds),
+                )
+                .map_err(map_prepared_child_error)?;
+            let runtime_identity = verify_systemd_runtime(config, installation, scope)
+                .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            let child_record = child.record.clone();
+            let mut evidence =
+                crate::closed_profile_observations::collect_live_closed_profile_evidence(
+                    config,
+                    installation,
+                    mapping,
+                    stream,
+                    peer,
+                    &child_record,
+                    scope,
+                    &posture,
+                    runtime_identity.as_str(),
+                )
+                .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            let launcher_instance = collect_launcher_instance(
+                config,
+                principal_mapping,
+                &child_record,
+                scope,
+                &posture,
+                &mut evidence,
+            )?;
+            let stores = crate::protected_launcher_capability::ProtectedAuthorityStoresV1::open()
+                .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            let cgroup =
+                crate::protected_launcher_capability::RetainedInvocationCgroupV1::open(scope)
+                    .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            let session = stream
+                .try_clone()
+                .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            let mut observation =
+                crate::protected_launcher_capability::RetainedProtectedLauncherObservationV1::observe(
+                    stores, cgroup, session,
+                )
+                .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            let launcher_profile_identity =
+                systemd_launcher_profile_identity(&systemd_launcher_profile_v3())
+                    .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            let launcher_executable_identity = installation
+                .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
+                .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            let context =
+                crate::protected_launcher_capability::ProtectedLauncherCapabilityContextV1 {
+                    request: &request.invocation,
+                    child: &child_record,
+                    scope,
+                    principal_mapping,
+                    process_posture: &posture,
+                    launcher_instance: &launcher_instance,
+                    launcher_executable_identity,
+                    launcher_configuration_identity: config.identity.as_str(),
+                    launcher_service_binding_identity: config.service_unit_identity.as_str(),
+                    launcher_profile_identity: launcher_profile_identity.as_str(),
+                    service_uid: unsafe { libc::geteuid() },
+                    service_gid: unsafe { libc::getegid() },
+                    authority: &authority,
+                };
+            let projection =
+                crate::protected_capability_observation::derive_and_sign_capability_observation_v1(
+                    &replay,
+                    &request.observation,
+                    &context,
+                    &mut observation,
+                )
+                .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            response.replace(Some(projection));
+            Ok((AuthorizationDecision::Denied, None))
+        },
+    )?;
+    if !matches!(boundary, BoundaryAdmission::Refused { .. }) {
+        return Err(SystemdServiceError::RuntimeProfileUnavailable);
+    }
+    let response = response
+        .into_inner()
+        .ok_or(SystemdServiceError::RuntimeProfileUnavailable)?;
+    let payload = serde_jcs::to_vec(&response).map_err(|_| SystemdServiceError::InvalidRequest)?;
+    let frame = encode_frame(&payload).map_err(|_| SystemdServiceError::InvalidRequest)?;
+    stream
+        .write_all(&frame)
+        .map_err(|_| SystemdServiceError::InvalidRequest)?;
+    Ok(0)
 }
 
 fn execute_selected_boundary(
@@ -808,27 +973,8 @@ fn produce_attestation(
         return Err(SystemdServiceError::RuntimeProfileUnavailable);
     }
 
-    let job_profile_identity =
-        systemd_job_principal_profile_identity(&systemd_job_principal_profile_v2())
-            .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
-    let mut instance = SystemdProtectedLauncherInstanceEvidenceV1 {
-        schema_version: 1,
-        identity: String::new(),
-        adapter: SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1.into(),
-        principal_mapping: principal_mapping.clone(),
-        process_posture: posture.clone(),
-        systemd_launcher_profile_identity: launcher_profile_identity.clone(),
-        systemd_job_principal_profile_identity: job_profile_identity,
-        launcher_session_binding_identity: config.identity.clone(),
-        systemd_invocation_identity: scope.identity.clone(),
-        working_directory_identity: child.working_directory_identity.clone(),
-        child_process_identity: child.identity.clone(),
-    };
-    instance.identity = systemd_protected_launcher_instance_v3_foundation_identity(&instance)
-        .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
     let complete =
-        ota_authority_launcher::observation_collector::collect_closed_profile(instance, evidence)
-            .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+        collect_launcher_instance(config, principal_mapping, child, scope, posture, evidence)?;
     let claims = LauncherAttestationClaimsV3 {
         message_kind: ATTESTATION_RESPONSE.into(),
         attestation_protocol_version: SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3.into(),
@@ -868,6 +1014,40 @@ fn produce_attestation(
         ota_authority_launcher::attestation_client::request_attestation(&producer, &request)
             .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
     Ok(response.attestation)
+}
+
+fn collect_launcher_instance(
+    config: &SystemdLauncherServiceConfigV1,
+    principal_mapping: &ota_authority_protocol::LauncherPrincipalMappingV1,
+    child: &ota_authority_protocol::LauncherChildProcessV1,
+    scope: &ota_authority_protocol::LauncherSystemdScopeV1,
+    posture: &ota_authority_protocol::OtaProcessPostureV1,
+    evidence: &mut crate::closed_profile_observations::LiveClosedProfileEvidence,
+) -> Result<ota_authority_protocol::SystemdProtectedLauncherInstanceEvidenceV2, SystemdServiceError>
+{
+    let launcher_profile_identity =
+        systemd_launcher_profile_identity(&systemd_launcher_profile_v3())
+            .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    let job_profile_identity =
+        systemd_job_principal_profile_identity(&systemd_job_principal_profile_v2())
+            .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    let mut instance = SystemdProtectedLauncherInstanceEvidenceV1 {
+        schema_version: 1,
+        identity: String::new(),
+        adapter: SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1.into(),
+        principal_mapping: principal_mapping.clone(),
+        process_posture: posture.clone(),
+        systemd_launcher_profile_identity: launcher_profile_identity,
+        systemd_job_principal_profile_identity: job_profile_identity,
+        launcher_session_binding_identity: config.identity.clone(),
+        systemd_invocation_identity: scope.identity.clone(),
+        working_directory_identity: child.working_directory_identity.clone(),
+        child_process_identity: child.identity.clone(),
+    };
+    instance.identity = systemd_protected_launcher_instance_v3_foundation_identity(&instance)
+        .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    ota_authority_launcher::observation_collector::collect_closed_profile(instance, evidence)
+        .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)
 }
 
 struct ProtectedBrokerProxy {
@@ -1524,6 +1704,20 @@ fn receive_initial_request(
             validate_launcher_invocation_request_v1(&request)
                 .map_err(|_| SystemdServiceError::InvalidRequest)?;
             Ok(InitialClientRequest::Invocation(request))
+        }
+        #[cfg(feature = "protected-attestor")]
+        Some(ota_authority_protocol::PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_PROBE_REQUEST) => {
+            let request: ProtectedLauncherCapabilityObservationProbeRequestV1 =
+                serde_json::from_value(value).map_err(|_| SystemdServiceError::InvalidRequest)?;
+            if protected_launcher_capability_observation_probe_request_v1_identity(&request)
+                .map_err(|_| SystemdServiceError::InvalidRequest)?
+                != request.identity
+            {
+                return Err(SystemdServiceError::InvalidRequest);
+            }
+            Ok(InitialClientRequest::CapabilityObservation(Box::new(
+                request,
+            )))
         }
         Some(ota_authority_protocol::LAUNCHER_FINALIZATION_ARCHIVE_REQUEST) => {
             let request: LauncherFinalizationArchiveRequestV1 =
@@ -2561,6 +2755,95 @@ mod tests {
         };
         assert!(matches!(
             validate_requested_command(&request),
+            Err(SystemdServiceError::InvalidRequest)
+        ));
+    }
+
+    #[cfg(feature = "protected-attestor")]
+    #[test]
+    fn capability_observation_probe_dispatch_requires_exact_bound_identity() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use ota_authority_protocol::{
+            PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_CHALLENGE,
+            PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_PROBE_REQUEST,
+            PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_REQUEST,
+            ProtectedLauncherCapabilityObservationChallengeV1,
+            ProtectedLauncherCapabilityObservationProbeRequestV1,
+            ProtectedLauncherCapabilityObservationRequestV1,
+            protected_launcher_capability_observation_challenge_v1_identity,
+            protected_launcher_capability_observation_nonce_commitment_v1,
+            protected_launcher_capability_observation_probe_request_v1_identity,
+            protected_launcher_capability_observation_request_v1_identity,
+        };
+
+        let invocation = LauncherInvocationRequestV1 {
+            message_kind: ota_authority_protocol::LAUNCHER_INVOCATION_REQUEST.into(),
+            protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
+            authority_id: "secret-delivery".into(),
+            ota_arguments: vec!["run".into(), "governed".into()],
+            repository_path: "/srv/repositories/project".into(),
+        };
+        let nonce = [7_u8; 32];
+        let mut challenge = ProtectedLauncherCapabilityObservationChallengeV1 {
+            schema_version: 1,
+            message_kind: PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_CHALLENGE.into(),
+            identity: String::new(),
+            workflow_run_id: "34356604479".into(),
+            workflow_run_attempt: "1".into(),
+            workflow_reference: "ota-run/ota/.github/workflows/secret-delivery-oidc-endpoint-evidence.yml@refs/heads/1.6.28-implementation".into(),
+            nonce_commitment: protected_launcher_capability_observation_nonce_commitment_v1(&nonce)
+                .expect("nonce commitment"),
+            issued_at_unix_seconds: 1_788_800_000,
+            expires_at_unix_seconds: 1_788_800_300,
+        };
+        challenge.identity =
+            protected_launcher_capability_observation_challenge_v1_identity(&challenge)
+                .expect("challenge identity");
+        let mut observation = ProtectedLauncherCapabilityObservationRequestV1 {
+            schema_version: 1,
+            message_kind: PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_REQUEST.into(),
+            identity: String::new(),
+            challenge,
+            nonce: URL_SAFE_NO_PAD.encode(nonce),
+            runner_version: "2.337.0".into(),
+            expected_launcher_request_identity: launcher_invocation_request_identity(&invocation)
+                .expect("invocation identity"),
+        };
+        observation.identity =
+            protected_launcher_capability_observation_request_v1_identity(&observation)
+                .expect("observation identity");
+        let mut probe = ProtectedLauncherCapabilityObservationProbeRequestV1 {
+            schema_version: 1,
+            message_kind: PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_PROBE_REQUEST.into(),
+            identity: String::new(),
+            invocation,
+            observation,
+        };
+        probe.identity =
+            protected_launcher_capability_observation_probe_request_v1_identity(&probe)
+                .expect("probe identity");
+
+        let receive = |value: &ProtectedLauncherCapabilityObservationProbeRequestV1| {
+            let (mut service, mut client) = UnixStream::pair().expect("socket pair");
+            let bytes = serde_jcs::to_vec(value).expect("probe bytes");
+            client
+                .write_all(&encode_frame(&bytes).expect("probe frame"))
+                .expect("write probe");
+            receive_initial_request(&mut service, MAX_FRAME_BYTES)
+        };
+        assert!(matches!(
+            receive(&probe),
+            Ok(InitialClientRequest::CapabilityObservation(value)) if *value == probe
+        ));
+
+        let mut substituted = probe;
+        substituted.observation.runner_version = "2.338.0".into();
+        substituted.observation.identity =
+            protected_launcher_capability_observation_request_v1_identity(&substituted.observation)
+                .expect("substituted observation identity");
+        assert!(matches!(
+            receive(&substituted),
             Err(SystemdServiceError::InvalidRequest)
         ));
     }

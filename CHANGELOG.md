@@ -47,8 +47,11 @@
   and reconciles its exact Launcher/Ota artifacts and build identities before use. The
   crate-private capability constructor now accepts that retained context, a Launcher-generated
   256-bit invocation nonce, and a retained, immediately reobserved boot ID opened beneath verified
-  procfs instead of four caller-supplied identity strings. The production observation route remains
-  inactive.
+  procfs instead of four caller-supplied identity strings. The feature-gated production
+  observation route now accepts only the closed invocation-bound Protocol probe on the existing
+  protected socket, derives and signs one public projection from the retained stopped child,
+  cgroup, session, authority, and store observations, then confirms child and scope cleanup without
+  entering broker authorization or selected execution. Hosted Linux/X64 execution remains required.
 - Retain the Linux
   protected-attestor foundation for protected-launcher capability observation. The launcher can
   retain the two fixed root-owned authority stores through descriptor-relative `openat2`
