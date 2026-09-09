@@ -172,6 +172,12 @@ pub(crate) enum SystemdServiceError {
     BrokerProxyUnavailable,
     #[error("the protected launcher installation identity is unavailable or mismatched")]
     InstallationIdentityUnavailable,
+    #[error("the protected launcher retained authority context is unavailable or mismatched")]
+    RetainedAuthorityContextUnavailable,
+    #[error(
+        "the protected launcher capability-observation replay store is unavailable or mismatched"
+    )]
+    CapabilityObservationReplayUnavailable,
     #[error("the protected launcher effective runtime profile is unavailable or mismatched")]
     RuntimeProfileUnavailable,
     #[error("the systemd launcher protocol bridge refused before authorization")]
@@ -457,11 +463,11 @@ fn serve_capability_observation(
         crate::protected_launcher_capability::RetainedProtectedLauncherAuthorityContextV1::acquire(
             authority,
         )
-        .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+        .map_err(|_| SystemdServiceError::RetainedAuthorityContextUnavailable)?;
     let replay =
         crate::protected_capability_observation::ProtectedCapabilityObservationReplayStoreV1::open(
         )
-        .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+        .map_err(|_| SystemdServiceError::CapabilityObservationReplayUnavailable)?;
     let response = RefCell::new(None::<ProtectedLauncherCapabilityObservationResponseV1>);
     let invocation_id = fresh_invocation_id()?;
     let scope_manager = SystemdScopeManager::connect().map_err(map_systemd_scope_error)?;

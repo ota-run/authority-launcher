@@ -54,7 +54,8 @@
   entering broker authorization or selected execution. The pressure provisioner now installs fixed
   root-owned empty verifier and binding snapshots for exact descriptor and byte observation; they
   grant no authority and prove no provider contact, materialization, or delivery. Hosted Linux/X64
-  execution remains required.
+  execution remains required. Pre-scope observation refusal now distinguishes retained authority
+  context failure from replay-store failure instead of collapsing both into runtime-profile drift.
 - Retain the Linux
   protected-attestor foundation for protected-launcher capability observation. The launcher can
   retain the two fixed root-owned authority stores through descriptor-relative `openat2`
