@@ -33,6 +33,11 @@
   exposed the mismatch on Ubuntu 26: provisioning retained `/usr/bin/sudo` while runtime correctly
   refused that symlink before authority execution. This repair requires a fresh immutable
   reprovision and hosted rerun; the failed run is not governed-invocation evidence.
+- Keep `NoNewPrivileges=no` only on the already-root protected Launcher so its live closed-profile
+  observer can query the canonical sudo policy on Ubuntu's `sudo-rs`. The independently controlled
+  runner and selected execution process still require and revalidate `NoNewPrivileges=1`, empty
+  capabilities, and their exact principal boundaries. This is a pressure-boundary repair and does
+  not activate provider contact or secret delivery.
 
 - Pin Authority Protocol `58526f3f29299873e345352963e30b8a1677044f` and add the protected
   Launcher authority-context foundation. Root provisioning writes one closed administrator and

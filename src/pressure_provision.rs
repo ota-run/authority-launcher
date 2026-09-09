@@ -1056,7 +1056,7 @@ fn protected_directories() -> [(&'static str, u32); 12] {
 
 fn launcher_service_unit(launcher: &Path, repository: &Path, read_only: &[String]) -> String {
     format!(
-        "[Unit]\nDescription=Ota protected authority launcher\nRequires=ota-authority-launcher.socket ota-authority-attestor.socket\nAfter=ota-authority-launcher.socket ota-authority-attestor.socket\n\n[Service]\nType=simple\nExecStart={} serve-systemd\nUser=root\nGroup=root\nUMask=0077\nRuntimeDirectory=ota/authority-launcher\nRuntimeDirectoryMode=0700\nNoNewPrivileges=yes\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths={}\nReadWritePaths={} {} {} {} {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}\n",
+        "[Unit]\nDescription=Ota protected authority launcher\nRequires=ota-authority-launcher.socket ota-authority-attestor.socket\nAfter=ota-authority-launcher.socket ota-authority-attestor.socket\n\n[Service]\nType=simple\nExecStart={} serve-systemd\nUser=root\nGroup=root\nUMask=0077\nRuntimeDirectory=ota/authority-launcher\nRuntimeDirectoryMode=0700\nNoNewPrivileges=no\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths={}\nReadWritePaths={} {} {} {} {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}\n",
         launcher.display(),
         read_only.join(" "),
         LAUNCHER_RUNTIME,
@@ -1068,7 +1068,7 @@ fn launcher_service_unit(launcher: &Path, repository: &Path, read_only: &[String
 
 fn launcher_hardening_drop_in(repository: &Path, read_only: &[String]) -> String {
     format!(
-        "[Service]\nUser=root\nGroup=root\nUMask=0077\nRuntimeDirectory=ota/authority-launcher\nRuntimeDirectoryMode=0700\nNoNewPrivileges=yes\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths=\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths=\nReadOnlyPaths={}\nReadWritePaths=\nReadWritePaths={} {} {} {} {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}\n",
+        "[Service]\nUser=root\nGroup=root\nUMask=0077\nRuntimeDirectory=ota/authority-launcher\nRuntimeDirectoryMode=0700\nNoNewPrivileges=no\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths=\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths=\nReadOnlyPaths={}\nReadWritePaths=\nReadWritePaths={} {} {} {} {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}\n",
         read_only.join(" "),
         LAUNCHER_RUNTIME,
         LAUNCHER_STATE,
@@ -2261,6 +2261,9 @@ mod tests {
             &[String::from("/etc/ota")],
         );
         assert!(service.contains("serve-systemd"));
+        assert!(service.contains("NoNewPrivileges=no"));
+        assert!(runner_hardening_drop_in().contains("NoNewPrivileges=yes"));
+        assert!(runner_hardening_drop_in().contains("CapabilityBoundingSet=\n"));
         assert!(service.contains("RestrictSUIDSGID=no"));
         assert!(service.contains("AmbientCapabilities=CAP_SETUID"));
         assert!(service.contains("RuntimeDirectory=ota/authority-launcher"));
@@ -2274,6 +2277,11 @@ mod tests {
                  {CAPABILITY_OBSERVATION_REPLAY_DIRECTORY} /srv/ota-pressure \
                  {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}"
             )));
+        assert!(
+            launcher_hardening_drop_in(Path::new("/srv/repository"), &[])
+                .lines()
+                .any(|line| line == "NoNewPrivileges=no")
+        );
         assert!(
             launcher_hardening_drop_in(Path::new("/srv/repository"), &[])
                 .lines()

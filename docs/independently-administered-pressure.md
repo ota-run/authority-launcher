@@ -80,6 +80,11 @@ effective process capabilities, or access to Docker/host-control sockets. Its ru
 set `NoNewPrivileges=yes`. The execution account must not be able to connect to either protected
 Ota socket.
 
+The root-owned Launcher service retains `NoNewPrivileges=no` so it can use the canonical protected
+`sudo -n -l -U` policy query for both selected principals. This does not extend to repository code:
+the runner service and every selected execution process independently require and revalidate
+`NoNewPrivileges=1`, empty process capabilities, and the declared principal boundary.
+
 Create `/srv/ota-v3-pressure` as `ota-authority-exec` and place the reviewed pressure contract
 there. Every existing directory and regular file must be owned by that principal, unavailable for
 write by the job principal, free of symlink aliases, and singularly linked. The selected `governed`

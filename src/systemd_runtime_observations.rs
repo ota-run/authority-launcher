@@ -254,7 +254,9 @@ fn verify_service_properties(
         ("UMask", "0077"),
         ("RuntimeDirectory", "ota/authority-launcher"),
         ("RuntimeDirectoryMode", "0700"),
-        ("NoNewPrivileges", "yes"),
+        // The root Launcher must inspect sudo policy. Selected and runner
+        // principals independently require and revalidate NoNewPrivileges=yes.
+        ("NoNewPrivileges", "no"),
         ("RestrictSUIDSGID", "no"),
         ("LockPersonality", "yes"),
         ("MemoryDenyWriteExecute", "no"),
