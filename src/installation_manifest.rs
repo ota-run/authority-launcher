@@ -475,6 +475,30 @@ pub(crate) struct ProtectedInstallationManifestV1 {
     pub files: Vec<ProtectedInstallationFileV1>,
 }
 
+pub(crate) fn resolve_optional_protected_executable_alias(
+    alias: &Path,
+    expected_owner_uid: u32,
+    trusted_root: &Path,
+) -> Result<Option<PathBuf>, InstallationManifestError> {
+    match alias.symlink_metadata() {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(InstallationManifestError::Unavailable),
+    }
+    let target = alias
+        .canonicalize()
+        .map_err(|_| InstallationManifestError::Unavailable)?;
+    let file =
+        open_protected_file(&target, expected_owner_uid, trusted_root).map_err(map_config_error)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| InstallationManifestError::Unavailable)?;
+    if metadata.mode() & 0o111 == 0 || metadata.nlink() != 1 {
+        return Err(InstallationManifestError::Mismatch);
+    }
+    Ok(Some(target))
+}
+
 impl ProtectedInstallationManifestV1 {
     pub(crate) fn singular_path(
         &self,

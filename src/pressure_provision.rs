@@ -77,6 +77,7 @@ use crate::installation_manifest::{
     ProtectedInstallationManifestV1, ProtectedInstallationRoleV1,
     broker_proxy_installation_identity, protected_history_installation_identity,
     protected_installation_manifest_identity, protected_launcher_installed_build_identity,
+    resolve_optional_protected_executable_alias,
 };
 use crate::protected_history::{
     HISTORY_BINDING_PATH, HISTORY_BLOB_ROOT, HISTORY_CATALOG_ROOT, HISTORY_SOCKET_PATH,
@@ -305,7 +306,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         &ota_binary,
         &pressure_client_binary,
         &job_runner_binary,
-    );
+    )?;
     let read_only_paths = launcher_paths
         .iter()
         .map(|(_, path)| path.to_string_lossy().into_owned())
@@ -715,27 +716,20 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         0o644,
     )?;
 
-    let mut files = protected_role_paths(
-        &launcher_binary,
-        &attestor_binary,
-        &broker_decision_binary,
-        &ota_binary,
-        &pressure_client_binary,
-        &job_runner_binary,
-    )
-    .into_iter()
-    .map(|(role, path)| {
-        Ok(ProtectedInstallationFileV1 {
-            role,
-            identity: if role == ProtectedInstallationRoleV1::HistoryBinding {
-                format!("sha256:{}", "0".repeat(64))
-            } else {
-                sha256_file(&path)?
-            },
-            path,
+    let mut files = launcher_paths
+        .into_iter()
+        .map(|(role, path)| {
+            Ok(ProtectedInstallationFileV1 {
+                role,
+                identity: if role == ProtectedInstallationRoleV1::HistoryBinding {
+                    format!("sha256:{}", "0".repeat(64))
+                } else {
+                    sha256_file(&path)?
+                },
+                path,
+            })
         })
-    })
-    .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, String>>()?;
     files.sort_by(|left, right| (left.role, &left.path).cmp(&(right.role, &right.path)));
     let mut manifest = ProtectedInstallationManifestV1 {
         schema_version: 1,
@@ -889,7 +883,7 @@ fn protected_role_paths(
     ota: &Path,
     pressure_client: &Path,
     job_runner: &Path,
-) -> Vec<(ProtectedInstallationRoleV1, PathBuf)> {
+) -> Result<Vec<(ProtectedInstallationRoleV1, PathBuf)>, String> {
     let mut paths = vec![
         (
             ProtectedInstallationRoleV1::BrokerProxyExecutable,
@@ -1017,13 +1011,13 @@ fn protected_role_paths(
             paths.push((role, PathBuf::from(ORBSTACK_GLOBAL_SERVICE_DROP_IN)));
         }
     }
-    if Path::new(SUDO).exists() {
-        paths.push((
-            ProtectedInstallationRoleV1::SudoExecutable,
-            PathBuf::from(SUDO),
-        ));
+    if let Some(sudo) =
+        resolve_optional_protected_executable_alias(Path::new(SUDO), 0, Path::new("/"))
+            .map_err(|_| String::from("protected sudo executable is unavailable"))?
+    {
+        paths.push((ProtectedInstallationRoleV1::SudoExecutable, sudo));
     }
-    paths
+    Ok(paths)
 }
 
 fn polkit_deny_rule(job: &Account, execution: &Account) -> Result<String, String> {
@@ -2230,7 +2224,8 @@ mod tests {
             Path::new("/ota"),
             Path::new("/production-client"),
             Path::new("/github-runner"),
-        );
+        )
+        .expect("protected role paths");
         assert!(paths.contains(&(
             ProtectedInstallationRoleV1::JobRunnerExecutable,
             PathBuf::from("/github-runner"),
@@ -2239,6 +2234,23 @@ mod tests {
             ProtectedInstallationRoleV1::ProductionClientExecutable,
             PathBuf::from("/production-client"),
         )));
+        if Path::new(SUDO).exists() {
+            let sudo = paths
+                .iter()
+                .find(|(role, _)| *role == ProtectedInstallationRoleV1::SudoExecutable)
+                .map(|(_, path)| path)
+                .expect("protected sudo role");
+            assert_eq!(
+                sudo,
+                &Path::new(SUDO).canonicalize().expect("canonical sudo")
+            );
+            assert!(
+                !fs::symlink_metadata(sudo)
+                    .expect("canonical sudo metadata")
+                    .file_type()
+                    .is_symlink()
+            );
+        }
     }
 
     #[test]

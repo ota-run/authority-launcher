@@ -26,6 +26,14 @@
 
 ## Unreleased
 
+- Reconcile optional `sudo` installation aliases to one protected canonical executable across
+  pressure provisioning, the installation manifest, generated systemd read-only paths, and live
+  closed-profile observation. Hosted run
+  [34348643156](https://github.com/ota-run/authority-launcher/actions/runs/34348643156)
+  exposed the mismatch on Ubuntu 26: provisioning retained `/usr/bin/sudo` while runtime correctly
+  refused that symlink before authority execution. This repair requires a fresh immutable
+  reprovision and hosted rerun; the failed run is not governed-invocation evidence.
+
 - Pin Authority Protocol `58526f3f29299873e345352963e30b8a1677044f` and add the protected
   Launcher authority-context foundation. Root provisioning writes one closed administrator and
   installed implementation-subject record, binds it as a singular protected installation role,
