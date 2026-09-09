@@ -84,6 +84,10 @@ use crate::protected_history::{
     ProtectedHistoryBindingV1, ProtectedHistoryRepositoryMappingV1,
     protected_history_binding_identity, protected_history_repository_mapping_identity,
 };
+use crate::protected_launcher_capability::{
+    SECRET_DELIVERY_AUTHORITY_DIRECTORY, SECRET_DELIVERY_BINDING_STORE,
+    SECRET_DELIVERY_VERIFIER_STORE,
+};
 
 const ETC_OTA: &str = "/etc/ota";
 const STATE_ROOT: &str = "/var/lib/ota";
@@ -93,6 +97,8 @@ const ATTESTOR_CONFIG: &str = "/etc/ota/authority-attestor.json";
 const VERIFIER_SET: &str = "/etc/ota/authority-attestor-verifiers.json";
 const INSTALLATION_MANIFEST: &str = "/etc/ota/authority-launcher-installation.json";
 const PUBLIC_INSTALLATION_EVIDENCE_ROOT: &str = "/usr/share/ota/authority-launcher";
+const EMPTY_SECRET_DELIVERY_VERIFIER_SNAPSHOT: &[u8] = b"{\"schema_version\":1,\"verifiers\":[]}\n";
+const EMPTY_SECRET_DELIVERY_BINDING_SNAPSHOT: &[u8] = b"{\"schema_version\":1,\"bindings\":[]}\n";
 const PUBLIC_INSTALLATION_EVIDENCE: &str =
     "/usr/share/ota/authority-launcher/installation-evidence.json";
 const RUNNER_PUBLICATION_GATE: &str = PUBLIC_INSTALLATION_EVIDENCE;
@@ -280,6 +286,16 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     for (path, mode) in protected_directories() {
         create_root_directory(Path::new(path), mode)?;
     }
+    write_root_file(
+        &Path::new(SECRET_DELIVERY_AUTHORITY_DIRECTORY).join(SECRET_DELIVERY_VERIFIER_STORE),
+        EMPTY_SECRET_DELIVERY_VERIFIER_SNAPSHOT,
+        0o400,
+    )?;
+    write_root_file(
+        &Path::new(SECRET_DELIVERY_AUTHORITY_DIRECTORY).join(SECRET_DELIVERY_BINDING_STORE),
+        EMPTY_SECRET_DELIVERY_BINDING_SNAPSHOT,
+        0o400,
+    )?;
     create_root_directory(
         Path::new(POLKIT_RULE)
             .parent()
@@ -1037,7 +1053,7 @@ fn polkit_deny_rule(job: &Account, execution: &Account) -> Result<String, String
     ))
 }
 
-fn protected_directories() -> [(&'static str, u32); 12] {
+fn protected_directories() -> [(&'static str, u32); 13] {
     [
         (ETC_OTA, 0o755),
         (STATE_ROOT, 0o755),
@@ -1047,6 +1063,7 @@ fn protected_directories() -> [(&'static str, u32); 12] {
         (ACTIVE_SLOT_STATE, 0o700),
         (FINALIZATION_STATE, 0o700),
         (CAPABILITY_OBSERVATION_REPLAY_DIRECTORY, 0o700),
+        (SECRET_DELIVERY_AUTHORITY_DIRECTORY, 0o700),
         (BROKER_STATE, 0o700),
         (LAUNCHER_RUNTIME, 0o700),
         (HISTORY_BLOB_ROOT, 0o700),
@@ -1608,6 +1625,7 @@ fn managed_authority_state_paths() -> Vec<&'static str> {
         ISSUANCE_STATE,
         LAUNCHER_STATE,
         CAPABILITY_OBSERVATION_REPLAY_DIRECTORY,
+        SECRET_DELIVERY_AUTHORITY_DIRECTORY,
         LAUNCHER_RUNTIME,
         LAUNCHER_SOCKET,
         ATTESTOR_SOCKET,
@@ -2306,11 +2324,20 @@ mod tests {
         assert!(
             protected_directories().contains(&(CAPABILITY_OBSERVATION_REPLAY_DIRECTORY, 0o700))
         );
-        assert!(
-            managed_authority_state_paths()
-                .windows(2)
-                .any(|paths| paths == [LAUNCHER_STATE, CAPABILITY_OBSERVATION_REPLAY_DIRECTORY])
+        assert!(protected_directories().contains(&(SECRET_DELIVERY_AUTHORITY_DIRECTORY, 0o700)));
+        assert_eq!(
+            EMPTY_SECRET_DELIVERY_VERIFIER_SNAPSHOT,
+            b"{\"schema_version\":1,\"verifiers\":[]}\n"
         );
+        assert_eq!(
+            EMPTY_SECRET_DELIVERY_BINDING_SNAPSHOT,
+            b"{\"schema_version\":1,\"bindings\":[]}\n"
+        );
+        assert!(managed_authority_state_paths().windows(2).any(|paths| paths
+            == [
+                CAPABILITY_OBSERVATION_REPLAY_DIRECTORY,
+                SECRET_DELIVERY_AUTHORITY_DIRECTORY,
+            ]));
         assert!(protected_directories().contains(&(HISTORY_BLOB_ROOT, 0o700)));
         assert!(protected_directories().contains(&(HISTORY_CATALOG_ROOT, 0o700)));
         assert!(

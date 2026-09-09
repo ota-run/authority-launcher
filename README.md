@@ -79,6 +79,11 @@ live observations, delegates only projection signing to the Attestor, cleans up 
 scope, and returns only the signed public projection. This route does not authorize execution or
 contact OIDC or another provider.
 
+The pressure provisioner installs fixed root-owned `0400` empty verifier and binding snapshots
+beneath `/etc/ota/secret-delivery` so that capability observation can bind their exact descriptors
+and bytes. Those empty structural snapshots grant no verifier or provider authority and prove no
+provider contact, materialization, or secret delivery.
+
 The feature-gated `ota-authority-pressure-peer` binary is an exception for conformance testing
 only. It uses fixed public test keys and deterministic scenarios to exercise protocol v2 through a
 real launcher/Core process chain. The hosted lane runs Core as a dedicated non-root principal with

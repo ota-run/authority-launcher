@@ -1,9 +1,8 @@
 //! Root-owned issuance of a public observation projection for one protected capability.
 //!
-//! This module is deliberately not a command route. A future protected Launcher observation
-//! service is its sole caller; that service delegates only projection signing to the separate
-//! Attestor. Core receives only the resulting public projection after a later reviewed transport
-//! boundary exists.
+//! The protected Launcher service owns capability derivation and delegates only projection signing
+//! to the separate Attestor. Core receives only the resulting public projection over the fixed
+//! local service boundary; provider operations remain outside this route.
 
 use std::ffi::CString;
 use std::fs::File;

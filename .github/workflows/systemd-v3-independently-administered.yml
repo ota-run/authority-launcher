@@ -131,6 +131,7 @@ jobs:
               "/var/lib/ota/authority-attestor",
               "/var/lib/ota/authority-launcher",
               "/var/lib/ota/authority-launcher/capability-observation-replay",
+              "/etc/ota/secret-delivery",
               "/run/ota/authority-launcher",
               "/run/ota/authority-launcher.sock",
               "/run/ota/authority-attestor.sock",

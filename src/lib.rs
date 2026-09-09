@@ -36,10 +36,10 @@ pub mod linux_observations;
 #[cfg(target_os = "linux")]
 pub mod observation_collector;
 #[cfg(all(target_os = "linux", feature = "protected-attestor"))]
-#[allow(dead_code)] // Step 7 foundation; no Core-facing observation route is active yet.
+#[allow(dead_code)] // Step 7 protected observation route; provider operations remain inactive.
 pub(crate) mod protected_capability_observation;
 #[cfg(target_os = "linux")]
-// The future protected Launcher observation service remains the only caller.
+// The protected Launcher observation service remains the only production caller.
 #[allow(dead_code)]
 pub(crate) mod protected_launcher_capability;
 #[cfg(target_os = "linux")]

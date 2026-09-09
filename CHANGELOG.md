@@ -51,7 +51,10 @@
   observation route now accepts only the closed invocation-bound Protocol probe on the existing
   protected socket, derives and signs one public projection from the retained stopped child,
   cgroup, session, authority, and store observations, then confirms child and scope cleanup without
-  entering broker authorization or selected execution. Hosted Linux/X64 execution remains required.
+  entering broker authorization or selected execution. The pressure provisioner now installs fixed
+  root-owned empty verifier and binding snapshots for exact descriptor and byte observation; they
+  grant no authority and prove no provider contact, materialization, or delivery. Hosted Linux/X64
+  execution remains required.
 - Retain the Linux
   protected-attestor foundation for protected-launcher capability observation. The launcher can
   retain the two fixed root-owned authority stores through descriptor-relative `openat2`
