@@ -34,3 +34,21 @@ It records completed execution, terminal cleanup, and one valid protected receip
 invalid archives. It does not prove capability-observation production routing, accepted-session
 provenance, provider contact, OIDC exchange, secret materialization or delivery, Step 8, V12.2, or
 general repository or agent governance.
+
+## Ubuntu 26 Sudo Policy Observation Reconciliation
+
+- Source run: https://github.com/ota-run/authority-launcher/actions/runs/34356604479
+- Source job: https://github.com/ota-run/authority-launcher/actions/runs/34356604479/job/102482773723
+- Source artifact: `independently-administered-systemd-v3-evidence`
+- Launcher revision: `22f17eff3e005bb4544d583d0743721835539d0a`
+- Protocol revision: `58526f3f29299873e345352963e30b8a1677044f`
+- Core revision: `104c1345117a39f899fdc6a48bf8cf689ffbe9b6`
+- Retained file: `systemd-v3-independently-administered-34356604479.zip`
+- SHA-256: `33e749d46e1ff7d0904196373c8538deda66cc34eacefb3f86ffe3b0dbcfb725`
+
+The eight-file ZIP proves one bounded independently administered governed invocation after the
+Ubuntu 26 `sudo-rs` observation boundary was reconciled. It records completed execution, all four
+terminal cleanup conditions, and one valid protected receipt archive with zero invalid archives.
+It does not prove capability-observation production routing, accepted-session provenance, provider
+contact, OIDC exchange, secret materialization or delivery, Step 8, V12.2, or general repository or
+agent governance.
