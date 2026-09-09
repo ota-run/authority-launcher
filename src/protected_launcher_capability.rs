@@ -30,11 +30,13 @@
 use ota_authority_protocol::{
     LauncherChildProcessV1, LauncherInvocationRequestV1, LauncherPrincipalMappingV1,
     LauncherSystemdScopeV1, OtaProcessPostureV1, PROTECTED_LAUNCHER_CAPABILITY,
-    ProtectedLauncherCapabilityEvidenceV1, ProtectedLauncherCapabilityV1,
-    ProtectedLauncherDescriptorRoleV1, ProtectedLauncherDescriptorV1,
-    SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, SystemdProtectedLauncherInstanceEvidenceV2,
-    launcher_invocation_request_identity, protected_launcher_capability_v1_identity,
-    protected_launcher_cgroup_v1_identity, validate_protected_launcher_capability_v1,
+    ProtectedLauncherAuthorityContextV1, ProtectedLauncherCapabilityEvidenceV1,
+    ProtectedLauncherCapabilityV1, ProtectedLauncherDescriptorRoleV1,
+    ProtectedLauncherDescriptorV1, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1,
+    SystemdProtectedLauncherInstanceEvidenceV2, launcher_invocation_request_identity,
+    protected_launcher_authority_context_v1_identity, protected_launcher_boot_v1_identity,
+    protected_launcher_capability_v1_identity, protected_launcher_cgroup_v1_identity,
+    protected_launcher_invocation_nonce_v1_identity, validate_protected_launcher_capability_v1,
 };
 #[cfg(target_os = "linux")]
 use thiserror::Error;
@@ -61,11 +63,166 @@ use std::os::unix::net::UnixStream;
 use std::path::{Component, Path};
 
 #[cfg(target_os = "linux")]
+use crate::installation_manifest::RetainedProtectedLauncherAuthorityInstallationV1;
+
+#[cfg(target_os = "linux")]
+const PROC_BOOT_ID_PATH: &[u8] = b"sys/kernel/random/boot_id";
+
+#[cfg(target_os = "linux")]
 pub const SECRET_DELIVERY_AUTHORITY_DIRECTORY: &str = "/etc/ota/secret-delivery";
 #[cfg(target_os = "linux")]
 pub const SECRET_DELIVERY_VERIFIER_STORE: &str = "verifiers-v1.json";
 #[cfg(target_os = "linux")]
 pub const SECRET_DELIVERY_BINDING_STORE: &str = "bindings-v1.json";
+
+#[cfg(target_os = "linux")]
+struct RetainedProtectedLauncherBootV1 {
+    file: File,
+    device: u64,
+    inode: u64,
+    mode: u32,
+    value: String,
+    identity: String,
+}
+
+#[cfg(target_os = "linux")]
+impl RetainedProtectedLauncherBootV1 {
+    fn observe() -> Result<Self, ProtectedLauncherCapabilityError> {
+        let proc_root = open_root(Path::new("/proc"), 0, 0)?;
+        verify_procfs_root(proc_root.as_raw_fd())?;
+        let descriptor = openat2_beneath(
+            proc_root.as_raw_fd(),
+            PROC_BOOT_ID_PATH,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )?;
+        let file = File::from(descriptor);
+        let (device, inode, mode, value, identity) = observe_boot_file(&file)?;
+        Ok(Self {
+            file,
+            device,
+            inode,
+            mode,
+            value,
+            identity,
+        })
+    }
+
+    fn reobserve(&self) -> Result<&str, ProtectedLauncherCapabilityError> {
+        let (device, inode, mode, value, identity) = observe_boot_file(&self.file)?;
+        if device != self.device
+            || inode != self.inode
+            || mode != self.mode
+            || value != self.value
+            || identity != self.identity
+        {
+            return Err(ProtectedLauncherCapabilityError::ReconciliationFailed);
+        }
+        Ok(self.identity.as_str())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct RetainedProtectedLauncherAuthorityContextV1 {
+    authority: RetainedProtectedLauncherAuthoritySourceV1,
+    authority_identity: String,
+    invocation_nonce: [u8; 32],
+    invocation_nonce_identity: String,
+    boot: RetainedProtectedLauncherBootV1,
+}
+
+#[cfg(target_os = "linux")]
+enum RetainedProtectedLauncherAuthoritySourceV1 {
+    Installation(Box<RetainedProtectedLauncherAuthorityInstallationV1>),
+    #[cfg(test)]
+    Fixture(Box<ProtectedLauncherAuthorityContextV1>),
+}
+
+#[cfg(target_os = "linux")]
+impl RetainedProtectedLauncherAuthorityContextV1 {
+    pub(crate) fn acquire(
+        authority: RetainedProtectedLauncherAuthorityInstallationV1,
+    ) -> Result<Self, ProtectedLauncherCapabilityError> {
+        let authority_identity = authority
+            .reconcile()
+            .map_err(|_| ProtectedLauncherCapabilityError::Unprotected)?
+            .identity
+            .clone();
+        let mut invocation_nonce = [0_u8; 32];
+        getrandom::getrandom(&mut invocation_nonce)
+            .map_err(|_| ProtectedLauncherCapabilityError::Unavailable)?;
+        if invocation_nonce.iter().all(|byte| *byte == 0) {
+            return Err(ProtectedLauncherCapabilityError::Unavailable);
+        }
+        let invocation_nonce_identity =
+            protected_launcher_invocation_nonce_v1_identity(&invocation_nonce)
+                .map_err(|_| ProtectedLauncherCapabilityError::Unprotected)?;
+        Ok(Self {
+            authority: RetainedProtectedLauncherAuthoritySourceV1::Installation(Box::new(
+                authority,
+            )),
+            authority_identity,
+            invocation_nonce,
+            invocation_nonce_identity,
+            boot: RetainedProtectedLauncherBootV1::observe()?,
+        })
+    }
+
+    fn reconcile(
+        &self,
+    ) -> Result<(&ProtectedLauncherAuthorityContextV1, &str, &str), ProtectedLauncherCapabilityError>
+    {
+        let authority = match &self.authority {
+            RetainedProtectedLauncherAuthoritySourceV1::Installation(authority) => authority
+                .reconcile()
+                .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?,
+            #[cfg(test)]
+            RetainedProtectedLauncherAuthoritySourceV1::Fixture(authority) => authority.as_ref(),
+        };
+        if protected_launcher_authority_context_v1_identity(authority)
+            .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?
+            != authority.identity
+            || authority.identity != self.authority_identity
+            || protected_launcher_invocation_nonce_v1_identity(&self.invocation_nonce)
+                .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?
+                != self.invocation_nonce_identity
+        {
+            return Err(ProtectedLauncherCapabilityError::ReconciliationFailed);
+        }
+        Ok((
+            authority,
+            self.invocation_nonce_identity.as_str(),
+            self.boot.reobserve()?,
+        ))
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        authority: ProtectedLauncherAuthorityContextV1,
+        invocation_nonce: [u8; 32],
+    ) -> Result<Self, ProtectedLauncherCapabilityError> {
+        let authority_identity = authority.identity.clone();
+        Ok(Self {
+            authority: RetainedProtectedLauncherAuthoritySourceV1::Fixture(Box::new(authority)),
+            authority_identity,
+            invocation_nonce,
+            invocation_nonce_identity: protected_launcher_invocation_nonce_v1_identity(
+                &invocation_nonce,
+            )
+            .map_err(|_| ProtectedLauncherCapabilityError::Unprotected)?,
+            boot: RetainedProtectedLauncherBootV1::observe()?,
+        })
+    }
+
+    #[cfg(test)]
+    fn fixture_authority_mut(&mut self) -> &mut ProtectedLauncherAuthorityContextV1 {
+        match &mut self.authority {
+            RetainedProtectedLauncherAuthoritySourceV1::Fixture(authority) => authority.as_mut(),
+            RetainedProtectedLauncherAuthoritySourceV1::Installation(_) => {
+                panic!("test fixture authority required")
+            }
+        }
+    }
+}
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -94,12 +251,9 @@ pub(crate) struct ProtectedLauncherCapabilityContextV1<'a> {
     pub launcher_configuration_identity: &'a str,
     pub launcher_service_binding_identity: &'a str,
     pub launcher_profile_identity: &'a str,
-    pub runner_administrator_identity: &'a str,
     pub service_uid: u32,
     pub service_gid: u32,
-    pub invocation_nonce_identity: &'a str,
-    pub boot_identity: &'a str,
-    pub implementation_subject_identity: &'a str,
+    pub authority: &'a RetainedProtectedLauncherAuthorityContextV1,
 }
 
 #[cfg(target_os = "linux")]
@@ -159,6 +313,16 @@ pub(crate) fn derive_protected_launcher_capability_v1(
     input: &ProtectedLauncherCapabilityContextV1<'_>,
     observation: &mut RetainedProtectedLauncherObservationV1,
 ) -> Result<ProtectedLauncherCapabilityV1, ProtectedLauncherCapabilityError> {
+    let (authority, invocation_nonce_identity, boot_identity) = input.authority.reconcile()?;
+    let runner_administrator_identity = authority.runner_administrator.identity.as_str();
+    let implementation_subject = &authority.implementation_subject;
+    let implementation_subject_identity = implementation_subject.identity.as_str();
+    if implementation_subject.launcher_artifact_identity != input.launcher_executable_identity
+        || implementation_subject.ota_artifact_identity != input.child.ota_binary_identity
+        || implementation_subject.launcher_profile_identity != input.launcher_profile_identity
+    {
+        return Err(ProtectedLauncherCapabilityError::ReconciliationFailed);
+    }
     let (descriptors, verifier_store_bytes, binding_store_bytes) =
         observation.reobserve(input.scope)?;
     let cgroup_descriptor = descriptors
@@ -179,11 +343,11 @@ pub(crate) fn derive_protected_launcher_capability_v1(
         launcher_configuration_identity: input.launcher_configuration_identity.into(),
         launcher_service_binding_identity: input.launcher_service_binding_identity.into(),
         launcher_profile_identity: input.launcher_profile_identity.into(),
-        runner_administrator_identity: input.runner_administrator_identity.into(),
+        runner_administrator_identity: runner_administrator_identity.into(),
         service_uid: input.service_uid,
         service_gid: input.service_gid,
-        invocation_nonce_identity: input.invocation_nonce_identity.into(),
-        boot_identity: input.boot_identity.into(),
+        invocation_nonce_identity: invocation_nonce_identity.into(),
+        boot_identity: boot_identity.into(),
         protected_launcher_instance_identity: input.launcher_instance.identity.clone(),
         systemd_invocation_identity: input.scope.identity.clone(),
         systemd_scope_identity: input.scope.identity.clone(),
@@ -191,7 +355,7 @@ pub(crate) fn derive_protected_launcher_capability_v1(
         child_process_identity: input.child.identity.clone(),
         principal_mapping_identity: input.principal_mapping.identity.clone(),
         process_posture_identity: input.process_posture.identity.clone(),
-        implementation_subject_identity: input.implementation_subject_identity.into(),
+        implementation_subject_identity: implementation_subject_identity.into(),
         descriptors: descriptors.to_vec(),
     };
     capability.identity = protected_launcher_capability_v1_identity(&capability)
@@ -207,12 +371,12 @@ pub(crate) fn derive_protected_launcher_capability_v1(
         launcher_configuration_identity: input.launcher_configuration_identity,
         launcher_service_binding_identity: input.launcher_service_binding_identity,
         launcher_profile_identity: input.launcher_profile_identity,
-        runner_administrator_identity: input.runner_administrator_identity,
+        runner_administrator_identity,
         service_uid: input.service_uid,
         service_gid: input.service_gid,
-        invocation_nonce_identity: input.invocation_nonce_identity,
-        boot_identity: input.boot_identity,
-        implementation_subject_identity: input.implementation_subject_identity,
+        invocation_nonce_identity,
+        boot_identity,
+        implementation_subject_identity,
         observed_descriptors: descriptors.as_slice(),
         verifier_store_bytes,
         binding_store_bytes,
@@ -670,6 +834,45 @@ fn verify_directory_descriptor(
 }
 
 #[cfg(target_os = "linux")]
+fn verify_procfs_root(descriptor: RawFd) -> Result<(), ProtectedLauncherCapabilityError> {
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(descriptor, stat.as_mut_ptr()) } != 0 {
+        return Err(ProtectedLauncherCapabilityError::Unavailable);
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.f_type as libc::c_long != libc::PROC_SUPER_MAGIC as libc::c_long {
+        return Err(ProtectedLauncherCapabilityError::Unprotected);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn observe_boot_file(
+    file: &File,
+) -> Result<(u64, u64, u32, String, String), ProtectedLauncherCapabilityError> {
+    let metadata = file
+        .metadata()
+        .map_err(|_| ProtectedLauncherCapabilityError::Unavailable)?;
+    let mode = metadata.mode() & 0o7777;
+    if !metadata.is_file() || metadata.uid() != 0 || mode & 0o022 != 0 {
+        return Err(ProtectedLauncherCapabilityError::Unprotected);
+    }
+    let mut bytes = [0_u8; 38];
+    let count = file
+        .read_at(&mut bytes, 0)
+        .map_err(|_| ProtectedLauncherCapabilityError::Unavailable)?;
+    let value = std::str::from_utf8(&bytes[..count])
+        .ok()
+        .and_then(|value| value.strip_suffix('\n').or(Some(value)))
+        .filter(|value| value.len() == 36)
+        .ok_or(ProtectedLauncherCapabilityError::Unprotected)?
+        .to_owned();
+    let identity = protected_launcher_boot_v1_identity(&value)
+        .map_err(|_| ProtectedLauncherCapabilityError::Unprotected)?;
+    Ok((metadata.dev(), metadata.ino(), mode, value, identity))
+}
+
+#[cfg(target_os = "linux")]
 fn verify_cgroup2_root(descriptor: RawFd) -> Result<(), ProtectedLauncherCapabilityError> {
     let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
     if unsafe { libc::fstatfs(descriptor, stat.as_mut_ptr()) } != 0 {
@@ -973,13 +1176,11 @@ mod privileged_linux_tests {
         principal_mapping: LauncherPrincipalMappingV1,
         process_posture: OtaProcessPostureV1,
         launcher_instance: SystemdProtectedLauncherInstanceEvidenceV2,
+        launcher_executable_identity: String,
         launcher_configuration_identity: String,
         launcher_service_binding_identity: String,
         launcher_profile_identity: String,
-        runner_administrator_identity: String,
-        invocation_nonce_identity: String,
-        boot_identity: String,
-        implementation_subject_identity: String,
+        authority: RetainedProtectedLauncherAuthorityContextV1,
     }
 
     impl CapabilityFixture {
@@ -991,16 +1192,13 @@ mod privileged_linux_tests {
                 principal_mapping: &self.principal_mapping,
                 process_posture: &self.process_posture,
                 launcher_instance: &self.launcher_instance,
-                launcher_executable_identity: self.child.ota_binary_identity.as_str(),
+                launcher_executable_identity: self.launcher_executable_identity.as_str(),
                 launcher_configuration_identity: self.launcher_configuration_identity.as_str(),
                 launcher_service_binding_identity: self.launcher_service_binding_identity.as_str(),
                 launcher_profile_identity: self.launcher_profile_identity.as_str(),
-                runner_administrator_identity: self.runner_administrator_identity.as_str(),
                 service_uid: 0,
                 service_gid: 0,
-                invocation_nonce_identity: self.invocation_nonce_identity.as_str(),
-                boot_identity: self.boot_identity.as_str(),
-                implementation_subject_identity: self.implementation_subject_identity.as_str(),
+                authority: &self.authority,
             }
         }
     }
@@ -1161,6 +1359,63 @@ mod privileged_linux_tests {
         launcher_instance.identity =
             systemd_protected_launcher_instance_v2_identity(&launcher_instance)
                 .expect("launcher instance identity");
+        let mut runner_administrator = RunnerAdministratorAuthorityV1 {
+            schema_version: 1,
+            record_kind: RUNNER_ADMINISTRATOR_AUTHORITY.into(),
+            identity: String::new(),
+            authority_id: String::from("secret-delivery"),
+            authority_instance_id: URL_SAFE_NO_PAD.encode([6_u8; 32]),
+            administration_scope: String::from("protected_self_hosted_runner"),
+        };
+        runner_administrator.identity =
+            runner_administrator_authority_v1_identity(&runner_administrator)
+                .expect("runner administrator identity");
+        let mut implementation_subject = ProtectedLauncherImplementationSubjectV1 {
+            schema_version: 1,
+            record_kind: PROTECTED_LAUNCHER_IMPLEMENTATION_SUBJECT.into(),
+            identity: String::new(),
+            launcher_source_repository: String::from(
+                "https://github.com/ota-run/authority-launcher",
+            ),
+            launcher_source_revision: "1".repeat(40),
+            core_source_repository: String::from("https://github.com/ota-run/ota"),
+            core_source_revision: "2".repeat(40),
+            protocol_source_repository: String::from(
+                "https://github.com/ota-run/authority-protocol",
+            ),
+            protocol_source_revision: "3".repeat(40),
+            launcher_build_identity: identity('a'),
+            core_build_identity: identity('b'),
+            launcher_artifact_identity: identity('1'),
+            ota_artifact_identity: child.ota_binary_identity.clone(),
+            protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
+            minimum_core_version: String::from("1.6.28"),
+            maximum_exclusive_core_version: String::from("1.7.0"),
+            launcher_profile_identity: launcher_profile_identity.clone(),
+            target: ProtectedLauncherImplementationTargetV1 {
+                environment: String::from("self_hosted"),
+                os: String::from("linux"),
+                architecture: String::from("x86_64"),
+                execution_mode: String::from("native"),
+                launcher_class: String::from("systemd_protected_launcher_v3"),
+            },
+        };
+        implementation_subject.identity =
+            protected_launcher_implementation_subject_v1_identity(&implementation_subject)
+                .expect("implementation subject identity");
+        let mut authority = ProtectedLauncherAuthorityContextV1 {
+            schema_version: 1,
+            record_kind: PROTECTED_LAUNCHER_AUTHORITY_CONTEXT.into(),
+            identity: String::new(),
+            runner_administrator,
+            implementation_subject,
+        };
+        authority.identity = protected_launcher_authority_context_v1_identity(&authority)
+            .expect("authority context identity");
+        let invocation_nonce = [10_u8; 32];
+        let retained_authority =
+            RetainedProtectedLauncherAuthorityContextV1::for_test(authority, invocation_nonce)
+                .expect("retained authority context");
         CapabilityFixture {
             request,
             child,
@@ -1168,13 +1423,11 @@ mod privileged_linux_tests {
             principal_mapping,
             process_posture,
             launcher_instance,
+            launcher_executable_identity: identity('1'),
             launcher_configuration_identity,
             launcher_service_binding_identity: identity('4'),
             launcher_profile_identity,
-            runner_administrator_identity: identity('6'),
-            invocation_nonce_identity: identity('a'),
-            boot_identity: identity('b'),
-            implementation_subject_identity: identity('c'),
+            authority: retained_authority,
         }
     }
 
@@ -1247,10 +1500,52 @@ mod privileged_linux_tests {
     #[test]
     #[ignore = "requires root-owned stores and a real transient systemd cgroup-v2 scope"]
     fn retained_observation_derives_and_rejects_live_substitution() {
-        let fixture = fixture();
+        let mut fixture = fixture();
         let mut retained = observation(&fixture.scope);
         let capability = derive_protected_launcher_capability_v1(&fixture.context(), &mut retained)
             .expect("live capability");
+
+        fixture.authority.invocation_nonce[0] ^= 1;
+        assert!(
+            derive_protected_launcher_capability_v1(&fixture.context(), &mut retained).is_err()
+        );
+        fixture.authority.invocation_nonce[0] ^= 1;
+
+        let original_authority = fixture.authority.fixture_authority_mut().clone();
+        let authority = fixture.authority.fixture_authority_mut();
+        authority.runner_administrator.authority_instance_id = URL_SAFE_NO_PAD.encode([11_u8; 32]);
+        authority.runner_administrator.identity =
+            runner_administrator_authority_v1_identity(&authority.runner_administrator)
+                .expect("substituted administrator identity");
+        authority.identity = protected_launcher_authority_context_v1_identity(authority)
+            .expect("substituted authority context identity");
+        assert!(
+            derive_protected_launcher_capability_v1(&fixture.context(), &mut retained).is_err()
+        );
+        *fixture.authority.fixture_authority_mut() = original_authority.clone();
+
+        let authority = fixture.authority.fixture_authority_mut();
+        authority.implementation_subject.core_source_revision = "4".repeat(40);
+        authority.implementation_subject.identity =
+            protected_launcher_implementation_subject_v1_identity(
+                &authority.implementation_subject,
+            )
+            .expect("substituted implementation identity");
+        authority.identity = protected_launcher_authority_context_v1_identity(authority)
+            .expect("substituted subject context identity");
+        assert!(
+            derive_protected_launcher_capability_v1(&fixture.context(), &mut retained).is_err()
+        );
+        *fixture.authority.fixture_authority_mut() = original_authority;
+
+        let original_boot_identity = fixture.authority.boot.identity.clone();
+        fixture.authority.boot.identity = identity('f');
+        assert!(
+            derive_protected_launcher_capability_v1(&fixture.context(), &mut retained).is_err()
+        );
+        fixture.authority.boot.identity = original_boot_identity;
+        derive_protected_launcher_capability_v1(&fixture.context(), &mut retained)
+            .expect("restored authority observations");
 
         let verifier_path =
             Path::new(SECRET_DELIVERY_AUTHORITY_DIRECTORY).join(SECRET_DELIVERY_VERIFIER_STORE);

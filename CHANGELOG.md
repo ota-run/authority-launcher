@@ -26,7 +26,15 @@
 
 ## Unreleased
 
-- Pin Authority Protocol `e0af492ba8a6fbe01e805c79762909c9cda28198` and add the Linux
+- Pin Authority Protocol `58526f3f29299873e345352963e30b8a1677044f` and add the protected
+  Launcher authority-context foundation. Root provisioning writes one closed administrator and
+  installed implementation-subject record, binds it as a singular protected installation role,
+  and reconciles its exact Launcher/Ota artifacts and build identities before use. The
+  crate-private capability constructor now accepts that retained context, a Launcher-generated
+  256-bit invocation nonce, and a retained, immediately reobserved boot ID opened beneath verified
+  procfs instead of four caller-supplied identity strings. The production observation route remains
+  inactive.
+- Retain the Linux
   protected-attestor foundation for protected-launcher capability observation. The launcher can
   retain the two fixed root-owned authority stores through descriptor-relative `openat2`
   resolution, observe a retained live Unix-stream descriptor and exact invocation cgroup, and

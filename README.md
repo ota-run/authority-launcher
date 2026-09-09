@@ -295,6 +295,16 @@ a retained live Unix-stream session descriptor and invocation cgroup before deri
 OIDC token, contact Google, inject a secret, or change the default launcher path. Those remain
 separate reviewed boundaries.
 
+The same inactive foundation loads one administrator-installed
+`ProtectedLauncherAuthorityContextV1` whose file identity is a singular protected-installation
+role. It reconciles the exact installed Launcher and Ota artifacts, source-bound build identities,
+Protocol revision, compatibility range, launcher profile, and Linux/x86_64 target before capability
+use. The root Launcher generates the invocation nonce itself and observes the canonical boot UUID
+through a retained descriptor beneath a verified procfs root, rechecking both immediately before
+capability reconciliation. Repository, workflow, environment, and request values cannot provide
+those identities. This is context and observation ownership only, not an active service route or
+provider evidence.
+
 This path permits selected execution only after signed V3 admission and one bounded consumed
 lease. The selected Ota command creates its ordinary transaction-bound crossing receipt/archive;
 launcher terminal evidence separately binds Core's completion to exact child, scope, cgroup, and

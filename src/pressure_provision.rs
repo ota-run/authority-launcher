@@ -39,18 +39,26 @@ use ota_authority_protocol::{
     CHALLENGE_REQUEST_DOMAIN_V1, LEASE_CONSUME_DOMAIN_V1, LEASE_CONSUME_RESPONSE_DOMAIN_V1,
     LEASE_CONSUMPTION_QUERY_DOMAIN_V1, LEASE_CONSUMPTION_STATUS_DOMAIN_V1,
     LEASE_ISSUANCE_DOMAIN_V1, LauncherAttestationProducerBindingV1, LauncherWorkingDirectoryV1,
+    PROTECTED_LAUNCHER_AUTHORITY_CONTEXT,
     PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_PROJECTION_KEY_USAGE_V1,
     PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_SIGNATURE_DOMAIN_V1,
-    PROTECTED_LAUNCHER_CAPABILITY_PROJECTION_VERIFIER,
-    ProtectedLauncherCapabilityProjectionVerifierV1, SYSTEMD_JOB_PRINCIPAL_PROFILE_ID_V2,
-    SYSTEMD_LAUNCHER_PROFILE_ID_V3, SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1,
+    PROTECTED_LAUNCHER_CAPABILITY_PROJECTION_VERIFIER, PROTECTED_LAUNCHER_IMPLEMENTATION_SUBJECT,
+    ProtectedLauncherAuthorityContextV1, ProtectedLauncherCapabilityProjectionVerifierV1,
+    ProtectedLauncherImplementationSubjectV1, ProtectedLauncherImplementationTargetV1,
+    RUNNER_ADMINISTRATOR_AUTHORITY, RunnerAdministratorAuthorityV1,
+    SYSTEMD_JOB_PRINCIPAL_PROFILE_ID_V2, SYSTEMD_LAUNCHER_PROFILE_ID_V3,
+    SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1,
     SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3,
     launcher_attestation_producer_binding_v1_identity, launcher_working_directory_identity,
-    message_identity, protected_launcher_capability_projection_key_identity_v1,
-    protected_launcher_capability_projection_verifier_v1_identity, sha256_identity,
+    message_identity, protected_launcher_authority_context_v1_identity,
+    protected_launcher_capability_projection_key_identity_v1,
+    protected_launcher_capability_projection_verifier_v1_identity,
+    protected_launcher_implementation_subject_v1_identity,
+    runner_administrator_authority_v1_identity, sha256_identity,
     systemd_job_principal_profile_identity, systemd_job_principal_profile_v2,
     systemd_launcher_profile_identity, systemd_launcher_profile_v3,
 };
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -65,9 +73,10 @@ use crate::config::{
 };
 use crate::installation_manifest::{
     CAPABILITY_OBSERVATION_REPLAY_DIRECTORY, CAPABILITY_PROJECTION_VERIFIER_PATH,
-    ProtectedInstallationFileV1, ProtectedInstallationManifestV1, ProtectedInstallationRoleV1,
+    PROTECTED_LAUNCHER_AUTHORITY_CONTEXT_PATH, ProtectedInstallationFileV1,
+    ProtectedInstallationManifestV1, ProtectedInstallationRoleV1,
     broker_proxy_installation_identity, protected_history_installation_identity,
-    protected_installation_manifest_identity,
+    protected_installation_manifest_identity, protected_launcher_installed_build_identity,
 };
 use crate::protected_history::{
     HISTORY_BINDING_PATH, HISTORY_BLOB_ROOT, HISTORY_CATALOG_ROOT, HISTORY_SOCKET_PATH,
@@ -190,6 +199,7 @@ struct PreparedProvisioningObservationV1 {
 
 #[derive(Deserialize)]
 struct OtaBuildIdentity {
+    semver: String,
     source_build: bool,
     commit: Option<String>,
     dirty: bool,
@@ -247,6 +257,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         .unwrap_or(pressure_client_binary.as_path())
         .to_path_buf();
     let source_revisions = build_source_revisions(&ota_binary)?;
+    validate_protected_launcher_core_version(&source_revisions.3)?;
     for path in [
         Path::new(SYSTEMCTL),
         Path::new(PKCHECK),
@@ -460,6 +471,75 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     let job_profile_identity =
         systemd_job_principal_profile_identity(&systemd_job_principal_profile_v2())
             .map_err(|_| String::from("job profile identity unavailable"))?;
+    let launcher_artifact_identity = sha256_file(&launcher_binary)?;
+    let ota_artifact_identity = sha256_file(&ota_binary)?;
+    let mut runner_administrator = RunnerAdministratorAuthorityV1 {
+        schema_version: 1,
+        record_kind: RUNNER_ADMINISTRATOR_AUTHORITY.into(),
+        identity: String::new(),
+        authority_id: request.authority_id.clone(),
+        authority_instance_id: URL_SAFE_NO_PAD.encode(random_seed()?),
+        administration_scope: String::from("protected_self_hosted_runner"),
+    };
+    runner_administrator.identity =
+        runner_administrator_authority_v1_identity(&runner_administrator)
+            .map_err(|_| String::from("runner administrator identity unavailable"))?;
+    let mut implementation_subject = ProtectedLauncherImplementationSubjectV1 {
+        schema_version: 1,
+        record_kind: PROTECTED_LAUNCHER_IMPLEMENTATION_SUBJECT.into(),
+        identity: String::new(),
+        launcher_source_repository: String::from("https://github.com/ota-run/authority-launcher"),
+        launcher_source_revision: source_revisions.2.clone(),
+        core_source_repository: String::from("https://github.com/ota-run/ota"),
+        core_source_revision: source_revisions.1.clone(),
+        protocol_source_repository: String::from("https://github.com/ota-run/authority-protocol"),
+        protocol_source_revision: source_revisions.0.clone(),
+        launcher_build_identity: protected_launcher_installed_build_identity(
+            "launcher",
+            "https://github.com/ota-run/authority-launcher",
+            &source_revisions.2,
+            &launcher_artifact_identity,
+        )
+        .map_err(|_| String::from("launcher build identity unavailable"))?,
+        core_build_identity: protected_launcher_installed_build_identity(
+            "core",
+            "https://github.com/ota-run/ota",
+            &source_revisions.1,
+            &ota_artifact_identity,
+        )
+        .map_err(|_| String::from("Core build identity unavailable"))?,
+        launcher_artifact_identity,
+        ota_artifact_identity,
+        protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
+        minimum_core_version: String::from("1.6.28"),
+        maximum_exclusive_core_version: String::from("1.7.0"),
+        launcher_profile_identity: launcher_profile_identity.clone(),
+        target: ProtectedLauncherImplementationTargetV1 {
+            environment: String::from("self_hosted"),
+            os: String::from("linux"),
+            architecture: String::from("x86_64"),
+            execution_mode: String::from("native"),
+            launcher_class: String::from("systemd_protected_launcher_v3"),
+        },
+    };
+    implementation_subject.identity =
+        protected_launcher_implementation_subject_v1_identity(&implementation_subject)
+            .map_err(|_| String::from("protected Launcher subject identity unavailable"))?;
+    let mut authority_context = ProtectedLauncherAuthorityContextV1 {
+        schema_version: 1,
+        record_kind: PROTECTED_LAUNCHER_AUTHORITY_CONTEXT.into(),
+        identity: String::new(),
+        runner_administrator,
+        implementation_subject,
+    };
+    authority_context.identity =
+        protected_launcher_authority_context_v1_identity(&authority_context)
+            .map_err(|_| String::from("protected Launcher authority context unavailable"))?;
+    write_json(
+        Path::new(PROTECTED_LAUNCHER_AUTHORITY_CONTEXT_PATH),
+        &authority_context,
+        0o600,
+    )?;
 
     let mut launcher_config = SystemdLauncherServiceConfigV1 {
         schema_version: 1,
@@ -864,6 +944,10 @@ fn protected_role_paths(
             PathBuf::from(CAPABILITY_PROJECTION_VERIFIER_PATH),
         ),
         (
+            ProtectedInstallationRoleV1::ProtectedLauncherAuthorityContext,
+            PathBuf::from(PROTECTED_LAUNCHER_AUTHORITY_CONTEXT_PATH),
+        ),
+        (
             ProtectedInstallationRoleV1::AttestorServiceUnit,
             PathBuf::from(ATTESTOR_SERVICE),
         ),
@@ -1254,7 +1338,18 @@ fn validate_git_revision(value: &str) -> Result<(), String> {
     }
 }
 
-fn build_source_revisions(ota_binary: &Path) -> Result<(String, String, String), String> {
+fn validate_protected_launcher_core_version(value: &str) -> Result<(), String> {
+    let version = Version::parse(value)
+        .map_err(|_| String::from("installed Ota semantic version is malformed"))?;
+    if version < Version::new(1, 6, 28) || version >= Version::new(1, 7, 0) {
+        return Err(String::from(
+            "installed Ota version is outside the protected Launcher compatibility range",
+        ));
+    }
+    Ok(())
+}
+
+fn build_source_revisions(ota_binary: &Path) -> Result<(String, String, String, String), String> {
     let protocol = option_env!("OTA_PROTOCOL_BUILD_REVISION")
         .ok_or_else(|| String::from("Protocol build revision is unavailable"))?
         .to_owned();
@@ -1281,7 +1376,7 @@ fn build_source_revisions(ota_binary: &Path) -> Result<(String, String, String),
         .filter(|_| identity.source_build && !identity.dirty)
         .ok_or_else(|| String::from("installed Ota must be a clean source build"))?;
     validate_git_revision(&core)?;
-    Ok((protocol, core, launcher))
+    Ok((protocol, core, launcher, identity.semver))
 }
 
 fn observe_prepared_provisioning_precondition(
@@ -1508,6 +1603,7 @@ fn managed_authority_state_paths() -> Vec<&'static str> {
         LAUNCHER_CONFIG,
         ATTESTOR_CONFIG,
         VERIFIER_SET,
+        PROTECTED_LAUNCHER_AUTHORITY_CONTEXT_PATH,
         INSTALLATION_MANIFEST,
         PUBLIC_INSTALLATION_EVIDENCE_ROOT,
         BROKER_STORE,
@@ -1880,6 +1976,15 @@ mod tests {
         assert!(validate_git_revision(&"A".repeat(40)).is_err());
         assert!(validate_git_revision(&"a".repeat(39)).is_err());
         assert!(validate_git_revision("not-a-revision").is_err());
+    }
+
+    #[test]
+    fn protected_launcher_core_compatibility_is_bounded() {
+        assert!(validate_protected_launcher_core_version("1.6.28").is_ok());
+        assert!(validate_protected_launcher_core_version("1.6.99").is_ok());
+        assert!(validate_protected_launcher_core_version("1.6.27").is_err());
+        assert!(validate_protected_launcher_core_version("1.7.0").is_err());
+        assert!(validate_protected_launcher_core_version("stable").is_err());
     }
 
     #[test]

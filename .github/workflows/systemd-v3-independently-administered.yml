@@ -120,6 +120,7 @@ jobs:
               "/etc/ota/authority-launcher-systemd.json",
               "/etc/ota/authority-attestor.json",
               "/etc/ota/authority-attestor-verifiers.json",
+              "/etc/ota/protected-launcher-authority-context-v1.json",
               "/etc/ota/authority-launcher-installation.json",
               "/usr/share/ota/authority-launcher",
               "/etc/ota/crossing-brokers.json",

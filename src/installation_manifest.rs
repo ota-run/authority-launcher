@@ -26,26 +26,33 @@
 //! identities only, never producer credentials or private key material.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
 use std::io::Seek;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use ota_authority_protocol::{
-    ProtectedLauncherCapabilityProjectionVerifierV1, message_identity,
-    systemd_job_principal_profile_identity, systemd_job_principal_profile_v2,
-    systemd_launcher_profile_identity, systemd_launcher_profile_v3,
-    validate_protected_launcher_capability_projection_verifier_v1,
+    ProtectedLauncherAuthorityContextV1, ProtectedLauncherCapabilityProjectionVerifierV1,
+    message_identity, protected_launcher_authority_context_v1_identity,
+    protected_launcher_implementation_subject_v1_identity,
+    runner_administrator_authority_v1_identity, systemd_job_principal_profile_identity,
+    systemd_job_principal_profile_v2, systemd_launcher_profile_identity,
+    systemd_launcher_profile_v3, validate_protected_launcher_capability_projection_verifier_v1,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::{
-    ConfigError, SystemdLauncherServiceConfigV1, open_protected_file, sha256_file_identity,
+    ConfigError, SystemdLauncherServiceConfigV1, open_protected_executable, open_protected_file,
+    sha256_file_identity,
 };
 
 pub(crate) const SYSTEMD_INSTALLATION_MANIFEST_PATH: &str =
     "/etc/ota/authority-launcher-installation.json";
 pub(crate) const CAPABILITY_PROJECTION_VERIFIER_PATH: &str =
     "/usr/share/ota/authority-launcher/capability-projection-verifier-v1.json";
+pub(crate) const PROTECTED_LAUNCHER_AUTHORITY_CONTEXT_PATH: &str =
+    "/etc/ota/protected-launcher-authority-context-v1.json";
 pub(crate) const CAPABILITY_OBSERVATION_REPLAY_DIRECTORY: &str =
     "/var/lib/ota/authority-launcher/capability-observation-replay";
 const INSTALLATION_MANIFEST_IDENTITY_DOMAIN_V1: &str =
@@ -54,6 +61,8 @@ const HISTORY_INSTALLATION_IDENTITY_DOMAIN_V1: &str =
     "ota.authority-launcher.history-installation.v1\0";
 const BROKER_PROXY_INSTALLATION_IDENTITY_DOMAIN_V1: &str =
     "ota.authority-launcher.broker-proxy-installation.v1\0";
+pub(crate) const PROTECTED_LAUNCHER_BUILD_IDENTITY_DOMAIN_V1: &[u8] =
+    b"ota.authority-launcher.installed-build.v1\0";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(crate) enum InstallationManifestError {
@@ -82,6 +91,7 @@ pub(crate) enum ProtectedInstallationRoleV1 {
     AttestorConfiguration,
     AttestorVerifierSet,
     CapabilityProjectionVerifier,
+    ProtectedLauncherAuthorityContext,
     AttestorServiceUnit,
     AttestorServiceDropIn,
     AttestorSocketUnit,
@@ -99,6 +109,299 @@ pub(crate) enum ProtectedInstallationRoleV1 {
     HistoryBinding,
     HistoryServiceUnit,
     HistorySocketUnit,
+}
+
+pub(crate) fn protected_launcher_installed_build_identity(
+    owner: &str,
+    source_repository: &str,
+    source_revision: &str,
+    artifact_identity: &str,
+) -> Result<String, InstallationManifestError> {
+    message_identity(
+        PROTECTED_LAUNCHER_BUILD_IDENTITY_DOMAIN_V1,
+        &(owner, source_repository, source_revision, artifact_identity),
+    )
+    .map_err(|_| InstallationManifestError::Malformed)
+}
+
+#[allow(dead_code)] // Retained by the inactive protected observation service foundation.
+struct RetainedProtectedInstallationFileV1 {
+    file: File,
+    path: PathBuf,
+    trusted_root: PathBuf,
+    expected_owner_uid: u32,
+    executable: bool,
+    identity: String,
+    device: u64,
+    inode: u64,
+    mode: u32,
+    size: u64,
+}
+
+#[allow(dead_code)]
+impl RetainedProtectedInstallationFileV1 {
+    fn open(
+        path: &Path,
+        expected_owner_uid: u32,
+        trusted_root: &Path,
+        executable: bool,
+    ) -> Result<Self, InstallationManifestError> {
+        let file = if executable {
+            open_protected_executable(path, expected_owner_uid, trusted_root)
+        } else {
+            open_protected_file(path, expected_owner_uid, trusted_root)
+        }
+        .map_err(map_config_error)?;
+        let retained = Self {
+            file,
+            path: path.to_path_buf(),
+            trusted_root: trusted_root.to_path_buf(),
+            expected_owner_uid,
+            executable,
+            identity: String::new(),
+            device: 0,
+            inode: 0,
+            mode: 0,
+            size: 0,
+        };
+        let (identity, device, inode, mode, size) = retained.observe_descriptor()?;
+        Ok(Self {
+            identity,
+            device,
+            inode,
+            mode,
+            size,
+            ..retained
+        })
+    }
+
+    fn observe_descriptor(
+        &self,
+    ) -> Result<(String, u64, u64, u32, u64), InstallationManifestError> {
+        let mut file = self
+            .file
+            .try_clone()
+            .map_err(|_| InstallationManifestError::Unavailable)?;
+        file.rewind()
+            .map_err(|_| InstallationManifestError::Unavailable)?;
+        let identity = sha256_file_identity(&mut file).map_err(map_config_error)?;
+        let metadata = self
+            .file
+            .metadata()
+            .map_err(|_| InstallationManifestError::Unavailable)?;
+        Ok((
+            identity,
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mode() & 0o7777,
+            metadata.size(),
+        ))
+    }
+
+    fn reconcile(&self) -> Result<(), InstallationManifestError> {
+        let expected = (
+            self.identity.clone(),
+            self.device,
+            self.inode,
+            self.mode,
+            self.size,
+        );
+        if self.observe_descriptor()? != expected {
+            return Err(InstallationManifestError::Mismatch);
+        }
+        let reopened = Self::open(
+            &self.path,
+            self.expected_owner_uid,
+            &self.trusted_root,
+            self.executable,
+        )?;
+        if reopened.observe_descriptor()? != expected {
+            return Err(InstallationManifestError::Mismatch);
+        }
+        Ok(())
+    }
+
+    fn read_json<T: for<'de> Deserialize<'de>>(&self) -> Result<T, InstallationManifestError> {
+        let mut file = self
+            .file
+            .try_clone()
+            .map_err(|_| InstallationManifestError::Unavailable)?;
+        file.rewind()
+            .map_err(|_| InstallationManifestError::Unavailable)?;
+        serde_json::from_reader(file).map_err(|_| InstallationManifestError::Malformed)
+    }
+}
+
+#[allow(dead_code)] // Retained by the inactive protected observation service foundation.
+pub(crate) struct RetainedProtectedLauncherAuthorityInstallationV1 {
+    context: ProtectedLauncherAuthorityContextV1,
+    manifest_identity: String,
+    manifest: RetainedProtectedInstallationFileV1,
+    context_file: RetainedProtectedInstallationFileV1,
+    launcher: RetainedProtectedInstallationFileV1,
+    ota: RetainedProtectedInstallationFileV1,
+}
+
+#[allow(dead_code)]
+impl RetainedProtectedLauncherAuthorityInstallationV1 {
+    pub(crate) fn reconcile(
+        &self,
+    ) -> Result<&ProtectedLauncherAuthorityContextV1, InstallationManifestError> {
+        self.manifest.reconcile()?;
+        self.context_file.reconcile()?;
+        self.launcher.reconcile()?;
+        self.ota.reconcile()?;
+        let manifest: ProtectedInstallationManifestV1 = self.manifest.read_json()?;
+        let context: ProtectedLauncherAuthorityContextV1 = self.context_file.read_json()?;
+        if manifest.identity != self.manifest_identity || context != self.context {
+            return Err(InstallationManifestError::Mismatch);
+        }
+        if self.context_file.identity
+            != manifest
+                .singular_identity(ProtectedInstallationRoleV1::ProtectedLauncherAuthorityContext)?
+            || self.launcher.identity
+                != manifest.singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)?
+            || self.ota.identity
+                != manifest.singular_identity(ProtectedInstallationRoleV1::OtaExecutable)?
+        {
+            return Err(InstallationManifestError::Mismatch);
+        }
+        validate_authority_context_against_installation(
+            &context,
+            &manifest,
+            &self.context_file.path,
+        )?;
+        Ok(&self.context)
+    }
+}
+
+#[allow(dead_code)] // Used by the future protected observation service route.
+pub(crate) fn load_protected_launcher_authority_context(
+    config: &SystemdLauncherServiceConfigV1,
+    launcher_executable: &Path,
+) -> Result<RetainedProtectedLauncherAuthorityInstallationV1, InstallationManifestError> {
+    load_protected_launcher_authority_context_at(
+        Path::new(SYSTEMD_INSTALLATION_MANIFEST_PATH),
+        Path::new(PROTECTED_LAUNCHER_AUTHORITY_CONTEXT_PATH),
+        Path::new(crate::config::SYSTEMD_AUTHORITY_LAUNCHER_CONFIG_PATH),
+        launcher_executable,
+        config,
+        0,
+        Path::new("/"),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_protected_launcher_authority_context_at(
+    manifest_path: &Path,
+    context_path: &Path,
+    config_path: &Path,
+    launcher_executable: &Path,
+    config: &SystemdLauncherServiceConfigV1,
+    expected_owner_uid: u32,
+    trusted_root: &Path,
+) -> Result<RetainedProtectedLauncherAuthorityInstallationV1, InstallationManifestError> {
+    let manifest = load_protected_installation_manifest_at(
+        manifest_path,
+        config_path,
+        launcher_executable,
+        config,
+        expected_owner_uid,
+        trusted_root,
+    )?;
+    let retained_manifest = RetainedProtectedInstallationFileV1::open(
+        manifest_path,
+        expected_owner_uid,
+        trusted_root,
+        false,
+    )?;
+    let context_file = RetainedProtectedInstallationFileV1::open(
+        context_path,
+        expected_owner_uid,
+        trusted_root,
+        false,
+    )?;
+    let launcher = RetainedProtectedInstallationFileV1::open(
+        launcher_executable,
+        expected_owner_uid,
+        trusted_root,
+        true,
+    )?;
+    let ota = RetainedProtectedInstallationFileV1::open(
+        &config.ota_binary,
+        expected_owner_uid,
+        trusted_root,
+        true,
+    )?;
+    let context: ProtectedLauncherAuthorityContextV1 = context_file.read_json()?;
+    if context_file.identity
+        != manifest
+            .singular_identity(ProtectedInstallationRoleV1::ProtectedLauncherAuthorityContext)?
+        || launcher.identity
+            != manifest.singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)?
+        || ota.identity != manifest.singular_identity(ProtectedInstallationRoleV1::OtaExecutable)?
+    {
+        return Err(InstallationManifestError::Mismatch);
+    }
+    validate_authority_context_against_installation(&context, &manifest, context_path)?;
+    let retained = RetainedProtectedLauncherAuthorityInstallationV1 {
+        context,
+        manifest_identity: manifest.identity.clone(),
+        manifest: retained_manifest,
+        context_file,
+        launcher,
+        ota,
+    };
+    Ok(retained)
+}
+
+fn validate_authority_context_against_installation(
+    context: &ProtectedLauncherAuthorityContextV1,
+    manifest: &ProtectedInstallationManifestV1,
+    context_path: &Path,
+) -> Result<(), InstallationManifestError> {
+    require_exact_singular_path(
+        manifest,
+        ProtectedInstallationRoleV1::ProtectedLauncherAuthorityContext,
+        context_path,
+    )?;
+    let subject = &context.implementation_subject;
+    if runner_administrator_authority_v1_identity(&context.runner_administrator)
+        .map_err(|_| InstallationManifestError::Malformed)?
+        != context.runner_administrator.identity
+        || protected_launcher_implementation_subject_v1_identity(subject)
+            .map_err(|_| InstallationManifestError::Malformed)?
+            != subject.identity
+        || protected_launcher_authority_context_v1_identity(context)
+            .map_err(|_| InstallationManifestError::Malformed)?
+            != context.identity
+        || subject.launcher_artifact_identity
+            != manifest.singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)?
+        || subject.ota_artifact_identity
+            != manifest.singular_identity(ProtectedInstallationRoleV1::OtaExecutable)?
+        || subject.launcher_profile_identity != manifest.launcher_profile_identity
+        || subject.launcher_build_identity
+            != protected_launcher_installed_build_identity(
+                "launcher",
+                &subject.launcher_source_repository,
+                &subject.launcher_source_revision,
+                &subject.launcher_artifact_identity,
+            )?
+        || subject.core_build_identity
+            != protected_launcher_installed_build_identity(
+                "core",
+                &subject.core_source_repository,
+                &subject.core_source_revision,
+                &subject.ota_artifact_identity,
+            )?
+        || option_env!("OTA_LAUNCHER_BUILD_COMMIT")
+            != Some(subject.launcher_source_revision.as_str())
+        || option_env!("OTA_PROTOCOL_BUILD_REVISION")
+            != Some(subject.protocol_source_revision.as_str())
+    {
+        return Err(InstallationManifestError::Mismatch);
+    }
+    Ok(())
 }
 
 #[allow(dead_code)] // Used by the library-owned protected observation service path.
@@ -469,6 +772,7 @@ fn validate_manifest_shape(
         ProtectedInstallationRoleV1::AttestorExecutable,
         ProtectedInstallationRoleV1::AttestorConfiguration,
         ProtectedInstallationRoleV1::AttestorVerifierSet,
+        ProtectedInstallationRoleV1::ProtectedLauncherAuthorityContext,
         ProtectedInstallationRoleV1::AttestorServiceUnit,
         ProtectedInstallationRoleV1::AttestorSocketUnit,
         ProtectedInstallationRoleV1::SystemctlExecutable,
@@ -590,11 +894,18 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ed25519_dalek::SigningKey;
     use ota_authority_protocol::{
+        PROTECTED_LAUNCHER_AUTHORITY_CONTEXT,
         PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_PROJECTION_KEY_USAGE_V1,
         PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_SIGNATURE_DOMAIN_V1,
         PROTECTED_LAUNCHER_CAPABILITY_PROJECTION_VERIFIER,
+        PROTECTED_LAUNCHER_IMPLEMENTATION_SUBJECT, ProtectedLauncherAuthorityContextV1,
+        ProtectedLauncherImplementationSubjectV1, ProtectedLauncherImplementationTargetV1,
+        RUNNER_ADMINISTRATOR_AUTHORITY, RunnerAdministratorAuthorityV1,
+        protected_launcher_authority_context_v1_identity,
         protected_launcher_capability_projection_key_identity_v1,
         protected_launcher_capability_projection_verifier_v1_identity,
+        protected_launcher_implementation_subject_v1_identity,
+        runner_administrator_authority_v1_identity,
     };
     use tempfile::tempdir;
 
@@ -776,6 +1087,11 @@ mod tests {
                 root.path().join("attestor-verifiers.json"),
             ),
             (
+                ProtectedInstallationRoleV1::ProtectedLauncherAuthorityContext,
+                root.path()
+                    .join("protected-launcher-authority-context-v1.json"),
+            ),
+            (
                 ProtectedInstallationRoleV1::AttestorServiceUnit,
                 root.path().join("attestor.service"),
             ),
@@ -796,13 +1112,121 @@ mod tests {
                 root.path().join("pkcheck"),
             ),
         ];
-        for (_, path) in &roles {
+        for (role, path) in &roles {
             if path != &config_path {
                 fs::write(path, path.as_os_str().as_encoded_bytes()).expect("protected file");
-                fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                let mode = if matches!(
+                    role,
+                    ProtectedInstallationRoleV1::LauncherExecutable
+                        | ProtectedInstallationRoleV1::OtaExecutable
+                ) {
+                    0o700
+                } else {
+                    0o600
+                };
+                fs::set_permissions(path, fs::Permissions::from_mode(mode))
                     .expect("protected file permissions");
             }
         }
+        let file_identity = |path: &Path| {
+            let mut file = open_protected_file(path, owner, root.path())
+                .expect("open protected fixture artifact");
+            sha256_file_identity(&mut file).expect("fixture artifact identity")
+        };
+        let launcher_artifact_identity = file_identity(&launcher_path);
+        let ota_artifact_identity = file_identity(
+            roles
+                .iter()
+                .find(|(role, _)| *role == ProtectedInstallationRoleV1::OtaExecutable)
+                .expect("Ota fixture role")
+                .1
+                .as_path(),
+        );
+        let launcher_source_revision = env!("OTA_LAUNCHER_BUILD_COMMIT").to_owned();
+        let protocol_source_revision = env!("OTA_PROTOCOL_BUILD_REVISION").to_owned();
+        let core_source_revision = "2".repeat(40);
+        let launcher_profile_identity =
+            systemd_launcher_profile_identity(&systemd_launcher_profile_v3())
+                .expect("launcher profile identity");
+        let mut administrator = RunnerAdministratorAuthorityV1 {
+            schema_version: 1,
+            record_kind: RUNNER_ADMINISTRATOR_AUTHORITY.into(),
+            identity: String::new(),
+            authority_id: String::from("release"),
+            authority_instance_id: URL_SAFE_NO_PAD.encode([9_u8; 32]),
+            administration_scope: String::from("protected_self_hosted_runner"),
+        };
+        administrator.identity = runner_administrator_authority_v1_identity(&administrator)
+            .expect("administrator identity");
+        let mut subject = ProtectedLauncherImplementationSubjectV1 {
+            schema_version: 1,
+            record_kind: PROTECTED_LAUNCHER_IMPLEMENTATION_SUBJECT.into(),
+            identity: String::new(),
+            launcher_source_repository: String::from(
+                "https://github.com/ota-run/authority-launcher",
+            ),
+            launcher_source_revision,
+            core_source_repository: String::from("https://github.com/ota-run/ota"),
+            core_source_revision,
+            protocol_source_repository: String::from(
+                "https://github.com/ota-run/authority-protocol",
+            ),
+            protocol_source_revision,
+            launcher_build_identity: protected_launcher_installed_build_identity(
+                "launcher",
+                "https://github.com/ota-run/authority-launcher",
+                env!("OTA_LAUNCHER_BUILD_COMMIT"),
+                &launcher_artifact_identity,
+            )
+            .expect("Launcher build identity"),
+            core_build_identity: protected_launcher_installed_build_identity(
+                "core",
+                "https://github.com/ota-run/ota",
+                &"2".repeat(40),
+                &ota_artifact_identity,
+            )
+            .expect("Core build identity"),
+            launcher_artifact_identity,
+            ota_artifact_identity,
+            protocol_version: ota_authority_protocol::SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
+            minimum_core_version: String::from("1.6.28"),
+            maximum_exclusive_core_version: String::from("1.7.0"),
+            launcher_profile_identity,
+            target: ProtectedLauncherImplementationTargetV1 {
+                environment: String::from("self_hosted"),
+                os: String::from("linux"),
+                architecture: String::from("x86_64"),
+                execution_mode: String::from("native"),
+                launcher_class: String::from("systemd_protected_launcher_v3"),
+            },
+        };
+        subject.identity = protected_launcher_implementation_subject_v1_identity(&subject)
+            .expect("subject identity");
+        let mut authority_context = ProtectedLauncherAuthorityContextV1 {
+            schema_version: 1,
+            record_kind: PROTECTED_LAUNCHER_AUTHORITY_CONTEXT.into(),
+            identity: String::new(),
+            runner_administrator: administrator,
+            implementation_subject: subject,
+        };
+        authority_context.identity =
+            protected_launcher_authority_context_v1_identity(&authority_context)
+                .expect("authority context identity");
+        let authority_context_path = roles
+            .iter()
+            .find(|(role, _)| {
+                *role == ProtectedInstallationRoleV1::ProtectedLauncherAuthorityContext
+            })
+            .expect("authority context fixture role")
+            .1
+            .clone();
+        fs::write(
+            &authority_context_path,
+            serde_json::to_vec(&authority_context).expect("serialized authority context"),
+        )
+        .expect("authority context file");
+        fs::set_permissions(&authority_context_path, fs::Permissions::from_mode(0o600))
+            .expect("authority context permissions");
         let role_identity = |role| {
             let path = roles
                 .iter()
@@ -884,8 +1308,116 @@ mod tests {
         )
         .expect("verified protected installation");
         assert_eq!(loaded.identity, manifest.identity);
+        let retained_authority = load_protected_launcher_authority_context_at(
+            &manifest_path,
+            &authority_context_path,
+            &config_path,
+            &launcher_path,
+            &config,
+            owner,
+            root.path(),
+        )
+        .expect("verified authority context");
+        assert_eq!(
+            retained_authority
+                .reconcile()
+                .expect("reconciled authority context"),
+            &authority_context,
+        );
 
-        let attestor_path = manifest
+        let original_manifest = manifest.clone();
+        let mut substituted_context = authority_context.clone();
+        substituted_context
+            .implementation_subject
+            .ota_artifact_identity = identity('f');
+        substituted_context.implementation_subject.identity =
+            protected_launcher_implementation_subject_v1_identity(
+                &substituted_context.implementation_subject,
+            )
+            .expect("substituted subject identity");
+        substituted_context.identity =
+            protected_launcher_authority_context_v1_identity(&substituted_context)
+                .expect("substituted context identity");
+        fs::write(
+            &authority_context_path,
+            serde_json::to_vec(&substituted_context).expect("serialized substituted context"),
+        )
+        .expect("substituted context file");
+        manifest
+            .files
+            .iter_mut()
+            .find(|entry| {
+                entry.role == ProtectedInstallationRoleV1::ProtectedLauncherAuthorityContext
+            })
+            .expect("authority context manifest entry")
+            .identity = file_identity(&authority_context_path);
+        manifest.identity = protected_installation_manifest_identity(&manifest)
+            .expect("substituted manifest identity");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("serialized substituted manifest"),
+        )
+        .expect("substituted manifest file");
+        assert_eq!(
+            retained_authority.reconcile(),
+            Err(InstallationManifestError::Mismatch),
+        );
+        fs::write(
+            &authority_context_path,
+            serde_json::to_vec(&authority_context).expect("serialized restored context"),
+        )
+        .expect("restored context file");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&original_manifest).expect("serialized restored manifest"),
+        )
+        .expect("restored manifest file");
+        retained_authority
+            .reconcile()
+            .expect("restored authority installation");
+
+        let original_launcher = fs::read(&launcher_path).expect("launcher fixture bytes");
+        let mut substituted_launcher = original_launcher.clone();
+        substituted_launcher[0] ^= 1;
+        fs::write(&launcher_path, &substituted_launcher).expect("substituted launcher bytes");
+        assert_eq!(
+            retained_authority.reconcile(),
+            Err(InstallationManifestError::Mismatch),
+        );
+        fs::write(&launcher_path, &original_launcher).expect("restored launcher bytes");
+        retained_authority
+            .reconcile()
+            .expect("restored launcher installation");
+
+        let ota_path = original_manifest
+            .singular_path(ProtectedInstallationRoleV1::OtaExecutable)
+            .expect("Ota fixture path");
+        let original_ota = fs::read(ota_path).expect("Ota fixture bytes");
+        let mut substituted_ota = original_ota.clone();
+        substituted_ota[0] ^= 1;
+        fs::write(ota_path, &substituted_ota).expect("substituted Ota bytes");
+        assert_eq!(
+            retained_authority.reconcile(),
+            Err(InstallationManifestError::Mismatch),
+        );
+        fs::write(ota_path, &original_ota).expect("restored Ota bytes");
+        retained_authority
+            .reconcile()
+            .expect("restored Ota installation");
+
+        fs::set_permissions(&authority_context_path, fs::Permissions::from_mode(0o640))
+            .expect("context metadata substitution");
+        assert_eq!(
+            retained_authority.reconcile(),
+            Err(InstallationManifestError::Mismatch),
+        );
+        fs::set_permissions(&authority_context_path, fs::Permissions::from_mode(0o600))
+            .expect("context metadata restoration");
+        retained_authority
+            .reconcile()
+            .expect("restored context metadata");
+
+        let attestor_path = original_manifest
             .files
             .iter()
             .find(|entry| entry.role == ProtectedInstallationRoleV1::AttestorExecutable)

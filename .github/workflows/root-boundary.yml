@@ -74,6 +74,32 @@ jobs:
             CARGO_TARGET_DIR="$ROOT_TEST_TARGET" \
             cargo test unix::tests::root_launch_drops_uid_gid_and_supplementary_groups -- --exact
 
+      - name: Prove retained protected Launcher authority installation
+        env:
+          AUTHORITY_CONTEXT_TEST_TARGET: ${{ runner.temp }}/protected-launcher-authority-context-target
+          AUTHORITY_CONTEXT_TEST_OUTPUT: ${{ runner.temp }}/protected-launcher-authority-context-test.txt
+        run: |
+          set -euo pipefail
+          cargo_bin_dir=$(dirname "$(command -v cargo)")
+          observed_rustup_home=$(rustup show home)
+          test_status=0
+          sudo env \
+            PATH="$cargo_bin_dir:/usr/bin:/bin" \
+            RUSTUP_HOME="$observed_rustup_home" \
+            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            CARGO_TARGET_DIR="$AUTHORITY_CONTEXT_TEST_TARGET" \
+            /bin/bash -c \
+              'cargo test --locked --all-features --lib installation_manifest::tests::manifest_binds_every_required_protected_file_and_refuses_substitution -- --exact > "$1" 2>&1' \
+              _ "$AUTHORITY_CONTEXT_TEST_OUTPUT" || test_status=$?
+          cat "$AUTHORITY_CONTEXT_TEST_OUTPUT"
+          test "$test_status" -eq 0
+          test "$(grep -Fxc \
+            'test installation_manifest::tests::manifest_binds_every_required_protected_file_and_refuses_substitution ... ok' \
+            "$AUTHORITY_CONTEXT_TEST_OUTPUT")" -eq 1
+          test "$(grep -Ec \
+            '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' \
+            "$AUTHORITY_CONTEXT_TEST_OUTPUT")" -eq 1
+
       - name: Prove retained protected-launcher capability derivation
         env:
           CAPABILITY_TEST_TARGET: ${{ runner.temp }}/protected-launcher-capability-target
