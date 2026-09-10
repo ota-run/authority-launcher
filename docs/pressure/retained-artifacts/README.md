@@ -52,3 +52,21 @@ terminal cleanup conditions, and one valid protected receipt archive with zero i
 It does not prove capability-observation production routing, accepted-session provenance, provider
 contact, OIDC exchange, secret materialization or delivery, Step 8, V12.2, or general repository or
 agent governance.
+
+## V4 Capability-Compatibility Governed Invocation
+
+- Source run: https://github.com/ota-run/authority-launcher/actions/runs/34443805276
+- Source job: https://github.com/ota-run/authority-launcher/actions/runs/34443805276/job/102764136034
+- Source artifact: `independently-administered-systemd-v3-evidence`
+- Launcher revision: `017d866bf9aab8b193ef0ce0515acc95545f3399`
+- Protocol revision: `d16947b87d84e66a4164a275c703b47fce6ded20`
+- Core revision: `a93d65650e6d74167515fedc43a62ea9cc657489`
+- Retained file: `systemd-v3-independently-administered-34443805276.zip`
+- SHA-256: `42f81e506fe0573e7a373d8950c5fca1d0004e48bbebea3f14ba7a12e0df45b9`
+
+The eight-file ZIP proves one bounded independently administered governed invocation after the
+same installation passed the V4 protected-capability compatibility gate. It records completed
+execution, all four terminal cleanup conditions, and one valid protected receipt archive with zero
+invalid archives. It does not prove a real GitHub OIDC token request, provider contact, secret
+materialization or delivery, positive provider evidence, Step 8, V12.2, or general repository or
+agent governance.
