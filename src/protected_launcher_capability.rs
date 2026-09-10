@@ -736,6 +736,27 @@ pub(crate) fn open_protected_directory_chain(
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn open_protected_directory_mount_boundary(
+    parent: RawFd,
+    name: &[u8],
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<OwnedFd, ProtectedLauncherCapabilityError> {
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+        return Err(ProtectedLauncherCapabilityError::Unprotected);
+    }
+    let directory = openat2_beneath_with_mode_and_resolution(
+        parent,
+        name,
+        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+        false,
+    )?;
+    verify_directory_descriptor(directory.as_raw_fd(), expected_uid, expected_gid, true)?;
+    Ok(directory)
+}
+
+#[cfg(target_os = "linux")]
 fn open_store(
     authority_directory: RawFd,
     name: &str,
@@ -928,6 +949,17 @@ pub(crate) fn openat2_beneath_with_mode(
     flags: i32,
     mode: u64,
 ) -> Result<OwnedFd, ProtectedLauncherCapabilityError> {
+    openat2_beneath_with_mode_and_resolution(parent, name, flags, mode, true)
+}
+
+#[cfg(target_os = "linux")]
+fn openat2_beneath_with_mode_and_resolution(
+    parent: RawFd,
+    name: &[u8],
+    flags: i32,
+    mode: u64,
+    prohibit_mount_transition: bool,
+) -> Result<OwnedFd, ProtectedLauncherCapabilityError> {
     const RESOLVE_NO_XDEV: u64 = 0x01;
     const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
     const RESOLVE_NO_SYMLINKS: u64 = 0x04;
@@ -936,7 +968,13 @@ pub(crate) fn openat2_beneath_with_mode(
     let how = OpenHow {
         flags: flags as u64,
         mode,
-        resolve: RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH,
+        resolve: (if prohibit_mount_transition {
+            RESOLVE_NO_XDEV
+        } else {
+            0
+        }) | RESOLVE_NO_MAGICLINKS
+            | RESOLVE_NO_SYMLINKS
+            | RESOLVE_BENEATH,
     };
     let descriptor = unsafe {
         libc::syscall(
@@ -970,6 +1008,41 @@ mod linux_tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn protected_mount_boundary_accepts_exactly_one_canonical_component() {
+        let root = tempdir().expect("mount-boundary root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
+        let boundary = root.path().join("state");
+        fs::create_dir(&boundary).expect("boundary directory");
+        fs::set_permissions(&boundary, fs::Permissions::from_mode(0o700)).expect("boundary mode");
+        let metadata = root.path().metadata().expect("root metadata");
+        let root = open_root(root.path(), metadata.uid(), metadata.gid()).expect("retained root");
+        open_protected_directory_mount_boundary(
+            root.as_raw_fd(),
+            b"state",
+            metadata.uid(),
+            metadata.gid(),
+        )
+        .expect("canonical boundary component");
+        for alias in [
+            b"".as_slice(),
+            b".".as_slice(),
+            b"..".as_slice(),
+            b"state/nested".as_slice(),
+        ] {
+            assert!(
+                open_protected_directory_mount_boundary(
+                    root.as_raw_fd(),
+                    alias,
+                    metadata.uid(),
+                    metadata.gid(),
+                )
+                .is_err(),
+                "mount-boundary alias must refuse: {alias:?}",
+            );
+        }
+    }
 
     fn create_store_tree() -> tempfile::TempDir {
         let root = tempdir().expect("root");

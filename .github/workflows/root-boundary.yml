@@ -149,6 +149,58 @@ jobs:
           test "$(sudo stat -c '%U:%G:%a' /etc/ota/secret-delivery/verifiers-v1.json)" = "root:root:400"
           test "$(sudo stat -c '%U:%G:%a' /etc/ota/secret-delivery/bindings-v1.json)" = "root:root:400"
 
+      - name: Prove production replay store across protected state mount
+        env:
+          REPLAY_TEST_TARGET: ${{ runner.temp }}/protected-launcher-replay-target
+        run: |
+          set -euo pipefail
+          replay_root=/var/lib/ota/authority-launcher
+          replay_directory="$replay_root/capability-observation-replay"
+          replay_test_output="${{ runner.temp }}/protected-launcher-replay-test.txt"
+          replay_test_metadata="${{ runner.temp }}/protected-launcher-replay-test-build.jsonl"
+          cleanup() {
+            sudo rm -rf "$replay_root"
+          }
+          trap cleanup EXIT
+          sudo install -d -o root -g root -m 0700 "$replay_directory"
+          mkdir -p "$REPLAY_TEST_TARGET"
+          CARGO_TARGET_DIR="$REPLAY_TEST_TARGET" cargo test \
+            --locked \
+            --features protected-attestor \
+            --lib \
+            --no-run \
+            --message-format=json > "$replay_test_metadata"
+          replay_test_binary=$(jq -sr '
+            [ .[] |
+              select(
+                .reason == "compiler-artifact" and
+                .target.name == "ota_authority_launcher" and
+                .profile.test == true and
+                .executable != null
+              ) |
+              .executable
+            ] |
+            if length == 1 then .[0] else error("expected one replay test binary") end
+          ' "$replay_test_metadata")
+          test -x "$replay_test_binary"
+          set +e
+          sudo systemd-run --quiet --wait --pipe --collect \
+            --unit=ota-authority-replay-store-test.service \
+            --property=ProtectSystem=strict \
+            --property="ReadWritePaths=$replay_root" \
+            /bin/bash -c \
+              'mountpoint -q /var/lib/ota/authority-launcher && exec "$1" protected_capability_observation::tests::production_replay_store_crosses_only_the_verified_state_mount --exact --ignored' \
+              _ "$replay_test_binary" 2>&1 | tee "$replay_test_output"
+          replay_test_status=${PIPESTATUS[0]}
+          set -e
+          test "$replay_test_status" -eq 0
+          test "$(grep -Fxc \
+            'test protected_capability_observation::tests::production_replay_store_crosses_only_the_verified_state_mount ... ok' \
+            "$replay_test_output")" -eq 1
+          test "$(grep -Ec \
+            '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' \
+            "$replay_test_output")" -eq 1
+
       - name: Build pressure-only signed peer
         run: cargo build --features pressure-peer --bins
 

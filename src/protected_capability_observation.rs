@@ -43,7 +43,8 @@ use crate::installation_manifest::{
 use crate::protected_launcher_capability::{
     ProtectedLauncherCapabilityContextV1, ProtectedLauncherCapabilityError,
     RetainedProtectedLauncherObservationV1, derive_protected_launcher_capability_v1,
-    open_protected_directory_chain, open_root, openat2_beneath, openat2_beneath_with_mode,
+    open_protected_directory_chain, open_protected_directory_mount_boundary, open_root,
+    openat2_beneath, openat2_beneath_with_mode,
 };
 
 #[derive(Debug, Error)]
@@ -87,13 +88,41 @@ pub(crate) struct ProtectedCapabilityObservationReplayStoreV1 {
 impl ProtectedCapabilityObservationReplayStoreV1 {
     pub(crate) fn open() -> Result<Self, ProtectedCapabilityObservationError> {
         let directory = Path::new(CAPABILITY_OBSERVATION_REPLAY_DIRECTORY);
-        let relative = directory
+        let state_root = directory
+            .parent()
+            .ok_or(ProtectedCapabilityObservationError::ReplayStateUnavailable)?;
+        let state_parent = state_root
+            .parent()
+            .ok_or(ProtectedCapabilityObservationError::ReplayStateUnavailable)?;
+        let state_parent_relative = state_parent
             .strip_prefix("/")
             .map_err(|_| ProtectedCapabilityObservationError::ReplayStateUnavailable)?;
         let root = open_root(Path::new("/"), 0, 0)
             .map_err(|_| ProtectedCapabilityObservationError::ReplayStateUnavailable)?;
-        let directory = open_protected_directory_chain(root.as_raw_fd(), relative, 0, 0, true)
-            .map_err(|_| ProtectedCapabilityObservationError::ReplayStateUnavailable)?;
+        let state_parent =
+            open_protected_directory_chain(root.as_raw_fd(), state_parent_relative, 0, 0, false)
+                .map_err(|_| ProtectedCapabilityObservationError::ReplayStateUnavailable)?;
+        let state_root_name = state_root
+            .file_name()
+            .ok_or(ProtectedCapabilityObservationError::ReplayStateUnavailable)?;
+        let state_root = open_protected_directory_mount_boundary(
+            state_parent.as_raw_fd(),
+            state_root_name.as_encoded_bytes(),
+            0,
+            0,
+        )
+        .map_err(|_| ProtectedCapabilityObservationError::ReplayStateUnavailable)?;
+        let replay_name = directory
+            .file_name()
+            .ok_or(ProtectedCapabilityObservationError::ReplayStateUnavailable)?;
+        let directory = open_protected_directory_chain(
+            state_root.as_raw_fd(),
+            Path::new(replay_name),
+            0,
+            0,
+            true,
+        )
+        .map_err(|_| ProtectedCapabilityObservationError::ReplayStateUnavailable)?;
         Self::from_directory(directory.as_raw_fd(), 0)
     }
 
@@ -622,6 +651,29 @@ mod tests {
             .expect("reserve through retained descriptor");
         assert!(retained.join(&record_name).is_file());
         assert!(!original.join(&record_name).exists());
+    }
+
+    #[test]
+    #[ignore = "requires root and a systemd-managed mount at the production launcher state root"]
+    fn production_replay_store_crosses_only_the_verified_state_mount() {
+        assert_eq!(unsafe { libc::geteuid() }, 0, "test requires root");
+        let directory = Path::new(CAPABILITY_OBSERVATION_REPLAY_DIRECTORY);
+        assert!(directory.is_dir(), "production replay directory must exist");
+        let store = ProtectedCapabilityObservationReplayStoreV1::open()
+            .expect("production replay store through protected state mount");
+        let nonce = [11_u8; 32];
+        let challenge = nonce_challenge(&challenge(&nonce), "91");
+        let record_name = store
+            .reserve(&challenge, &nonce, challenge.issued_at_unix_seconds)
+            .expect("reserve through production replay store");
+        store
+            .consume(
+                &record_name,
+                &challenge,
+                &format!("sha256:{}", "c".repeat(64)),
+                &format!("sha256:{}", "d".repeat(64)),
+            )
+            .expect("consume through production replay store");
     }
 
     fn nonce_challenge(
