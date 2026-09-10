@@ -189,13 +189,13 @@ jobs:
             --property=ProtectSystem=strict \
             --property="ReadWritePaths=$replay_root" \
             /bin/bash -c \
-              'mountpoint -q /var/lib/ota/authority-launcher && exec "$1" protected_capability_observation::tests::production_replay_store_crosses_only_the_verified_state_mount --exact --ignored' \
+              'mountpoint -q /var/lib/ota/authority-launcher && exec "$1" protected_capability_observation::tests::production_replay_store_opens_the_verified_protected_path --exact --ignored' \
               _ "$replay_test_binary" 2>&1 | tee "$replay_test_output"
           replay_test_status=${PIPESTATUS[0]}
           set -e
           test "$replay_test_status" -eq 0
           test "$(grep -Fxc \
-            'test protected_capability_observation::tests::production_replay_store_crosses_only_the_verified_state_mount ... ok' \
+            'test protected_capability_observation::tests::production_replay_store_opens_the_verified_protected_path ... ok' \
             "$replay_test_output")" -eq 1
           test "$(grep -Ec \
             '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' \

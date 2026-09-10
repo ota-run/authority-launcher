@@ -87,12 +87,13 @@
   capability-observation routing, provider-contact, OIDC, materialization, or delivery evidence.
 
 - Repair production capability-observation replay-store acquisition under the launcher's systemd
-  filesystem hardening. The opener now permits only the fixed administrator-owned launcher-state
-  mount transition, verifies that boundary as `root:root 0700`, and restores no-mount-crossing
-  descriptor-relative resolution for the replay directory and every record operation. A privileged
-  Linux workflow regression requires the state root to be a real mount and exercises reservation
-  and consumption through the production path. This does not prove provider contact, OIDC,
-  materialization, or secret delivery.
+  filesystem hardening and distribution-specific mount layouts. The opener permits mount
+  transitions only while walking the fixed absolute replay path, refuses aliases and symlinks,
+  verifies every component as root-owned and non-writable by group or world, requires the final
+  directory to be `root:root 0700`, then restores no-mount-crossing descriptor-relative resolution
+  for every replay record operation. A privileged Linux workflow regression requires the launcher
+  state root to be a real mount and exercises reservation and consumption through the production
+  path. This does not prove provider contact, OIDC, materialization, or secret delivery.
 
 - Reconcile the README with the completed bounded systemd carrier: remove stale preview/candidate
   wording, distinguish pressure-proven source from separately packaged release artifacts, and keep

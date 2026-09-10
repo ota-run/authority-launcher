@@ -699,13 +699,19 @@ pub(crate) fn open_root(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn open_protected_directory_chain(
-    root: RawFd,
+fn canonical_relative_components(
     path: &Path,
-    expected_uid: u32,
-    expected_gid: u32,
-    final_private_mode: bool,
-) -> Result<OwnedFd, ProtectedLauncherCapabilityError> {
+) -> Result<Vec<Component<'_>>, ProtectedLauncherCapabilityError> {
+    let encoded = path.as_os_str().as_encoded_bytes();
+    if encoded.is_empty()
+        || encoded.first() == Some(&b'/')
+        || encoded.last() == Some(&b'/')
+        || encoded
+            .split(|byte| *byte == b'/')
+            .any(|component| component.is_empty() || component == b"." || component == b"..")
+    {
+        return Err(ProtectedLauncherCapabilityError::Unprotected);
+    }
     let components = path.components().collect::<Vec<_>>();
     if components.is_empty()
         || components
@@ -714,6 +720,18 @@ pub(crate) fn open_protected_directory_chain(
     {
         return Err(ProtectedLauncherCapabilityError::Unprotected);
     }
+    Ok(components)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn open_protected_directory_chain(
+    root: RawFd,
+    path: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+    final_private_mode: bool,
+) -> Result<OwnedFd, ProtectedLauncherCapabilityError> {
+    let components = canonical_relative_components(path)?;
     let mut parent = duplicate_fd(root)?;
     for (index, component) in components.iter().enumerate() {
         let Component::Normal(name) = component else {
@@ -736,24 +754,35 @@ pub(crate) fn open_protected_directory_chain(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn open_protected_directory_mount_boundary(
-    parent: RawFd,
-    name: &[u8],
+pub(crate) fn open_protected_directory_chain_allowing_mounts(
+    root: RawFd,
+    path: &Path,
     expected_uid: u32,
     expected_gid: u32,
+    final_private_mode: bool,
 ) -> Result<OwnedFd, ProtectedLauncherCapabilityError> {
-    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
-        return Err(ProtectedLauncherCapabilityError::Unprotected);
+    let components = canonical_relative_components(path)?;
+    let mut parent = duplicate_fd(root)?;
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err(ProtectedLauncherCapabilityError::Unprotected);
+        };
+        let next = openat2_beneath_with_mode_and_resolution(
+            parent.as_raw_fd(),
+            name.as_encoded_bytes(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            0,
+            false,
+        )?;
+        verify_directory_descriptor(
+            next.as_raw_fd(),
+            expected_uid,
+            expected_gid,
+            final_private_mode && index + 1 == components.len(),
+        )?;
+        parent = next;
     }
-    let directory = openat2_beneath_with_mode_and_resolution(
-        parent,
-        name,
-        libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        0,
-        false,
-    )?;
-    verify_directory_descriptor(directory.as_raw_fd(), expected_uid, expected_gid, true)?;
-    Ok(directory)
+    Ok(parent)
 }
 
 #[cfg(target_os = "linux")]
@@ -1010,36 +1039,45 @@ mod linux_tests {
     use super::*;
 
     #[test]
-    fn protected_mount_boundary_accepts_exactly_one_canonical_component() {
-        let root = tempdir().expect("mount-boundary root");
+    fn protected_mount_chain_accepts_only_canonical_components() {
+        let root = tempdir().expect("mount-chain root");
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
         let boundary = root.path().join("state");
         fs::create_dir(&boundary).expect("boundary directory");
         fs::set_permissions(&boundary, fs::Permissions::from_mode(0o700)).expect("boundary mode");
+        let replay = boundary.join("replay");
+        fs::create_dir(&replay).expect("replay directory");
+        fs::set_permissions(&replay, fs::Permissions::from_mode(0o700)).expect("replay mode");
         let metadata = root.path().metadata().expect("root metadata");
         let root = open_root(root.path(), metadata.uid(), metadata.gid()).expect("retained root");
-        open_protected_directory_mount_boundary(
+        open_protected_directory_chain_allowing_mounts(
             root.as_raw_fd(),
-            b"state",
+            Path::new("state/replay"),
             metadata.uid(),
             metadata.gid(),
+            true,
         )
-        .expect("canonical boundary component");
+        .expect("canonical mount chain");
         for alias in [
-            b"".as_slice(),
-            b".".as_slice(),
-            b"..".as_slice(),
-            b"state/nested".as_slice(),
+            "",
+            ".",
+            "..",
+            "state//replay",
+            "state/./replay",
+            "state/../replay",
+            "state/replay/",
+            "/state/replay",
         ] {
             assert!(
-                open_protected_directory_mount_boundary(
+                open_protected_directory_chain_allowing_mounts(
                     root.as_raw_fd(),
-                    alias,
+                    Path::new(alias),
                     metadata.uid(),
                     metadata.gid(),
+                    true,
                 )
                 .is_err(),
-                "mount-boundary alias must refuse: {alias:?}",
+                "mount-chain alias must refuse: {alias:?}",
             );
         }
     }
