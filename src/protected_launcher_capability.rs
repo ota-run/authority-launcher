@@ -32,11 +32,15 @@ use ota_authority_protocol::{
     LauncherSystemdScopeV1, OtaProcessPostureV1, PROTECTED_LAUNCHER_CAPABILITY,
     ProtectedLauncherAuthorityContextV1, ProtectedLauncherCapabilityEvidenceV1,
     ProtectedLauncherCapabilityV1, ProtectedLauncherDescriptorRoleV1,
-    ProtectedLauncherDescriptorV1, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1,
+    ProtectedLauncherDescriptorV1, ProtectedSecretDeliveryBindingBundleV1,
+    ProtectedSecretDeliveryVerifierStoreV1, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1,
     SystemdProtectedLauncherInstanceEvidenceV2, launcher_invocation_request_identity,
     protected_launcher_authority_context_v1_identity, protected_launcher_boot_v1_identity,
     protected_launcher_capability_v1_identity, protected_launcher_cgroup_v1_identity,
-    protected_launcher_invocation_nonce_v1_identity, validate_protected_launcher_capability_v1,
+    protected_launcher_invocation_nonce_v1_identity,
+    protected_secret_delivery_binding_bundle_signature_message_v1,
+    reconcile_protected_secret_delivery_authority_bundle_v1,
+    validate_protected_launcher_capability_v1,
 };
 #[cfg(target_os = "linux")]
 use thiserror::Error;
@@ -61,6 +65,15 @@ use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 #[cfg(target_os = "linux")]
 use std::path::{Component, Path};
+
+#[cfg(target_os = "linux")]
+use base64::Engine;
+#[cfg(target_os = "linux")]
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+#[cfg(target_os = "linux")]
+use ed25519_dalek::{Signature, VerifyingKey};
+#[cfg(target_os = "linux")]
+use time::OffsetDateTime;
 
 #[cfg(target_os = "linux")]
 use crate::installation_manifest::RetainedProtectedLauncherAuthorityInstallationV1;
@@ -406,6 +419,18 @@ pub struct ProtectedAuthorityStoresV1 {
     descriptors: [ProtectedLauncherDescriptorV1; 2],
 }
 
+/// Reconciled authority input retained by the protected Launcher. It is not an admission,
+/// provider credential, or transport message; a later same-session route must bind it to Core's
+/// candidate before any provider transaction can begin.
+#[cfg(target_os = "linux")]
+pub(crate) struct VerifiedSecretDeliveryAuthorityBundleV1 {
+    pub(crate) verifier_store_identity: String,
+    pub(crate) binding_store_identity: String,
+    pub(crate) bundle_identity: String,
+    pub(crate) payload_identity: String,
+    pub(crate) payload: Vec<u8>,
+}
+
 #[cfg(target_os = "linux")]
 impl ProtectedAuthorityStoresV1 {
     pub fn open() -> Result<Self, ProtectedLauncherCapabilityError> {
@@ -435,6 +460,87 @@ impl ProtectedAuthorityStoresV1 {
             &self.descriptors[1],
             self.binding_store_bytes.as_slice(),
         )
+    }
+
+    /// Revalidates the retained root-owned descriptors, then verifies one current authority
+    /// bundle. The clock is Launcher-owned; only tests may inject a timestamp.
+    pub(crate) fn verify_secret_delivery_authority_bundle_v1(
+        &self,
+    ) -> Result<VerifiedSecretDeliveryAuthorityBundleV1, ProtectedLauncherCapabilityError> {
+        let observed_at_unix_seconds = u64::try_from(OffsetDateTime::now_utc().unix_timestamp())
+            .map_err(|_| ProtectedLauncherCapabilityError::Unavailable)?;
+        self.verify_secret_delivery_authority_bundle_inner_v1(observed_at_unix_seconds)
+    }
+
+    #[cfg(test)]
+    fn verify_secret_delivery_authority_bundle_at_v1(
+        &self,
+        observed_at_unix_seconds: u64,
+    ) -> Result<VerifiedSecretDeliveryAuthorityBundleV1, ProtectedLauncherCapabilityError> {
+        self.verify_secret_delivery_authority_bundle_inner_v1(observed_at_unix_seconds)
+    }
+
+    fn verify_secret_delivery_authority_bundle_inner_v1(
+        &self,
+        observed_at_unix_seconds: u64,
+    ) -> Result<VerifiedSecretDeliveryAuthorityBundleV1, ProtectedLauncherCapabilityError> {
+        self.revalidate()?;
+        let store: ProtectedSecretDeliveryVerifierStoreV1 =
+            serde_json::from_slice(self.verifier_store_bytes())
+                .map_err(|_| ProtectedLauncherCapabilityError::Unprotected)?;
+        let bundle: ProtectedSecretDeliveryBindingBundleV1 =
+            serde_json::from_slice(self.binding_store_bytes())
+                .map_err(|_| ProtectedLauncherCapabilityError::Unprotected)?;
+        reconcile_protected_secret_delivery_authority_bundle_v1(
+            &store,
+            &bundle,
+            observed_at_unix_seconds,
+        )
+        .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+
+        let verifier = store
+            .verifiers
+            .first()
+            .ok_or(ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        let public_key = URL_SAFE_NO_PAD
+            .decode(&verifier.public_key)
+            .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        let public_key: [u8; 32] = public_key
+            .try_into()
+            .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        let verifying_key = VerifyingKey::from_bytes(&public_key)
+            .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        let signature = URL_SAFE_NO_PAD
+            .decode(&bundle.signature)
+            .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        let signature = Signature::from_slice(&signature)
+            .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        let signature_message =
+            protected_secret_delivery_binding_bundle_signature_message_v1(bundle.identity.as_str())
+                .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        verifying_key
+            .verify_strict(&signature_message, &signature)
+            .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        let payload =
+            ota_authority_protocol::protected_secret_delivery_binding_bundle_payload_bytes_v1(
+                &bundle,
+            )
+            .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        let verifier_store_identity = self.descriptors[0]
+            .content_identity
+            .clone()
+            .ok_or(ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        let binding_store_identity = self.descriptors[1]
+            .content_identity
+            .clone()
+            .ok_or(ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        Ok(VerifiedSecretDeliveryAuthorityBundleV1 {
+            verifier_store_identity,
+            binding_store_identity,
+            bundle_identity: bundle.identity,
+            payload_identity: bundle.payload_identity,
+            payload,
+        })
     }
 
     fn open_beneath(
@@ -1034,6 +1140,10 @@ mod linux_tests {
     use std::os::unix::net::{UnixDatagram, UnixStream};
     use std::time::{Duration, Instant};
 
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ed25519_dalek::{Signer, SigningKey};
+    use ota_authority_protocol::*;
     use tempfile::tempdir;
 
     use super::*;
@@ -1103,6 +1213,338 @@ mod linux_tests {
             fs::set_permissions(path, fs::Permissions::from_mode(0o400)).expect("store mode");
         }
         root
+    }
+
+    fn create_signed_authority_bundle_store_tree() -> (
+        tempfile::TempDir,
+        ProtectedSecretDeliveryVerifierStoreV1,
+        ProtectedSecretDeliveryBindingBundleV1,
+        Vec<u8>,
+    ) {
+        let root = create_store_tree();
+        let authority = root.path().join("authority");
+        let signing_key = SigningKey::from_bytes(&[9; 32]);
+        let public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes());
+        let mut verifier = ProtectedSecretDeliveryBindingBundleVerifierV1 {
+            schema_version: 1,
+            record_kind: PROTECTED_SECRET_DELIVERY_BINDING_BUNDLE_VERIFIER.into(),
+            identity: String::new(),
+            public_key: public_key.clone(),
+            key_identity: protected_secret_delivery_binding_bundle_key_identity_v1(&public_key)
+                .expect("key identity"),
+            key_usage: PROTECTED_SECRET_DELIVERY_BINDING_BUNDLE_KEY_USAGE_V1.into(),
+            signature_domain: std::str::from_utf8(
+                PROTECTED_SECRET_DELIVERY_BINDING_BUNDLE_SIGNATURE_DOMAIN_V1,
+            )
+            .expect("signature domain")
+            .into(),
+        };
+        verifier.identity =
+            protected_secret_delivery_binding_bundle_verifier_v1_identity(&verifier)
+                .expect("verifier identity");
+        let payload = br#"{"schema_version":1,"bindings":[]}"#.to_vec();
+        let mut bundle = ProtectedSecretDeliveryBindingBundleV1 {
+            schema_version: 1,
+            record_kind: PROTECTED_SECRET_DELIVERY_BINDING_BUNDLE.into(),
+            identity: String::new(),
+            authority_id: "ota-secret-delivery".into(),
+            generation: 1,
+            issued_at_unix_seconds: 1_788_800_000,
+            expires_at_unix_seconds: 1_788_803_600,
+            verifier_identity: verifier.identity.clone(),
+            payload: URL_SAFE_NO_PAD.encode(&payload),
+            payload_identity: protected_secret_delivery_binding_bundle_payload_v1_identity(
+                &payload,
+            )
+            .expect("payload identity"),
+            signature: "A".repeat(86),
+        };
+        bundle.identity =
+            protected_secret_delivery_binding_bundle_v1_identity(&bundle).expect("bundle identity");
+        sign_authority_bundle(&mut bundle, &signing_key);
+        let mut store = ProtectedSecretDeliveryVerifierStoreV1 {
+            schema_version: 1,
+            record_kind: PROTECTED_SECRET_DELIVERY_VERIFIER_STORE.into(),
+            identity: String::new(),
+            authority_id: bundle.authority_id.clone(),
+            generation: 1,
+            not_before_unix_seconds: bundle.issued_at_unix_seconds,
+            not_after_unix_seconds: bundle.expires_at_unix_seconds,
+            verifiers: vec![verifier],
+            active_binding_bundle_identity: bundle.identity.clone(),
+            active_binding_bundle_generation: bundle.generation,
+        };
+        store.identity =
+            protected_secret_delivery_verifier_store_v1_identity(&store).expect("store identity");
+        write_authority_bundle_records(&authority, &store, &bundle);
+        (root, store, bundle, payload)
+    }
+
+    fn sign_authority_bundle(
+        bundle: &mut ProtectedSecretDeliveryBindingBundleV1,
+        signing_key: &SigningKey,
+    ) {
+        bundle.identity =
+            protected_secret_delivery_binding_bundle_v1_identity(bundle).expect("bundle identity");
+        bundle.signature = URL_SAFE_NO_PAD.encode(
+            signing_key
+                .sign(
+                    &protected_secret_delivery_binding_bundle_signature_message_v1(
+                        bundle.identity.as_str(),
+                    )
+                    .expect("signature message"),
+                )
+                .to_bytes(),
+        );
+    }
+
+    fn write_authority_bundle_records(
+        authority: &Path,
+        store: &ProtectedSecretDeliveryVerifierStoreV1,
+        bundle: &ProtectedSecretDeliveryBindingBundleV1,
+    ) {
+        for (name, bytes) in [
+            (
+                SECRET_DELIVERY_VERIFIER_STORE,
+                serde_jcs::to_vec(&store).expect("store JSON"),
+            ),
+            (
+                SECRET_DELIVERY_BINDING_STORE,
+                serde_jcs::to_vec(&bundle).expect("bundle JSON"),
+            ),
+        ] {
+            let path = authority.join(name);
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("write mode");
+            fs::write(&path, bytes).expect("authority record");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o400)).expect("protected mode");
+        }
+    }
+
+    #[test]
+    fn retained_authority_bundle_verifies_signature_and_descriptor_bytes() {
+        let (root, _store, bundle, payload) = create_signed_authority_bundle_store_tree();
+        let metadata = root.path().metadata().expect("root metadata");
+        let stores = ProtectedAuthorityStoresV1::open_beneath(
+            root.path(),
+            Path::new("authority"),
+            metadata.uid(),
+            metadata.gid(),
+        )
+        .expect("retained stores");
+        let verified = stores
+            .verify_secret_delivery_authority_bundle_at_v1(bundle.issued_at_unix_seconds)
+            .expect("current signed bundle");
+        assert_eq!(verified.bundle_identity, bundle.identity);
+        assert_eq!(verified.payload, payload);
+        assert!(verified.verifier_store_identity.starts_with("sha256:"));
+        assert!(verified.binding_store_identity.starts_with("sha256:"));
+        assert_eq!(verified.payload_identity, bundle.payload_identity);
+
+        let binding_path = root
+            .path()
+            .join("authority")
+            .join(SECRET_DELIVERY_BINDING_STORE);
+        let mut bytes = fs::read(&binding_path).expect("binding bytes");
+        let index = bytes
+            .iter()
+            .position(|byte| *byte == b'a')
+            .expect("mutable byte");
+        bytes[index] = b'b';
+        fs::set_permissions(&binding_path, fs::Permissions::from_mode(0o600)).expect("write mode");
+        fs::write(&binding_path, bytes).expect("same-length drift");
+        fs::set_permissions(&binding_path, fs::Permissions::from_mode(0o400))
+            .expect("protected mode");
+        assert!(matches!(
+            stores.verify_secret_delivery_authority_bundle_at_v1(bundle.issued_at_unix_seconds),
+            Err(ProtectedLauncherCapabilityError::ReconciliationFailed)
+        ));
+    }
+
+    #[test]
+    fn retained_authority_bundle_refuses_structurally_valid_wrong_signature() {
+        let (root, _store, bundle, _) = create_signed_authority_bundle_store_tree();
+        let binding_path = root
+            .path()
+            .join("authority")
+            .join(SECRET_DELIVERY_BINDING_STORE);
+        let mut invalid = bundle;
+        invalid.signature = "A".repeat(86);
+        fs::set_permissions(&binding_path, fs::Permissions::from_mode(0o600)).expect("write mode");
+        fs::write(
+            &binding_path,
+            serde_jcs::to_vec(&invalid).expect("invalid bundle JSON"),
+        )
+        .expect("invalid bundle");
+        fs::set_permissions(&binding_path, fs::Permissions::from_mode(0o400))
+            .expect("protected mode");
+        let metadata = root.path().metadata().expect("root metadata");
+        let stores = ProtectedAuthorityStoresV1::open_beneath(
+            root.path(),
+            Path::new("authority"),
+            metadata.uid(),
+            metadata.gid(),
+        )
+        .expect("retained stores");
+        assert!(matches!(
+            stores.verify_secret_delivery_authority_bundle_at_v1(invalid.issued_at_unix_seconds),
+            Err(ProtectedLauncherCapabilityError::ReconciliationFailed)
+        ));
+    }
+
+    #[test]
+    fn retained_authority_bundle_refuses_weak_keys_and_protocol_substitutions() {
+        let verify_mutation = |mutate: &dyn Fn(
+            &mut ProtectedSecretDeliveryVerifierStoreV1,
+            &mut ProtectedSecretDeliveryBindingBundleV1,
+        ),
+                               after_signing: &dyn Fn(
+            &mut ProtectedSecretDeliveryVerifierStoreV1,
+            &ProtectedSecretDeliveryBindingBundleV1,
+        ),
+                               observed_at: u64| {
+            let (root, mut store, mut bundle, _) = create_signed_authority_bundle_store_tree();
+            mutate(&mut store, &mut bundle);
+            let signing_key = SigningKey::from_bytes(&[9; 32]);
+            sign_authority_bundle(&mut bundle, &signing_key);
+            store.active_binding_bundle_identity = bundle.identity.clone();
+            after_signing(&mut store, &bundle);
+            store.identity = protected_secret_delivery_verifier_store_v1_identity(&store)
+                .expect("mutated store identity");
+            write_authority_bundle_records(&root.path().join("authority"), &store, &bundle);
+            let metadata = root.path().metadata().expect("root metadata");
+            let stores = ProtectedAuthorityStoresV1::open_beneath(
+                root.path(),
+                Path::new("authority"),
+                metadata.uid(),
+                metadata.gid(),
+            )
+            .expect("retained stores");
+            stores.verify_secret_delivery_authority_bundle_at_v1(observed_at)
+        };
+        const OBSERVED_AT: u64 = 1_788_800_001;
+
+        assert!(matches!(
+            verify_mutation(
+                &|_store, bundle| {
+                    bundle.authority_id = "other-authority".into();
+                },
+                &|_, _| {},
+                OBSERVED_AT,
+            ),
+            Err(ProtectedLauncherCapabilityError::ReconciliationFailed)
+        ));
+        assert!(matches!(
+            verify_mutation(
+                &|_store, bundle| {
+                    bundle.generation = 2;
+                },
+                &|_, _| {},
+                OBSERVED_AT,
+            ),
+            Err(ProtectedLauncherCapabilityError::ReconciliationFailed)
+        ));
+        assert!(matches!(
+            verify_mutation(
+                &|_, _| {},
+                &|store, _bundle| {
+                    store.active_binding_bundle_identity = format!("sha256:{}", "f".repeat(64));
+                },
+                OBSERVED_AT,
+            ),
+            Err(ProtectedLauncherCapabilityError::ReconciliationFailed)
+        ));
+        assert!(matches!(
+            verify_mutation(
+                &|_store, bundle| {
+                    bundle.verifier_identity = format!("sha256:{}", "e".repeat(64));
+                },
+                &|_, _| {},
+                OBSERVED_AT,
+            ),
+            Err(ProtectedLauncherCapabilityError::ReconciliationFailed)
+        ));
+        assert!(matches!(
+            verify_mutation(
+                &|store, bundle| {
+                    store.not_before_unix_seconds = OBSERVED_AT + 1;
+                    bundle.issued_at_unix_seconds = store.not_before_unix_seconds;
+                    bundle.expires_at_unix_seconds = store.not_after_unix_seconds;
+                },
+                &|_, _| {},
+                OBSERVED_AT,
+            ),
+            Err(ProtectedLauncherCapabilityError::ReconciliationFailed)
+        ));
+        assert!(matches!(
+            verify_mutation(
+                &|store, bundle| {
+                    store.not_after_unix_seconds = OBSERVED_AT;
+                    bundle.expires_at_unix_seconds = OBSERVED_AT;
+                },
+                &|_, _| {},
+                OBSERVED_AT + 1,
+            ),
+            Err(ProtectedLauncherCapabilityError::ReconciliationFailed)
+        ));
+
+        let (root, mut store, mut bundle, _) = create_signed_authority_bundle_store_tree();
+        let weak_public_key = URL_SAFE_NO_PAD.encode([
+            1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0,
+        ]);
+        let verifier = &mut store.verifiers[0];
+        verifier.public_key = weak_public_key.clone();
+        verifier.key_identity =
+            protected_secret_delivery_binding_bundle_key_identity_v1(weak_public_key.as_str())
+                .expect("weak key identity");
+        verifier.identity = protected_secret_delivery_binding_bundle_verifier_v1_identity(verifier)
+            .expect("weak verifier identity");
+        bundle.verifier_identity = verifier.identity.clone();
+        bundle.identity = protected_secret_delivery_binding_bundle_v1_identity(&bundle)
+            .expect("weak bundle identity");
+        bundle.signature = URL_SAFE_NO_PAD.encode([
+            1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0,
+        ]);
+        store.active_binding_bundle_identity = bundle.identity.clone();
+        store.identity = protected_secret_delivery_verifier_store_v1_identity(&store)
+            .expect("weak store identity");
+        write_authority_bundle_records(&root.path().join("authority"), &store, &bundle);
+        let metadata = root.path().metadata().expect("root metadata");
+        let stores = ProtectedAuthorityStoresV1::open_beneath(
+            root.path(),
+            Path::new("authority"),
+            metadata.uid(),
+            metadata.gid(),
+        )
+        .expect("weak retained stores");
+        assert!(matches!(
+            stores.verify_secret_delivery_authority_bundle_at_v1(OBSERVED_AT),
+            Err(ProtectedLauncherCapabilityError::ReconciliationFailed)
+        ));
+
+        let (root, _store, bundle, _) = create_signed_authority_bundle_store_tree();
+        let binding_path = root
+            .path()
+            .join("authority")
+            .join(SECRET_DELIVERY_BINDING_STORE);
+        fs::set_permissions(&binding_path, fs::Permissions::from_mode(0o600)).expect("write mode");
+        fs::write(&binding_path, b"{").expect("malformed bundle");
+        fs::set_permissions(&binding_path, fs::Permissions::from_mode(0o400))
+            .expect("protected mode");
+        let metadata = root.path().metadata().expect("root metadata");
+        let stores = ProtectedAuthorityStoresV1::open_beneath(
+            root.path(),
+            Path::new("authority"),
+            metadata.uid(),
+            metadata.gid(),
+        )
+        .expect("retained malformed stores");
+        assert!(matches!(
+            stores.verify_secret_delivery_authority_bundle_at_v1(bundle.issued_at_unix_seconds),
+            Err(ProtectedLauncherCapabilityError::Unprotected)
+        ));
     }
 
     #[test]
