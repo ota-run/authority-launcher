@@ -50,7 +50,10 @@ use ota_authority_protocol::{
     LauncherStartupContinuationV1, LeaseConsumeRequest, LeaseConsumeResponsePayload,
     LeaseConsumptionAdmissionV1, LeaseConsumptionIntentPersistenceV1,
     LeaseConsumptionIntentRelayEvidenceV1, LeaseConsumptionPersistenceV1,
-    LeaseConsumptionRelayEvidenceV1, MAX_FRAME_BYTES, OtaProcessPostureV1, PreparedLeasePayload,
+    LeaseConsumptionRelayEvidenceV1, MAX_FRAME_BYTES, OtaProcessPostureV1,
+    PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST, PreparedLeasePayload,
+    ProtectedLauncherSecretDeliveryTransactionBindingRequestV1,
+    ProtectedLauncherSecretDeliveryTransactionBindingResponseV1,
     SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3,
     SignedBrokerMessage, SignedLauncherAttestationV3, authorization_decision_admission_v1_identity,
     authorization_decision_relay_evidence_v1_identity, decode_frame, encode_frame,
@@ -436,12 +439,14 @@ impl PreparedChild {
         produce: impl FnOnce(
             &BrokerChallenge,
         ) -> Result<SignedLauncherAttestationV3, PreparedChildError>,
-    ) -> Result<(AuthorizationRequest, String), PreparedChildError> {
+    ) -> Result<(AuthorizationRequest, String, LauncherStartupContinuationV1), PreparedChildError>
+    {
         let mut continuation = LauncherStartupContinuationV1 {
             schema_version: 1,
             identity: String::new(),
             message_kind: ota_authority_protocol::LAUNCHER_STARTUP_CONTINUATION.into(),
             invocation_id: self.record.invocation_id.clone(),
+            launcher_request_identity: self.record.request_identity.clone(),
             child_process_identity: self.record.identity.clone(),
             working_directory_identity: self.record.working_directory_identity.clone(),
             process_posture_identity: posture.identity.clone(),
@@ -523,7 +528,7 @@ impl PreparedChild {
         let request_identity =
             message_identity(AUTHORIZATION_REQUEST_DOMAIN_V1.as_bytes(), &authorization)
                 .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-        Ok((authorization, request_identity))
+        Ok((authorization, request_identity, continuation))
     }
 
     fn receive_process_posture_after_resume(
@@ -563,10 +568,17 @@ impl PreparedChild {
         }
     }
 
-    pub(crate) fn relay_selected_execution(
+    pub(crate) fn relay_selected_execution_with_secret_binding(
         &mut self,
         client: &UnixStream,
         consumption: &LeaseConsumptionRelayEvidenceV1,
+        bind_secret_delivery: impl FnOnce(
+            &ProtectedLauncherSecretDeliveryTransactionBindingRequestV1,
+            &UnixStream,
+        ) -> Result<
+            ProtectedLauncherSecretDeliveryTransactionBindingResponseV1,
+            PreparedChildError,
+        >,
         mut persist_completion: impl FnMut(
             LauncherExecutionCompletionV1,
         ) -> Result<(), PreparedChildError>,
@@ -598,9 +610,24 @@ impl PreparedChild {
             output,
         );
 
-        let completion: LauncherExecutionCompletionV1 =
+        let first = read_json_frame_blocking::<serde_json::Value>(&mut self.launcher_session)
+            .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
+        let completion: LauncherExecutionCompletionV1 = if first
+            .get("message_kind")
+            .and_then(serde_json::Value::as_str)
+            == Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST)
+        {
+            let request = serde_json::from_value(first)
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+            let response = bind_secret_delivery(&request, &self.launcher_session)?;
+            write_json_frame_blocking(&mut self.launcher_session, &response)
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
             read_json_frame_blocking(&mut self.launcher_session)
-                .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
+                .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?
+        } else {
+            serde_json::from_value(first)
+                .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?
+        };
         if launcher_execution_completion_v1_identity(&completion)
             .ok()
             .as_deref()
@@ -2236,7 +2263,86 @@ mod tests {
         completion.identity =
             launcher_execution_completion_v1_identity(&completion).expect("completion identity");
         let expected_completion = completion.clone();
+        let binding_request: ProtectedLauncherSecretDeliveryTransactionBindingRequestV1 =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "message_kind": PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST,
+                "identity": identity('1'),
+                "launcher_request_identity": identity('2'),
+                "observation": {
+                    "schema_version": 1,
+                    "message_kind": "protected_launcher_capability_observation_request",
+                    "identity": identity('3'),
+                    "challenge": {
+                        "schema_version": 1,
+                        "message_kind": "protected_launcher_capability_observation_challenge",
+                        "identity": identity('4'),
+                        "workflow_run_id": "1",
+                        "workflow_run_attempt": "1",
+                        "workflow_reference": "ota-run/ota/.github/workflows/test.yml@refs/heads/main",
+                        "nonce_commitment": identity('5'),
+                        "issued_at_unix_seconds": 1,
+                        "expires_at_unix_seconds": 2
+                    },
+                    "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    "runner_version": "2.337.0",
+                    "expected_launcher_request_identity": identity('2')
+                },
+                "secret_transaction_candidate_identity": identity('6'),
+                "startup_continuation_identity": identity('7'),
+                "session_identity": identity('8')
+            }))
+            .expect("binding request fixture");
+        let binding_response: ProtectedLauncherSecretDeliveryTransactionBindingResponseV1 =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "message_kind": "protected_launcher_secret_delivery_transaction_binding_response",
+                "request_identity": identity('1'),
+                "binding": {
+                    "schema_version": 1,
+                    "message_kind": "protected_launcher_secret_delivery_transaction_binding",
+                    "identity": identity('9'),
+                    "request_identity": identity('1'),
+                    "launcher_request_identity": identity('2'),
+                    "startup_continuation_identity": identity('7'),
+                    "session_identity": identity('8'),
+                    "protected_capability_identity": identity('a'),
+                    "secret_transaction_candidate_identity": identity('6'),
+                    "observation_request_identity": identity('3'),
+                    "projection_identity": identity('b'),
+                    "verifier_identity": identity('c'),
+                    "installation_evidence_identity": identity('d'),
+                    "expires_at_unix_seconds": 2
+                },
+                "projection": {
+                    "payload": {
+                        "schema_version": 1,
+                        "evidence_kind": "protected_launcher_capability_observation",
+                        "challenge_identity": identity('4'),
+                        "derivation": "verified",
+                        "target": {
+                            "environment": "self_hosted",
+                            "os": "linux",
+                            "architecture": "x64"
+                        },
+                        "capability_class": "systemd_protected_launcher_v4",
+                        "runner_version": "2.337.0",
+                        "signing_key_identity": identity('e')
+                    },
+                    "projection_identity": identity('b'),
+                    "signature": "A".repeat(86)
+                }
+            }))
+            .expect("binding response fixture");
+        let expected_binding_request = binding_request.clone();
+        let expected_binding_response = binding_response.clone();
+        let duplicate_binding_request = binding_request.clone();
+        let duplicate_binding_response = binding_response.clone();
         let core_thread = std::thread::spawn(move || {
+            write_json_frame_blocking(&mut core, &binding_request).expect("send binding request");
+            let response: ProtectedLauncherSecretDeliveryTransactionBindingResponseV1 =
+                read_json_frame_blocking(&mut core).expect("binding response");
+            assert_eq!(response, binding_response);
             write_json_frame_blocking(&mut core, &completion).expect("send completion");
             let persistence: LauncherExecutionCompletionPersistenceV1 =
                 read_json_frame_blocking(&mut core).expect("completion persistence");
@@ -2260,15 +2366,26 @@ mod tests {
             stderr: Some(stderr),
         };
         let mut persisted = Vec::new();
+        let mut binding_calls = 0;
         let (observed_completion, observed_exit) = child
-            .relay_selected_execution(&client, &consumption, |completion| {
-                persisted.push(completion);
-                Ok(())
-            })
+            .relay_selected_execution_with_secret_binding(
+                &client,
+                &consumption,
+                |request, _session| {
+                    binding_calls += 1;
+                    assert_eq!(request, &expected_binding_request);
+                    Ok(expected_binding_response)
+                },
+                |completion| {
+                    persisted.push(completion);
+                    Ok(())
+                },
+            )
             .expect("selected execution relay");
         assert_eq!(observed_completion, expected_completion);
         assert_eq!(observed_exit, Some(0));
-        assert_eq!(persisted, vec![expected_completion]);
+        assert_eq!(persisted, vec![expected_completion.clone()]);
+        assert_eq!(binding_calls, 1);
         core_thread.join().expect("completion core thread");
         let first: LauncherOutputFrameV1 =
             read_json_frame_blocking(&mut pressure_client).expect("first output");
@@ -2276,6 +2393,150 @@ mod tests {
             read_json_frame_blocking(&mut pressure_client).expect("second output");
         assert_eq!((first.sequence, second.sequence), (0, 1));
         assert_ne!(first.stream, second.stream);
+
+        let direct_pid = unsafe { libc::fork() };
+        assert!(direct_pid >= 0, "fork direct-completion child");
+        if direct_pid == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        let (direct_session, mut direct_core) =
+            UnixStream::pair().expect("direct completion session");
+        let (direct_stdout, direct_stdout_writer) = pipe_cloexec().expect("direct stdout pipe");
+        let (direct_stderr, direct_stderr_writer) = pipe_cloexec().expect("direct stderr pipe");
+        drop(direct_stdout_writer);
+        drop(direct_stderr_writer);
+        let direct_completion = expected_completion.clone();
+        let direct_core_thread = std::thread::spawn(move || {
+            write_json_frame_blocking(&mut direct_core, &direct_completion)
+                .expect("send direct completion");
+            let persistence: LauncherExecutionCompletionPersistenceV1 =
+                read_json_frame_blocking(&mut direct_core).expect("direct completion persistence");
+            assert_eq!(persistence.completion_identity, direct_completion.identity);
+        });
+        let mut direct_child = PreparedChild {
+            pid: direct_pid,
+            record: LauncherChildProcessV1 {
+                pid: direct_pid as u32,
+                ..child.record.clone()
+            },
+            launcher_session: direct_session,
+            stdout: Some(direct_stdout),
+            stderr: Some(direct_stderr),
+        };
+        let (direct_observed, direct_exit) = direct_child
+            .relay_selected_execution_with_secret_binding(
+                &client,
+                &consumption,
+                |_, _| unreachable!("ordinary completion must not request secret binding"),
+                |_| Ok(()),
+            )
+            .expect("ordinary selected execution relay");
+        assert_eq!(direct_observed, expected_completion);
+        assert_eq!(direct_exit, Some(0));
+        direct_core_thread
+            .join()
+            .expect("direct completion core thread");
+
+        let duplicate_pid = unsafe { libc::fork() };
+        assert!(duplicate_pid >= 0, "fork duplicate-binding child");
+        if duplicate_pid == 0 {
+            unsafe { libc::pause() };
+            unsafe { libc::_exit(0) };
+        }
+        let (duplicate_session, mut duplicate_core) =
+            UnixStream::pair().expect("duplicate binding session");
+        let (duplicate_stdout, duplicate_stdout_writer) =
+            pipe_cloexec().expect("duplicate stdout pipe");
+        let (duplicate_stderr, duplicate_stderr_writer) =
+            pipe_cloexec().expect("duplicate stderr pipe");
+        drop(duplicate_stdout_writer);
+        drop(duplicate_stderr_writer);
+        let sent_duplicate_request = duplicate_binding_request.clone();
+        let duplicate_core_thread = std::thread::spawn(move || {
+            write_json_frame_blocking(&mut duplicate_core, &sent_duplicate_request)
+                .expect("send first binding request");
+            let _: ProtectedLauncherSecretDeliveryTransactionBindingResponseV1 =
+                read_json_frame_blocking(&mut duplicate_core).expect("first binding response");
+            write_json_frame_blocking(&mut duplicate_core, &sent_duplicate_request)
+                .expect("send duplicate binding request");
+        });
+        let mut duplicate_child = PreparedChild {
+            pid: duplicate_pid,
+            record: LauncherChildProcessV1 {
+                pid: duplicate_pid as u32,
+                ..child.record.clone()
+            },
+            launcher_session: duplicate_session,
+            stdout: Some(duplicate_stdout),
+            stderr: Some(duplicate_stderr),
+        };
+        assert_eq!(
+            duplicate_child.relay_selected_execution_with_secret_binding(
+                &client,
+                &consumption,
+                |request, _| {
+                    assert_eq!(request, &duplicate_binding_request);
+                    Ok(duplicate_binding_response)
+                },
+                |_| unreachable!("duplicate binding must not reach completion persistence"),
+            ),
+            Err(PreparedChildError::ExecutionCompletionUnavailable)
+        );
+        duplicate_child
+            .terminate_and_reap()
+            .expect("clean duplicate-binding child");
+        duplicate_core_thread
+            .join()
+            .expect("duplicate binding core thread");
+
+        let malformed_pid = unsafe { libc::fork() };
+        assert!(malformed_pid >= 0, "fork malformed-binding child");
+        if malformed_pid == 0 {
+            unsafe { libc::pause() };
+            unsafe { libc::_exit(0) };
+        }
+        let (malformed_session, mut malformed_core) =
+            UnixStream::pair().expect("malformed binding session");
+        let (malformed_stdout, malformed_stdout_writer) =
+            pipe_cloexec().expect("malformed stdout pipe");
+        let (malformed_stderr, malformed_stderr_writer) =
+            pipe_cloexec().expect("malformed stderr pipe");
+        drop(malformed_stdout_writer);
+        drop(malformed_stderr_writer);
+        let malformed_core_thread = std::thread::spawn(move || {
+            write_json_frame_blocking(
+                &mut malformed_core,
+                &serde_json::json!({
+                    "message_kind": PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST
+                }),
+            )
+            .expect("send malformed binding request");
+        });
+        let mut malformed_child = PreparedChild {
+            pid: malformed_pid,
+            record: LauncherChildProcessV1 {
+                pid: malformed_pid as u32,
+                ..child.record.clone()
+            },
+            launcher_session: malformed_session,
+            stdout: Some(malformed_stdout),
+            stderr: Some(malformed_stderr),
+        };
+        assert_eq!(
+            malformed_child.relay_selected_execution_with_secret_binding(
+                &client,
+                &consumption,
+                |_, _| unreachable!("malformed binding must refuse before callback"),
+                |_| unreachable!("malformed binding must not reach completion persistence"),
+            ),
+            Err(PreparedChildError::AuthorizationAdmissionMismatch)
+        );
+        malformed_child
+            .terminate_and_reap()
+            .expect("clean malformed-binding child");
+        malformed_core_thread
+            .join()
+            .expect("malformed binding core thread");
     }
 
     #[test]

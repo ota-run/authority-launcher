@@ -310,10 +310,15 @@ foundation for V12.1 Step 7. It opens only the fixed verifier and binding stores
 directory descriptors with Linux `openat2` no-symlink, no-magic-link, no-mount-crossing, and
 beneath-only resolution; requires the authority directory to be private and both stores to be
 root-owned regular mode-`0400` files; retains exact bytes and descriptor identities; and can observe
-a retained live Unix-stream session descriptor and invocation cgroup before deriving a protocol-verified
-`ProtectedLauncherCapabilityV1`. This slice does not transmit that capability to Core, request an
-OIDC token, contact Google, inject a secret, or change the default launcher path. Those remain
-separate reviewed boundaries.
+a retained live Unix-stream session descriptor and invocation cgroup before deriving a
+protocol-verified `ProtectedLauncherCapabilityV1`. After signed admission and lease consumption,
+the selected child may issue one typed secret-delivery transaction-binding request over that same
+inherited session. Launcher derives the capability from the exact retained child, scope, cgroup,
+session, stores, authority context, installation evidence, and replay state, then returns one
+Protocol-reconciled private binding plus its signed public projection. The private capability
+identity never enters the public projection. Non-secret execution still proceeds directly to its
+completion frame. This route does not request an OIDC token, contact Google, materialize or inject a
+secret, publish positive delivery evidence, or activate Step 8.
 
 The same protected observation route loads one administrator-installed
 `ProtectedLauncherAuthorityContextV1` whose file identity is a singular protected-installation

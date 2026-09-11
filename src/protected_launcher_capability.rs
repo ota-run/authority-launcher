@@ -1731,6 +1731,7 @@ mod privileged_linux_tests {
     use crate::protected_capability_observation::{
         ProtectedCapabilityObservationError, ProtectedCapabilityObservationReplayStoreV1,
         derive_and_sign_capability_observation_for_test_v1,
+        derive_secret_delivery_transaction_binding_for_test_v1,
     };
 
     struct CapabilityFixture {
@@ -2211,6 +2212,152 @@ mod privileged_linux_tests {
         let response_json = serde_json::to_string(&response).expect("response JSON");
         assert!(!response_json.contains(&request.nonce));
         assert!(!response_json.contains(&capability.identity));
+
+        let mut startup_continuation = LauncherStartupContinuationV1 {
+            schema_version: 1,
+            identity: String::new(),
+            message_kind: LAUNCHER_STARTUP_CONTINUATION.into(),
+            invocation_id: fixture.child.invocation_id.clone(),
+            launcher_request_identity: request_identity.clone(),
+            child_process_identity: fixture.child.identity.clone(),
+            working_directory_identity: fixture.child.working_directory_identity.clone(),
+            process_posture_identity: fixture.process_posture.identity.clone(),
+            principal_mapping_identity: fixture.principal_mapping.identity.clone(),
+        };
+        startup_continuation.identity =
+            launcher_startup_continuation_identity(&startup_continuation)
+                .expect("startup continuation identity");
+        let transaction_observation = observation_request(&[10_u8; 32], "4", &request_identity);
+        let mut transaction_request = ProtectedLauncherSecretDeliveryTransactionBindingRequestV1 {
+            schema_version: 1,
+            message_kind: PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST.into(),
+            identity: String::new(),
+            launcher_request_identity: request_identity.clone(),
+            observation: transaction_observation,
+            secret_transaction_candidate_identity: identity('c'),
+            startup_continuation_identity: startup_continuation.identity.clone(),
+            session_identity: protected_launcher_secret_delivery_transaction_session_v1_identity(
+                startup_continuation.identity.as_str(),
+            )
+            .expect("transaction session identity"),
+        };
+        transaction_request.identity =
+            protected_launcher_secret_delivery_transaction_binding_request_v1_identity(
+                &transaction_request,
+            )
+            .expect("transaction request identity");
+        let transaction_response = derive_secret_delivery_transaction_binding_for_test_v1(
+            &replay,
+            &transaction_request,
+            &startup_continuation,
+            &identity('d'),
+            transaction_request
+                .observation
+                .challenge
+                .issued_at_unix_seconds,
+            &binding,
+            &verifier,
+            &fixture.context(),
+            &mut retained,
+            |_, verifier, signing_request| {
+                let response = issuer
+                    .issue_capability_observation_for_test(signing_request, verifier)
+                    .map_err(|_| ProtectedCapabilityObservationError::SignerAuthorityUnavailable)?;
+                verify_capability_observation_signature_response(
+                    verifier,
+                    signing_request,
+                    &response,
+                )
+                .map_err(|_| ProtectedCapabilityObservationError::SignerAuthorityUnavailable)?;
+                Ok(response)
+            },
+        )
+        .expect("same-execution secret-delivery transaction binding");
+        assert_eq!(
+            transaction_response.binding.startup_continuation_identity,
+            startup_continuation.identity
+        );
+        assert_eq!(
+            transaction_response.binding.protected_capability_identity,
+            capability.identity
+        );
+        let public_projection_json = serde_json::to_string(&transaction_response.projection)
+            .expect("public projection JSON");
+        assert!(!public_projection_json.contains(&capability.identity));
+        assert!(
+            !public_projection_json
+                .contains(&transaction_request.secret_transaction_candidate_identity)
+        );
+
+        let substituted_observation = observation_request(&[11_u8; 32], "5", &request_identity);
+        let mut substituted_request = transaction_request.clone();
+        substituted_request.observation = substituted_observation;
+        substituted_request.startup_continuation_identity = identity('e');
+        substituted_request.session_identity =
+            protected_launcher_secret_delivery_transaction_session_v1_identity(
+                substituted_request.startup_continuation_identity.as_str(),
+            )
+            .expect("substituted transaction session identity");
+        substituted_request.identity =
+            protected_launcher_secret_delivery_transaction_binding_request_v1_identity(
+                &substituted_request,
+            )
+            .expect("substituted transaction request identity");
+        assert!(matches!(
+            derive_secret_delivery_transaction_binding_for_test_v1(
+                &replay,
+                &substituted_request,
+                &startup_continuation,
+                &identity('d'),
+                substituted_request
+                    .observation
+                    .challenge
+                    .issued_at_unix_seconds,
+                &binding,
+                &verifier,
+                &fixture.context(),
+                &mut retained,
+                |_, verifier, signing_request| {
+                    issuer
+                        .issue_capability_observation_for_test(signing_request, verifier)
+                        .map_err(|_| {
+                            ProtectedCapabilityObservationError::SignerAuthorityUnavailable
+                        })
+                },
+            ),
+            Err(ProtectedCapabilityObservationError::ProjectionInvalid)
+        ));
+        substituted_request.startup_continuation_identity = startup_continuation.identity.clone();
+        substituted_request.session_identity =
+            protected_launcher_secret_delivery_transaction_session_v1_identity(
+                startup_continuation.identity.as_str(),
+            )
+            .expect("restored transaction session identity");
+        substituted_request.identity =
+            protected_launcher_secret_delivery_transaction_binding_request_v1_identity(
+                &substituted_request,
+            )
+            .expect("restored transaction request identity");
+        derive_secret_delivery_transaction_binding_for_test_v1(
+            &replay,
+            &substituted_request,
+            &startup_continuation,
+            &identity('d'),
+            substituted_request
+                .observation
+                .challenge
+                .issued_at_unix_seconds,
+            &binding,
+            &verifier,
+            &fixture.context(),
+            &mut retained,
+            |_, verifier, signing_request| {
+                issuer
+                    .issue_capability_observation_for_test(signing_request, verifier)
+                    .map_err(|_| ProtectedCapabilityObservationError::SignerAuthorityUnavailable)
+            },
+        )
+        .expect("preflight refusal must not consume replay state");
         assert!(matches!(
             derive_and_sign_capability_observation_for_test_v1(
                 &replay,

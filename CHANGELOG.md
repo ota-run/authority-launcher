@@ -26,6 +26,17 @@
 
 ## Unreleased
 
+- Pin Authority Protocol `5b416637c763f835050f65660766efa2b432f4af` and add the
+  same-execution secret-delivery transaction-binding route. After exact signed admission and lease
+  consumption, one typed request on the selected child's inherited Launcher session is reconciled
+  against the retained startup continuation. Launcher reuses the exact child, scope, cgroup,
+  session, protected stores, authority context, installation evidence, replay state, and separate
+  Attestor to derive one private binding and signed public projection before returning control to
+  Core. Builds without `protected-attestor` refuse the typed request, and ordinary non-secret
+  completion remains unchanged. This activates no OIDC request, provider contact, materialization,
+  injection, positive delivery evidence, Step 8, or V12.2 capability; Core-side consumption and an
+  immutable Linux/X64 transaction run remain required.
+
 - Pin Authority Protocol `af543445446790b01529b6150f8219b3dec351f7` and implement the
   `ota.authority-launcher.systemd/v4` protected boot-observation profile. The Launcher keeps
   `ProtectProc=invisible` and `ProcSubset=pid`; systemd 253 or newer opens the canonical boot ID

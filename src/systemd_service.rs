@@ -200,6 +200,20 @@ struct SelectedBoundary {
     scope: ota_authority_protocol::LauncherSystemdScopeV1,
     active_slot: ActiveSlot,
     consumption: LeaseConsumptionRelayEvidenceV1,
+    startup_continuation: ota_authority_protocol::LauncherStartupContinuationV1,
+    principal_mapping: ota_authority_protocol::LauncherPrincipalMappingV1,
+    process_posture: ota_authority_protocol::OtaProcessPostureV1,
+}
+
+#[cfg_attr(not(feature = "protected-attestor"), allow(dead_code))]
+struct SelectedBoundaryExecutionContext<'a> {
+    config: &'a SystemdLauncherServiceConfigV1,
+    installation: &'a ProtectedInstallationManifestV1,
+    launcher_executable: &'a Path,
+    boot_file: &'a File,
+    peer: &'a ObservedSessionPeer,
+    mapping: &'a crate::config::SystemdPrincipalMappingV1,
+    launcher_request: &'a LauncherInvocationRequestV1,
 }
 
 enum BoundaryAdmission {
@@ -391,8 +405,15 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
             Err(SystemdServiceError::AuthorizationDecisionRefused)
         }
         Ok(BoundaryAdmission::Selected(boundary)) => execute_selected_boundary(
-            config,
-            &installation,
+            SelectedBoundaryExecutionContext {
+                config,
+                installation: &installation,
+                launcher_executable: &launcher_executable,
+                boot_file: &inherited.boot_file,
+                peer: &peer,
+                mapping,
+                launcher_request: &request,
+            },
             &mut stream,
             invocation_id.as_str(),
             &repository,
@@ -566,7 +587,7 @@ fn serve_capability_observation(
                 )
                 .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
             response.replace(Some(projection));
-            Ok((AuthorizationDecision::Denied, None))
+            Ok((AuthorizationDecision::Denied, None, None, None))
         },
     )?;
     if !matches!(boundary, BoundaryAdmission::Refused { .. }) {
@@ -583,25 +604,136 @@ fn serve_capability_observation(
     Ok(0)
 }
 
+#[cfg(not(feature = "protected-attestor"))]
+fn refuse_secret_delivery_binding_without_protected_attestor() -> Result<
+    ota_authority_protocol::ProtectedLauncherSecretDeliveryTransactionBindingResponseV1,
+    PreparedChildError,
+> {
+    Err(PreparedChildError::AuthorizationAdmissionMismatch)
+}
+
+#[cfg_attr(not(feature = "protected-attestor"), allow(unused_variables))]
 fn execute_selected_boundary(
-    config: &SystemdLauncherServiceConfigV1,
-    installation: &ProtectedInstallationManifestV1,
+    context: SelectedBoundaryExecutionContext<'_>,
     stream: &mut UnixStream,
     invocation_id: &str,
     repository: &crate::target_directory::OpenedRepositoryDirectory,
     mut boundary: SelectedBoundary,
 ) -> Result<u8, SystemdServiceError> {
-    let completion =
-        boundary
-            .child
-            .relay_selected_execution(stream, &boundary.consumption, |completion| {
+    let child_record = boundary.child.record.clone();
+    let scope = boundary.scope.clone();
+    let startup_continuation = boundary.startup_continuation.clone();
+    let principal_mapping = boundary.principal_mapping.clone();
+    let process_posture = boundary.process_posture.clone();
+    let completion = boundary.child.relay_selected_execution_with_secret_binding(
+        stream,
+        &boundary.consumption,
+        |request, selected_session| {
+            #[cfg(not(feature = "protected-attestor"))]
+            {
+                let _ = (request, selected_session);
+                refuse_secret_delivery_binding_without_protected_attestor()
+            }
+            #[cfg(feature = "protected-attestor")]
+            {
+                let authority =
+                    crate::installation_manifest::load_protected_launcher_authority_context(
+                        context.config,
+                        context.launcher_executable,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let authority = crate::protected_launcher_capability::RetainedProtectedLauncherAuthorityContextV1::acquire(
+                    authority,
+                    context.boot_file
+                        .try_clone()
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?,
+                )
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let runtime_identity =
+                    verify_systemd_runtime(context.config, context.installation, &scope)
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let mut evidence =
+                    crate::closed_profile_observations::collect_live_closed_profile_evidence(
+                    context.config,
+                    context.installation,
+                    context.mapping,
+                    stream,
+                    context.peer,
+                    &child_record,
+                    &scope,
+                    &process_posture,
+                    runtime_identity.as_str(),
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let launcher_instance = collect_launcher_instance(
+                    context.config,
+                    &principal_mapping,
+                    &child_record,
+                    &scope,
+                    &process_posture,
+                    &mut evidence,
+                )
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let stores =
+                    crate::protected_launcher_capability::ProtectedAuthorityStoresV1::open()
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let cgroup =
+                    crate::protected_launcher_capability::RetainedInvocationCgroupV1::open(&scope)
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let selected_session = selected_session
+                    .try_clone()
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let mut observation = crate::protected_launcher_capability::RetainedProtectedLauncherObservationV1::observe(
+                    stores,
+                    cgroup,
+                    selected_session,
+                )
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let launcher_profile_identity =
+                    systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let launcher_executable_identity = context
+                    .installation
+                    .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let capability_context =
+                crate::protected_launcher_capability::ProtectedLauncherCapabilityContextV1 {
+                    request: context.launcher_request,
+                    child: &child_record,
+                    scope: &scope,
+                    principal_mapping: &principal_mapping,
+                    process_posture: &process_posture,
+                    launcher_instance: &launcher_instance,
+                    launcher_executable_identity,
+                    launcher_configuration_identity: context.config.identity.as_str(),
+                    launcher_service_binding_identity: context.config.service_unit_identity.as_str(),
+                    launcher_profile_identity: launcher_profile_identity.as_str(),
+                    service_uid: unsafe { libc::geteuid() },
+                    service_gid: unsafe { libc::getegid() },
+                    authority: &authority,
+                };
+                let replay = crate::protected_capability_observation::ProtectedCapabilityObservationReplayStoreV1::open()
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                crate::protected_capability_observation::derive_secret_delivery_transaction_binding_v1(
+                    &replay,
+                    request,
+                    &startup_continuation,
+                    context.installation.identity.as_str(),
+                    &capability_context,
+                    &mut observation,
+                )
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)
+            }
+        },
+        |completion| {
                 boundary
                     .active_slot
                     .record_execution_completion(completion)
                     .map_err(|_| PreparedChildError::ExecutionCompletionPersistenceFailed)?;
                 pressure_exit_after_execution_completion_recorded()
                     .map_err(|_| PreparedChildError::ExecutionCompletionPersistenceFailed)
-            });
+        },
+    );
     let (completion, observed_exit_code) = match completion {
         Ok(completion) => completion,
         Err(error) => {
@@ -610,7 +742,7 @@ fn execute_selected_boundary(
                 prepared_child_error_reason(&error)
             );
             return fail_selected_boundary(
-                config,
+                context.config,
                 stream,
                 invocation_id,
                 boundary,
@@ -620,7 +752,7 @@ fn execute_selected_boundary(
     };
     if completion.receipt_archive_identity.is_none() {
         return fail_selected_boundary(
-            config,
+            context.config,
             stream,
             invocation_id,
             boundary,
@@ -633,12 +765,12 @@ fn execute_selected_boundary(
         .stop_and_confirm_empty(
             &boundary.scope,
             &boundary.child.record,
-            Duration::from_secs(config.maximum_terminal_wait_seconds),
+            Duration::from_secs(context.config.maximum_terminal_wait_seconds),
         )
         .is_err()
     {
         return fail_selected_boundary(
-            config,
+            context.config,
             stream,
             invocation_id,
             boundary,
@@ -647,7 +779,7 @@ fn execute_selected_boundary(
     }
     if boundary.active_slot.execution_completion() != Some(&completion) {
         return fail_selected_boundary(
-            config,
+            context.config,
             stream,
             invocation_id,
             boundary,
@@ -668,8 +800,8 @@ fn execute_selected_boundary(
         .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
     pressure_exit_after_finalization_intent_recorded()?;
     let signed_finalization = sign_execution_finalization(
-        config,
-        installation,
+        context.config,
+        context.installation,
         &finalization_journal.journal().finalization,
     )?;
     finalization_journal
@@ -850,7 +982,7 @@ fn prepare_disabled_child_boundary(
                 )
                 .map_err(|error| pressure_prepared_child_failure("process_posture", error))?;
             let child_record = child.record.clone();
-            let (authorization, request_identity) = child
+            let (authorization, request_identity, startup_continuation) = child
                 .continue_to_v3_authorization_request(
                     &posture,
                     Duration::from_secs(config.maximum_startup_seconds),
@@ -932,7 +1064,12 @@ fn prepare_disabled_child_boundary(
             if lease_consumption.is_some() != active_slot.borrow().has_lease_consumption() {
                 return Err(SystemdServiceError::AuthorizationDecisionRefused);
             }
-            Ok((decision, lease_consumption))
+            Ok((
+                decision,
+                lease_consumption,
+                Some(startup_continuation),
+                Some(posture),
+            ))
         },
     )
 }
@@ -1157,6 +1294,8 @@ where
         (
             AuthorizationDecision,
             Option<LeaseConsumptionRelayEvidenceV1>,
+            Option<ota_authority_protocol::LauncherStartupContinuationV1>,
+            Option<ota_authority_protocol::OtaProcessPostureV1>,
         ),
         SystemdServiceError,
     >,
@@ -1264,7 +1403,13 @@ where
     let posture_result = posture_gate(&mut child, &principal_mapping, &scope, &mut active_slot);
     let retain_for_recovery = posture_result.is_err() && active_slot.has_lease_consumption_intent();
     let consumed = active_slot.has_lease_consumption();
-    if let Ok((AuthorizationDecision::Allowed, Some(consumption))) = &posture_result {
+    if let Ok((
+        AuthorizationDecision::Allowed,
+        Some(consumption),
+        Some(startup_continuation),
+        Some(process_posture),
+    )) = &posture_result
+    {
         if !consumed {
             return Err(SystemdServiceError::AuthorizationDecisionRefused);
         }
@@ -1273,6 +1418,9 @@ where
             scope,
             active_slot,
             consumption: consumption.clone(),
+            startup_continuation: startup_continuation.clone(),
+            principal_mapping,
+            process_posture: process_posture.clone(),
         })));
     }
     let child_record = child.record.clone();
@@ -1291,7 +1439,7 @@ where
             .finalize()
             .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
     }
-    let (decision, _) = posture_result?;
+    let (decision, _, _, _) = posture_result?;
     Ok(BoundaryAdmission::Refused {
         child: child_record,
         decision,
@@ -2364,6 +2512,15 @@ mod tests {
         format!("sha256:{}", character.to_string().repeat(64))
     }
 
+    #[cfg(not(feature = "protected-attestor"))]
+    #[test]
+    fn secret_delivery_binding_refuses_without_protected_attestor() {
+        assert_eq!(
+            refuse_secret_delivery_binding_without_protected_attestor(),
+            Err(PreparedChildError::AuthorizationAdmissionMismatch)
+        );
+    }
+
     #[test]
     fn inherited_descriptor_roles_are_exact_and_order_independent() {
         assert_eq!(
@@ -3076,7 +3233,7 @@ mod tests {
                         && journal.get("stage").and_then(serde_json::Value::as_str)
                             == Some("scope_attached"),
                 );
-                Ok((AuthorizationDecision::Allowed, None))
+                Ok((AuthorizationDecision::Allowed, None, None, None))
             },
         )
         .expect("prepare and clean child boundary");
@@ -3170,7 +3327,7 @@ mod tests {
                 temporary.path(),
                 &UncertainScopeBoundary,
                 |_child, _principal_mapping, _scope, _active_slot| {
-                    Ok((AuthorizationDecision::Allowed, None))
+                    Ok((AuthorizationDecision::Allowed, None, None, None))
                 },
             ),
             Err(SystemdServiceError::ScopeCleanupFailed)
