@@ -34,8 +34,8 @@ use thiserror::Error;
 
 use crate::config::SystemdLauncherServiceConfigV1;
 use crate::installation_manifest::{
-    CAPABILITY_OBSERVATION_REPLAY_DIRECTORY, ProtectedInstallationManifestV1,
-    ProtectedInstallationRoleV1,
+    AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY, CAPABILITY_OBSERVATION_REPLAY_DIRECTORY,
+    ProtectedInstallationManifestV1, ProtectedInstallationRoleV1,
 };
 
 const LAUNCHER_SERVICE_UNIT: &str = "ota-authority-launcher.service";
@@ -343,6 +343,7 @@ fn launcher_writable_paths(
         Path::new("/run/ota/authority-launcher"),
         Path::new("/var/lib/ota/authority-launcher"),
         Path::new(CAPABILITY_OBSERVATION_REPLAY_DIRECTORY),
+        Path::new(AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY),
     ];
     if include_history {
         writable.extend([
@@ -572,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn launcher_runtime_writable_paths_include_the_capability_replay_store() {
+    fn launcher_runtime_writable_paths_include_distinct_replay_stores() {
         let repositories = vec![PathBuf::from("/srv/repository")];
         assert_eq!(
             launcher_writable_paths(&repositories, false),
@@ -580,6 +581,7 @@ mod tests {
                 Path::new("/run/ota/authority-launcher"),
                 Path::new("/var/lib/ota/authority-launcher"),
                 Path::new(CAPABILITY_OBSERVATION_REPLAY_DIRECTORY),
+                Path::new(AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY),
                 Path::new("/srv/repository"),
             ]
         );

@@ -156,13 +156,16 @@ jobs:
           set -euo pipefail
           replay_root=/var/lib/ota/authority-launcher
           replay_directory="$replay_root/capability-observation-replay"
+          snapshot_replay_directory="$replay_root/authority-snapshot-replay"
           replay_test_output="${{ runner.temp }}/protected-launcher-replay-test.txt"
+          snapshot_replay_test_output="${{ runner.temp }}/protected-authority-snapshot-replay-test.txt"
           replay_test_metadata="${{ runner.temp }}/protected-launcher-replay-test-build.jsonl"
           cleanup() {
             sudo rm -rf "$replay_root"
           }
           trap cleanup EXIT
           sudo install -d -o root -g root -m 0700 "$replay_directory"
+          sudo install -d -o root -g root -m 0700 "$snapshot_replay_directory"
           mkdir -p "$REPLAY_TEST_TARGET"
           CARGO_TARGET_DIR="$REPLAY_TEST_TARGET" cargo test \
             --locked \
@@ -200,6 +203,23 @@ jobs:
           test "$(grep -Ec \
             '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' \
             "$replay_test_output")" -eq 1
+          set +e
+          sudo systemd-run --quiet --wait --pipe --collect \
+            --unit=ota-authority-snapshot-replay-store-test.service \
+            --property=ProtectSystem=strict \
+            --property="ReadWritePaths=$replay_root" \
+            /bin/bash -c \
+              'mountpoint -q /var/lib/ota/authority-launcher && exec "$1" protected_authority_snapshot::tests::production_snapshot_replay_store_opens_the_verified_protected_path --exact --ignored' \
+              _ "$replay_test_binary" 2>&1 | tee "$snapshot_replay_test_output"
+          snapshot_replay_test_status=${PIPESTATUS[0]}
+          set -e
+          test "$snapshot_replay_test_status" -eq 0
+          test "$(grep -Fxc \
+            'test protected_authority_snapshot::tests::production_snapshot_replay_store_opens_the_verified_protected_path ... ok' \
+            "$snapshot_replay_test_output")" -eq 1
+          test "$(grep -Ec \
+            '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' \
+            "$snapshot_replay_test_output")" -eq 1
 
       - name: Build pressure-only signed peer
         run: cargo build --features pressure-peer --bins

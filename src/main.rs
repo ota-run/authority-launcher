@@ -43,6 +43,8 @@ mod prepared_child;
 #[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
 mod pressure_provision;
 #[cfg(all(target_os = "linux", feature = "protected-attestor"))]
+mod protected_authority_snapshot;
+#[cfg(all(target_os = "linux", feature = "protected-attestor"))]
 #[allow(dead_code)]
 mod protected_capability_observation;
 #[cfg(target_os = "linux")]

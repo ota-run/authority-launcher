@@ -55,6 +55,8 @@ pub(crate) const PROTECTED_LAUNCHER_AUTHORITY_CONTEXT_PATH: &str =
     "/etc/ota/protected-launcher-authority-context-v1.json";
 pub(crate) const CAPABILITY_OBSERVATION_REPLAY_DIRECTORY: &str =
     "/var/lib/ota/authority-launcher/capability-observation-replay";
+pub(crate) const AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY: &str =
+    "/var/lib/ota/authority-launcher/authority-snapshot-replay";
 const INSTALLATION_MANIFEST_IDENTITY_DOMAIN_V1: &str =
     "ota.authority-launcher.installation-manifest.v1\0";
 const HISTORY_INSTALLATION_IDENTITY_DOMAIN_V1: &str =

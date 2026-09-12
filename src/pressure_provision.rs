@@ -72,9 +72,9 @@ use crate::config::{
     systemd_launcher_service_config_identity,
 };
 use crate::installation_manifest::{
-    CAPABILITY_OBSERVATION_REPLAY_DIRECTORY, CAPABILITY_PROJECTION_VERIFIER_PATH,
-    PROTECTED_LAUNCHER_AUTHORITY_CONTEXT_PATH, ProtectedInstallationFileV1,
-    ProtectedInstallationManifestV1, ProtectedInstallationRoleV1,
+    AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY, CAPABILITY_OBSERVATION_REPLAY_DIRECTORY,
+    CAPABILITY_PROJECTION_VERIFIER_PATH, PROTECTED_LAUNCHER_AUTHORITY_CONTEXT_PATH,
+    ProtectedInstallationFileV1, ProtectedInstallationManifestV1, ProtectedInstallationRoleV1,
     broker_proxy_installation_identity, protected_history_installation_identity,
     protected_installation_manifest_identity, protected_launcher_installed_build_identity,
     resolve_optional_protected_executable_alias,
@@ -1054,7 +1054,7 @@ fn polkit_deny_rule(job: &Account, execution: &Account) -> Result<String, String
     ))
 }
 
-fn protected_directories() -> [(&'static str, u32); 13] {
+fn protected_directories() -> [(&'static str, u32); 14] {
     [
         (ETC_OTA, 0o755),
         (STATE_ROOT, 0o755),
@@ -1064,6 +1064,7 @@ fn protected_directories() -> [(&'static str, u32); 13] {
         (ACTIVE_SLOT_STATE, 0o700),
         (FINALIZATION_STATE, 0o700),
         (CAPABILITY_OBSERVATION_REPLAY_DIRECTORY, 0o700),
+        (AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY, 0o700),
         (SECRET_DELIVERY_AUTHORITY_DIRECTORY, 0o700),
         (BROKER_STATE, 0o700),
         (LAUNCHER_RUNTIME, 0o700),
@@ -1074,23 +1075,25 @@ fn protected_directories() -> [(&'static str, u32); 13] {
 
 fn launcher_service_unit(launcher: &Path, repository: &Path, read_only: &[String]) -> String {
     format!(
-        "[Unit]\nDescription=Ota protected authority launcher\nRequires=ota-authority-launcher.socket ota-authority-attestor.socket\nAfter=ota-authority-launcher.socket ota-authority-attestor.socket\n\n[Service]\nType=simple\nExecStart={} serve-systemd\nUser=root\nGroup=root\nUMask=0077\nRuntimeDirectory=ota/authority-launcher\nRuntimeDirectoryMode=0700\nNoNewPrivileges=no\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nOpenFile=/proc/sys/kernel/random/boot_id:ota-boot-id:read-only\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths={}\nReadWritePaths={} {} {} {} {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}\n",
+        "[Unit]\nDescription=Ota protected authority launcher\nRequires=ota-authority-launcher.socket ota-authority-attestor.socket\nAfter=ota-authority-launcher.socket ota-authority-attestor.socket\n\n[Service]\nType=simple\nExecStart={} serve-systemd\nUser=root\nGroup=root\nUMask=0077\nRuntimeDirectory=ota/authority-launcher\nRuntimeDirectoryMode=0700\nNoNewPrivileges=no\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nOpenFile=/proc/sys/kernel/random/boot_id:ota-boot-id:read-only\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths={}\nReadWritePaths={} {} {} {} {} {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}\n",
         launcher.display(),
         read_only.join(" "),
         LAUNCHER_RUNTIME,
         LAUNCHER_STATE,
         CAPABILITY_OBSERVATION_REPLAY_DIRECTORY,
+        AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY,
         repository.display(),
     )
 }
 
 fn launcher_hardening_drop_in(repository: &Path, read_only: &[String]) -> String {
     format!(
-        "[Service]\nUser=root\nGroup=root\nUMask=0077\nRuntimeDirectory=ota/authority-launcher\nRuntimeDirectoryMode=0700\nNoNewPrivileges=no\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nOpenFile=\nOpenFile=/proc/sys/kernel/random/boot_id:ota-boot-id:read-only\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths=\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths=\nReadOnlyPaths={}\nReadWritePaths=\nReadWritePaths={} {} {} {} {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}\n",
+        "[Service]\nUser=root\nGroup=root\nUMask=0077\nRuntimeDirectory=ota/authority-launcher\nRuntimeDirectoryMode=0700\nNoNewPrivileges=no\nRestrictSUIDSGID=no\nLockPersonality=yes\nMemoryDenyWriteExecute=no\nRestrictRealtime=yes\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=read-only\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nOpenFile=\nOpenFile=/proc/sys/kernel/random/boot_id:ota-boot-id:read-only\nRestrictNamespaces=yes\nSystemCallArchitectures=native\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID CAP_SYS_PTRACE\nAmbientCapabilities=CAP_SETUID\nSupplementaryGroups=\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nKillMode=control-group\nInaccessiblePaths=\nInaccessiblePaths={SIGNING_KEY} {BROKER_SIGNING_KEY}\nReadOnlyPaths=\nReadOnlyPaths={}\nReadWritePaths=\nReadWritePaths={} {} {} {} {} {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}\n",
         read_only.join(" "),
         LAUNCHER_RUNTIME,
         LAUNCHER_STATE,
         CAPABILITY_OBSERVATION_REPLAY_DIRECTORY,
+        AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY,
         repository.display(),
     )
 }
@@ -1657,6 +1660,7 @@ fn managed_authority_state_paths() -> Vec<&'static str> {
         ISSUANCE_STATE,
         LAUNCHER_STATE,
         CAPABILITY_OBSERVATION_REPLAY_DIRECTORY,
+        AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY,
         SECRET_DELIVERY_AUTHORITY_DIRECTORY,
         LAUNCHER_RUNTIME,
         LAUNCHER_SOCKET,
@@ -2340,7 +2344,8 @@ mod tests {
         assert!(service.lines().any(|line| line
             == format!(
                 "ReadWritePaths={LAUNCHER_RUNTIME} {LAUNCHER_STATE} \
-                 {CAPABILITY_OBSERVATION_REPLAY_DIRECTORY} /srv/ota-pressure \
+                 {CAPABILITY_OBSERVATION_REPLAY_DIRECTORY} \
+                 {AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY} /srv/ota-pressure \
                  {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}"
             )));
         assert!(
@@ -2354,7 +2359,8 @@ mod tests {
                 .any(|line| line
                     == format!(
                         "ReadWritePaths={LAUNCHER_RUNTIME} {LAUNCHER_STATE} \
-                         {CAPABILITY_OBSERVATION_REPLAY_DIRECTORY} /srv/repository \
+                         {CAPABILITY_OBSERVATION_REPLAY_DIRECTORY} \
+                         {AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY} /srv/repository \
                          {HISTORY_BLOB_ROOT} {HISTORY_CATALOG_ROOT}"
                     ))
         );
@@ -2372,6 +2378,7 @@ mod tests {
         assert!(
             protected_directories().contains(&(CAPABILITY_OBSERVATION_REPLAY_DIRECTORY, 0o700))
         );
+        assert!(protected_directories().contains(&(AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY, 0o700)));
         assert!(protected_directories().contains(&(SECRET_DELIVERY_AUTHORITY_DIRECTORY, 0o700)));
         assert_eq!(
             EMPTY_SECRET_DELIVERY_VERIFIER_SNAPSHOT,
@@ -2384,6 +2391,11 @@ mod tests {
         assert!(managed_authority_state_paths().windows(2).any(|paths| paths
             == [
                 CAPABILITY_OBSERVATION_REPLAY_DIRECTORY,
+                AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY,
+            ]));
+        assert!(managed_authority_state_paths().windows(2).any(|paths| paths
+            == [
+                AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY,
                 SECRET_DELIVERY_AUTHORITY_DIRECTORY,
             ]));
         assert!(protected_directories().contains(&(HISTORY_BLOB_ROOT, 0o700)));

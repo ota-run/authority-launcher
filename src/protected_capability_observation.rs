@@ -24,7 +24,9 @@ use ota_authority_protocol::{
     ProtectedLauncherCapabilityProjectionVerifierV1, ProtectedLauncherCapabilityV1,
     ProtectedLauncherSecretDeliveryTransactionBindingEvidenceV1,
     ProtectedLauncherSecretDeliveryTransactionBindingRequestV1,
+    ProtectedLauncherSecretDeliveryTransactionBindingRequestV2,
     ProtectedLauncherSecretDeliveryTransactionBindingResponseV1,
+    ProtectedLauncherSecretDeliveryTransactionBindingResponseV2,
     ProtectedLauncherSecretDeliveryTransactionBindingV1, launcher_invocation_request_identity,
     protected_launcher_capability_observation_challenge_v1_identity,
     protected_launcher_capability_observation_nonce_commitment_v1,
@@ -32,12 +34,16 @@ use ota_authority_protocol::{
     protected_launcher_capability_observation_request_v1_identity,
     protected_launcher_capability_observation_signing_request_v1_identity,
     protected_launcher_secret_delivery_transaction_binding_v1_identity,
+    protected_launcher_secret_delivery_transaction_binding_v2_identity,
+    reconcile_protected_authority_snapshot_response_v1,
     reconcile_protected_launcher_capability_observation_signing_response_v1,
     reconcile_protected_launcher_secret_delivery_transaction_binding_request_v1,
+    reconcile_protected_launcher_secret_delivery_transaction_binding_response_v2,
     reconcile_protected_launcher_secret_delivery_transaction_binding_v1,
     validate_protected_launcher_capability_observation_challenge_v1,
     validate_protected_launcher_capability_observation_projection_v1,
     validate_protected_launcher_capability_observation_response_v1,
+    validate_protected_launcher_secret_delivery_transaction_binding_request_v2,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -304,6 +310,86 @@ pub(crate) fn derive_secret_delivery_transaction_binding_v1(
         installation_evidence_identity,
         derivation,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn derive_secret_delivery_transaction_binding_v2(
+    replay: &ProtectedCapabilityObservationReplayStoreV1,
+    request: &ProtectedLauncherSecretDeliveryTransactionBindingRequestV2,
+    snapshot_request: &ota_authority_protocol::ProtectedAuthoritySnapshotRequestV1,
+    snapshot_response: &ota_authority_protocol::ProtectedAuthoritySnapshotResponseV1,
+    startup_continuation: &LauncherStartupContinuationV1,
+    installation_evidence_identity: &str,
+    context: &ProtectedLauncherCapabilityContextV1<'_>,
+    observation: &mut RetainedProtectedLauncherObservationV1,
+) -> Result<
+    ProtectedLauncherSecretDeliveryTransactionBindingResponseV2,
+    ProtectedCapabilityObservationError,
+> {
+    let observed_at_unix_seconds = u64::try_from(OffsetDateTime::now_utc().unix_timestamp())
+        .map_err(|_| ProtectedCapabilityObservationError::InvalidChallenge)?;
+    reconcile_protected_authority_snapshot_response_v1(
+        snapshot_request,
+        snapshot_response,
+        startup_continuation,
+        observed_at_unix_seconds,
+    )
+    .map_err(|_| ProtectedCapabilityObservationError::ProjectionInvalid)?;
+    validate_protected_launcher_secret_delivery_transaction_binding_request_v2(request)
+        .map_err(|_| ProtectedCapabilityObservationError::ProjectionInvalid)?;
+    if request.protected_snapshot_identity != snapshot_response.protected_snapshot_identity {
+        return Err(ProtectedCapabilityObservationError::ProjectionInvalid);
+    }
+    let derivation = derive_and_sign_capability_observation_with_evidence_v1(
+        replay,
+        &request.observation,
+        context,
+        observation,
+    )?;
+    let mut binding = ota_authority_protocol::ProtectedLauncherSecretDeliveryTransactionBindingV2 {
+        schema_version: 2,
+        message_kind:
+            ota_authority_protocol::PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_V2.into(),
+        identity: String::new(),
+        request_identity: request.identity.clone(),
+        launcher_request_identity: request.launcher_request_identity.clone(),
+        startup_continuation_identity: request.startup_continuation_identity.clone(),
+        session_identity: request.session_identity.clone(),
+        protected_snapshot_identity: request.protected_snapshot_identity.clone(),
+        protected_capability_identity: derivation.protected_capability.identity.clone(),
+        secret_transaction_candidate_identity: request
+            .secret_transaction_candidate_identity
+            .clone(),
+        observation_request_identity: request.observation.identity.clone(),
+        projection_identity: derivation.response.projection.projection_identity.clone(),
+        verifier_identity: derivation.verifier.identity.clone(),
+        installation_evidence_identity: installation_evidence_identity.into(),
+        expires_at_unix_seconds: request.observation.challenge.expires_at_unix_seconds,
+    };
+    binding.identity = protected_launcher_secret_delivery_transaction_binding_v2_identity(&binding)
+        .map_err(|_| ProtectedCapabilityObservationError::ProjectionInvalid)?;
+    let response = ProtectedLauncherSecretDeliveryTransactionBindingResponseV2 {
+        schema_version: 2,
+        message_kind:
+            ota_authority_protocol::PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_RESPONSE_V2
+                .into(),
+        request_identity: request.identity.clone(),
+        protected_snapshot_identity: request.protected_snapshot_identity.clone(),
+        binding,
+        projection: derivation.response.projection,
+    };
+    reconcile_protected_launcher_secret_delivery_transaction_binding_response_v2(
+        request,
+        &response,
+        snapshot_request,
+        snapshot_response,
+        startup_continuation,
+        &derivation.verifier,
+        installation_evidence_identity,
+        observed_at_unix_seconds,
+    )
+    .map_err(|_| ProtectedCapabilityObservationError::ProjectionInvalid)?;
+    Ok(response)
 }
 
 fn finish_secret_delivery_transaction_binding_v1(

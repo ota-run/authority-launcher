@@ -29,16 +29,22 @@
 #[cfg(target_os = "linux")]
 use ota_authority_protocol::{
     LauncherChildProcessV1, LauncherInvocationRequestV1, LauncherPrincipalMappingV1,
-    LauncherSystemdScopeV1, OtaProcessPostureV1, PROTECTED_LAUNCHER_CAPABILITY,
-    ProtectedLauncherAuthorityContextV1, ProtectedLauncherCapabilityEvidenceV1,
-    ProtectedLauncherCapabilityV1, ProtectedLauncherDescriptorRoleV1,
-    ProtectedLauncherDescriptorV1, ProtectedSecretDeliveryBindingBundleV1,
-    ProtectedSecretDeliveryVerifierStoreV1, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1,
-    SystemdProtectedLauncherInstanceEvidenceV2, launcher_invocation_request_identity,
+    LauncherSystemdScopeV1, OtaProcessPostureV1, PROTECTED_AUTHORITY_SNAPSHOT,
+    PROTECTED_AUTHORITY_SNAPSHOT_RESPONSE, PROTECTED_LAUNCHER_CAPABILITY,
+    ProtectedAuthoritySnapshotPayloadV1, ProtectedAuthoritySnapshotRequestV1,
+    ProtectedAuthoritySnapshotResponseV1, ProtectedLauncherAuthorityContextV1,
+    ProtectedLauncherCapabilityEvidenceV1, ProtectedLauncherCapabilityV1,
+    ProtectedLauncherDescriptorRoleV1, ProtectedLauncherDescriptorV1,
+    ProtectedSecretDeliveryBindingBundleV1, ProtectedSecretDeliveryVerifierStoreV1,
+    SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, SystemdProtectedLauncherInstanceEvidenceV2,
+    launcher_invocation_request_identity, protected_authority_snapshot_payload_v1_identity,
+    protected_authority_snapshot_response_v1_identity,
     protected_launcher_authority_context_v1_identity, protected_launcher_boot_v1_identity,
     protected_launcher_capability_v1_identity, protected_launcher_cgroup_v1_identity,
     protected_launcher_invocation_nonce_v1_identity,
     protected_secret_delivery_binding_bundle_signature_message_v1,
+    reconcile_protected_authority_snapshot_request_v1,
+    reconcile_protected_authority_snapshot_response_v1,
     reconcile_protected_secret_delivery_authority_bundle_v1,
     validate_protected_launcher_capability_v1,
 };
@@ -424,17 +430,35 @@ pub struct ProtectedAuthorityStoresV1 {
 /// candidate before any provider transaction can begin.
 #[cfg(target_os = "linux")]
 pub(crate) struct VerifiedSecretDeliveryAuthorityBundleV1 {
-    pub(crate) verifier_store_identity: String,
-    pub(crate) binding_store_identity: String,
-    pub(crate) bundle_identity: String,
-    pub(crate) payload_identity: String,
-    pub(crate) payload: Vec<u8>,
+    pub(crate) verifier_store_descriptor: ProtectedLauncherDescriptorV1,
+    pub(crate) binding_store_descriptor: ProtectedLauncherDescriptorV1,
+    pub(crate) verifier_store_bytes: Vec<u8>,
+    pub(crate) binding_store_bytes: Vec<u8>,
+    pub(crate) verifier_store: ProtectedSecretDeliveryVerifierStoreV1,
+    pub(crate) binding_bundle: ProtectedSecretDeliveryBindingBundleV1,
+    pub(crate) binding_payload: Vec<u8>,
 }
 
 #[cfg(target_os = "linux")]
 impl ProtectedAuthorityStoresV1 {
     pub fn open() -> Result<Self, ProtectedLauncherCapabilityError> {
         Self::open_beneath(Path::new("/"), Path::new("etc/ota/secret-delivery"), 0, 0)
+    }
+
+    pub(crate) fn try_clone(&self) -> Result<Self, ProtectedLauncherCapabilityError> {
+        Ok(Self {
+            verifier_store: self
+                .verifier_store
+                .try_clone()
+                .map_err(|_| ProtectedLauncherCapabilityError::Unavailable)?,
+            binding_store: self
+                .binding_store
+                .try_clone()
+                .map_err(|_| ProtectedLauncherCapabilityError::Unavailable)?,
+            verifier_store_bytes: self.verifier_store_bytes.clone(),
+            binding_store_bytes: self.binding_store_bytes.clone(),
+            descriptors: self.descriptors.clone(),
+        })
     }
 
     pub fn descriptors(&self) -> &[ProtectedLauncherDescriptorV1; 2] {
@@ -526,21 +550,71 @@ impl ProtectedAuthorityStoresV1 {
                 &bundle,
             )
             .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
-        let verifier_store_identity = self.descriptors[0]
-            .content_identity
-            .clone()
-            .ok_or(ProtectedLauncherCapabilityError::ReconciliationFailed)?;
-        let binding_store_identity = self.descriptors[1]
-            .content_identity
-            .clone()
-            .ok_or(ProtectedLauncherCapabilityError::ReconciliationFailed)?;
         Ok(VerifiedSecretDeliveryAuthorityBundleV1 {
-            verifier_store_identity,
-            binding_store_identity,
-            bundle_identity: bundle.identity,
-            payload_identity: bundle.payload_identity,
-            payload,
+            verifier_store_descriptor: self.descriptors[0].clone(),
+            binding_store_descriptor: self.descriptors[1].clone(),
+            verifier_store_bytes: self.verifier_store_bytes.clone(),
+            binding_store_bytes: self.binding_store_bytes.clone(),
+            verifier_store: store,
+            binding_bundle: bundle,
+            binding_payload: payload,
         })
+    }
+
+    /// Builds one private snapshot only after the retained stores, exact request, and signed
+    /// authority bundle have been revalidated together.
+    pub(crate) fn respond_to_authority_snapshot_v1(
+        &self,
+        request: &ProtectedAuthoritySnapshotRequestV1,
+        startup_continuation: &ota_authority_protocol::LauncherStartupContinuationV1,
+    ) -> Result<ProtectedAuthoritySnapshotResponseV1, ProtectedLauncherCapabilityError> {
+        let observed_at_unix_seconds = u64::try_from(OffsetDateTime::now_utc().unix_timestamp())
+            .map_err(|_| ProtectedLauncherCapabilityError::Unavailable)?;
+        reconcile_protected_authority_snapshot_request_v1(
+            request,
+            startup_continuation,
+            observed_at_unix_seconds,
+        )
+        .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        let verified =
+            self.verify_secret_delivery_authority_bundle_inner_v1(observed_at_unix_seconds)?;
+        let payload = ProtectedAuthoritySnapshotPayloadV1 {
+            schema_version: 1,
+            record_kind: PROTECTED_AUTHORITY_SNAPSHOT.into(),
+            request_identity: request.identity.clone(),
+            launcher_request_identity: request.launcher_request_identity.clone(),
+            startup_continuation_identity: request.startup_continuation_identity.clone(),
+            session_identity: request.session_identity.clone(),
+            contract_identity: request.contract_identity.clone(),
+            selected_execution_graph_identity: request.selected_execution_graph_identity.clone(),
+            verifier_store_descriptor: verified.verifier_store_descriptor,
+            binding_store_descriptor: verified.binding_store_descriptor,
+            verifier_store: verified.verifier_store,
+            binding_bundle: verified.binding_bundle,
+            verifier_store_bytes: URL_SAFE_NO_PAD.encode(verified.verifier_store_bytes),
+            binding_store_bytes: URL_SAFE_NO_PAD.encode(verified.binding_store_bytes),
+        };
+        let protected_snapshot_identity =
+            protected_authority_snapshot_payload_v1_identity(&payload)
+                .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        let mut response = ProtectedAuthoritySnapshotResponseV1 {
+            schema_version: 1,
+            message_kind: PROTECTED_AUTHORITY_SNAPSHOT_RESPONSE.into(),
+            identity: String::new(),
+            request_identity: request.identity.clone(),
+            payload,
+            protected_snapshot_identity,
+        };
+        response.identity = protected_authority_snapshot_response_v1_identity(&response)
+            .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        reconcile_protected_authority_snapshot_response_v1(
+            request,
+            &response,
+            startup_continuation,
+            observed_at_unix_seconds,
+        )
+        .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        Ok(response)
     }
 
     fn open_beneath(
@@ -1334,11 +1408,40 @@ mod linux_tests {
         let verified = stores
             .verify_secret_delivery_authority_bundle_at_v1(bundle.issued_at_unix_seconds)
             .expect("current signed bundle");
-        assert_eq!(verified.bundle_identity, bundle.identity);
-        assert_eq!(verified.payload, payload);
-        assert!(verified.verifier_store_identity.starts_with("sha256:"));
-        assert!(verified.binding_store_identity.starts_with("sha256:"));
-        assert_eq!(verified.payload_identity, bundle.payload_identity);
+        assert_eq!(verified.binding_bundle.identity, bundle.identity);
+        assert_eq!(verified.binding_payload, payload);
+        assert_eq!(
+            verified.binding_bundle.payload_identity,
+            bundle.payload_identity
+        );
+        assert_eq!(
+            verified
+                .verifier_store_descriptor
+                .content_identity
+                .as_deref(),
+            Some(
+                protected_launcher_store_content_identity_v1(
+                    ProtectedLauncherDescriptorRoleV1::VerifierStore,
+                    verified.verifier_store_bytes.as_slice(),
+                )
+                .expect("verifier content identity")
+                .as_str()
+            )
+        );
+        assert_eq!(
+            verified
+                .binding_store_descriptor
+                .content_identity
+                .as_deref(),
+            Some(
+                protected_launcher_store_content_identity_v1(
+                    ProtectedLauncherDescriptorRoleV1::BindingStore,
+                    verified.binding_store_bytes.as_slice(),
+                )
+                .expect("binding content identity")
+                .as_str()
+            )
+        );
 
         let binding_path = root
             .path()

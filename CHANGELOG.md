@@ -26,6 +26,16 @@
 
 ## Unreleased
 
+- Add the provider-free protected-authority snapshot bridge for the selected child. Launcher opens
+  and retains the exact protected stores before child creation, revalidates their descriptors and
+  signed bytes before returning one private snapshot, and permits only the ordered snapshot then
+  V2 transaction-binding exchange. A distinct descriptor-retained root-owned replay store reserves
+  before snapshot disclosure and is consumed only after exact V2 reconciliation; failed exchanges
+  remain reserved. Ordinary non-secret completion remains compatible when protected stores are
+  unavailable. This activates no OIDC request, provider contact, materialization, injection,
+  positive evidence, Step 8, or V12.2 capability. Exact Linux/X64 service-path execution and Core
+  consumption remain required before provider contact.
+
 - Pin Authority Protocol `5b416637c763f835050f65660766efa2b432f4af` and add the
   same-execution secret-delivery transaction-binding route. After exact signed admission and lease
   consumption, one typed request on the selected child's inherited Launcher session is reconciled

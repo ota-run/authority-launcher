@@ -36,6 +36,9 @@ pub mod linux_observations;
 #[cfg(target_os = "linux")]
 pub mod observation_collector;
 #[cfg(all(target_os = "linux", feature = "protected-attestor"))]
+#[allow(dead_code)] // Step 7 private snapshot replay; provider operations remain inactive.
+pub(crate) mod protected_authority_snapshot;
+#[cfg(all(target_os = "linux", feature = "protected-attestor"))]
 #[allow(dead_code)] // Step 7 protected observation route; provider operations remain inactive.
 pub(crate) mod protected_capability_observation;
 #[cfg(target_os = "linux")]
