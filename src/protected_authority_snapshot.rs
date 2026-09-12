@@ -1102,8 +1102,7 @@ mod tests {
         );
 
         assert_eq!(unsafe { libc::geteuid() }, 0, "test requires root");
-        let (directory, store, reservation) = replay_fixture();
-        let record = directory.path().join(&reservation.record_name);
+        let record = Path::new(AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY).join(&reservation.record_name);
         let record = CString::new(record.as_os_str().as_bytes()).expect("record path");
         assert_eq!(unsafe { libc::chown(record.as_ptr(), 1, 0) }, 0);
         assert_eq!(
