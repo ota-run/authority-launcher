@@ -736,6 +736,9 @@ impl PreparedChild {
                 )?;
                 pressure_v3_stage("authority_snapshot_request_received");
                 let request = serde_json::from_value(snapshot)
+                    .inspect_err(|_| {
+                        pressure_v3_stage("authority_snapshot_request_invalid");
+                    })
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
                 let response = respond_authority_snapshot(&request, &self.launcher_session)
                     .inspect_err(|_| {
