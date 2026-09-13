@@ -1295,6 +1295,18 @@ mod linux_tests {
         ProtectedSecretDeliveryBindingBundleV1,
         Vec<u8>,
     ) {
+        create_signed_authority_bundle_store_tree_at(1_788_800_000, 1_788_803_600)
+    }
+
+    pub(super) fn create_signed_authority_bundle_store_tree_at(
+        issued_at_unix_seconds: u64,
+        expires_at_unix_seconds: u64,
+    ) -> (
+        tempfile::TempDir,
+        ProtectedSecretDeliveryVerifierStoreV1,
+        ProtectedSecretDeliveryBindingBundleV1,
+        Vec<u8>,
+    ) {
         let root = create_store_tree();
         let authority = root.path().join("authority");
         let signing_key = SigningKey::from_bytes(&[9; 32]);
@@ -1323,8 +1335,8 @@ mod linux_tests {
             identity: String::new(),
             authority_id: "ota-secret-delivery".into(),
             generation: 1,
-            issued_at_unix_seconds: 1_788_800_000,
-            expires_at_unix_seconds: 1_788_803_600,
+            issued_at_unix_seconds,
+            expires_at_unix_seconds,
             verifier_identity: verifier.identity.clone(),
             payload: URL_SAFE_NO_PAD.encode(&payload),
             payload_identity: protected_secret_delivery_binding_bundle_payload_v1_identity(
@@ -1819,9 +1831,11 @@ mod linux_tests {
     feature = "protected-attestor"
 ))]
 mod privileged_linux_tests {
+    use std::cell::Cell;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
 
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1834,7 +1848,9 @@ mod privileged_linux_tests {
     use crate::protected_capability_observation::{
         ProtectedCapabilityObservationError, ProtectedCapabilityObservationReplayStoreV1,
         derive_and_sign_capability_observation_for_test_v1,
+        derive_same_child_capability_prelude_for_test_v1,
         derive_secret_delivery_transaction_binding_for_test_v1,
+        derive_secret_delivery_transaction_binding_v2,
     };
 
     struct CapabilityFixture {
@@ -1849,6 +1865,59 @@ mod privileged_linux_tests {
         launcher_service_binding_identity: String,
         launcher_profile_identity: String,
         authority: RetainedProtectedLauncherAuthorityContextV1,
+    }
+
+    struct CanonicalAuthorityStoreGuard {
+        originals: Vec<(PathBuf, Vec<u8>)>,
+        _source: tempfile::TempDir,
+    }
+
+    impl CanonicalAuthorityStoreGuard {
+        fn install(issued_at_unix_seconds: u64) -> Self {
+            let (source, _, _, _) =
+                super::linux_tests::create_signed_authority_bundle_store_tree_at(
+                    issued_at_unix_seconds,
+                    issued_at_unix_seconds + 600,
+                );
+            let source_root = source.path().join("authority");
+            let target_root = Path::new(SECRET_DELIVERY_AUTHORITY_DIRECTORY);
+            let mut originals = Vec::new();
+            for name in [
+                SECRET_DELIVERY_VERIFIER_STORE,
+                SECRET_DELIVERY_BINDING_STORE,
+            ] {
+                let target = target_root.join(name);
+                originals.push((
+                    target.clone(),
+                    fs::read(&target).expect("original protected authority bytes"),
+                ));
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+                    .expect("authority fixture write mode");
+                fs::write(
+                    &target,
+                    fs::read(source_root.join(name)).expect("signed authority fixture bytes"),
+                )
+                .expect("install signed authority fixture");
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o400))
+                    .expect("authority fixture protected mode");
+            }
+            Self {
+                originals,
+                _source: source,
+            }
+        }
+    }
+
+    impl Drop for CanonicalAuthorityStoreGuard {
+        fn drop(&mut self) {
+            for (path, bytes) in &self.originals {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                    .expect("authority fixture restore mode");
+                fs::write(path, bytes).expect("restore protected authority bytes");
+                fs::set_permissions(path, fs::Permissions::from_mode(0o400))
+                    .expect("restored authority protected mode");
+            }
+        }
     }
 
     impl CapabilityFixture {
@@ -2165,9 +2234,64 @@ mod privileged_linux_tests {
         verifier
     }
 
+    fn fresh_observation_request(
+        nonce: &[u8; 32],
+        expected_launcher_request_identity: &str,
+        issued_at_unix_seconds: u64,
+    ) -> ProtectedLauncherCapabilityObservationRequestV1 {
+        let mut request = observation_request(nonce, "6", expected_launcher_request_identity);
+        request.challenge.issued_at_unix_seconds = issued_at_unix_seconds;
+        request.challenge.expires_at_unix_seconds = issued_at_unix_seconds + 300;
+        request.challenge.identity =
+            protected_launcher_capability_observation_challenge_v1_identity(&request.challenge)
+                .expect("fresh observation challenge identity");
+        request.identity = protected_launcher_capability_observation_request_v1_identity(&request)
+            .expect("fresh observation request identity");
+        request
+    }
+
+    fn snapshot_request(
+        startup: &LauncherStartupContinuationV1,
+        issued_at_unix_seconds: u64,
+    ) -> ProtectedAuthoritySnapshotRequestV1 {
+        let nonce = [12_u8; 32];
+        let mut challenge = ProtectedAuthoritySnapshotChallengeV1 {
+            schema_version: 1,
+            message_kind: PROTECTED_AUTHORITY_SNAPSHOT_CHALLENGE.into(),
+            identity: String::new(),
+            nonce_commitment: protected_authority_snapshot_nonce_commitment_v1(&nonce)
+                .expect("snapshot nonce commitment"),
+            issued_at_unix_seconds,
+            expires_at_unix_seconds: issued_at_unix_seconds + 300,
+        };
+        challenge.identity = protected_authority_snapshot_challenge_v1_identity(&challenge)
+            .expect("snapshot challenge identity");
+        let mut request = ProtectedAuthoritySnapshotRequestV1 {
+            schema_version: 1,
+            message_kind: PROTECTED_AUTHORITY_SNAPSHOT_REQUEST.into(),
+            identity: String::new(),
+            challenge,
+            nonce: URL_SAFE_NO_PAD.encode(nonce),
+            launcher_request_identity: startup.launcher_request_identity.clone(),
+            startup_continuation_identity: startup.identity.clone(),
+            session_identity: protected_launcher_secret_delivery_transaction_session_v1_identity(
+                startup.identity.as_str(),
+            )
+            .expect("snapshot session identity"),
+            contract_identity: identity('a'),
+            selected_execution_graph_identity: identity('b'),
+        };
+        request.identity =
+            protected_authority_snapshot_request_v1_identity(&request).expect("snapshot request");
+        request
+    }
+
     #[test]
     #[ignore = "requires root-owned stores and a real transient systemd cgroup-v2 scope"]
     fn retained_observation_derives_and_rejects_live_substitution() {
+        let authority_fixture_now = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp())
+            .expect("authority fixture timestamp");
+        let _authority_store_guard = CanonicalAuthorityStoreGuard::install(authority_fixture_now);
         let mut fixture = fixture();
         let mut retained = observation(&fixture.scope);
         let capability = derive_protected_launcher_capability_v1(&fixture.context(), &mut retained)
@@ -2480,6 +2604,102 @@ mod privileged_linux_tests {
             ),
             Err(ProtectedCapabilityObservationError::ReplayDetected)
         ));
+
+        let now = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp())
+            .expect("current timestamp");
+        let prelude_request = fresh_observation_request(&[13_u8; 32], &request_identity, now);
+        let mut prelude_observation = observation(&fixture.scope);
+        let signing_count = Cell::new(0_u32);
+        let prelude = derive_same_child_capability_prelude_for_test_v1(
+            &replay,
+            &prelude_request,
+            &startup_continuation,
+            &identity('d'),
+            now,
+            &binding,
+            &verifier,
+            &fixture.context(),
+            &mut prelude_observation,
+            |_, verifier, signing_request| {
+                signing_count.set(signing_count.get() + 1);
+                let response = issuer
+                    .issue_capability_observation_for_test(signing_request, verifier)
+                    .map_err(|_| ProtectedCapabilityObservationError::SignerAuthorityUnavailable)?;
+                verify_capability_observation_signature_response(
+                    verifier,
+                    signing_request,
+                    &response,
+                )
+                .map_err(|_| ProtectedCapabilityObservationError::SignerAuthorityUnavailable)?;
+                Ok(response)
+            },
+        )
+        .expect("same-child capability prelude");
+        assert_eq!(signing_count.get(), 1, "prelude must sign exactly once");
+
+        let snapshot_request = snapshot_request(&startup_continuation, now);
+        let snapshot_response = prelude_observation
+            .stores
+            .respond_to_authority_snapshot_v1(&snapshot_request, &startup_continuation)
+            .expect("protected authority snapshot response");
+        let mut v2_request = ProtectedLauncherSecretDeliveryTransactionBindingRequestV2 {
+            schema_version: 2,
+            message_kind: PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V2.into(),
+            identity: String::new(),
+            launcher_request_identity: request_identity.clone(),
+            observation: prelude_request.clone(),
+            secret_transaction_candidate_identity: identity('c'),
+            startup_continuation_identity: startup_continuation.identity.clone(),
+            session_identity: protected_launcher_secret_delivery_transaction_session_v1_identity(
+                startup_continuation.identity.as_str(),
+            )
+            .expect("V2 session identity"),
+            same_child_capability_prelude_identity: prelude.prelude.identity.clone(),
+            protected_snapshot_identity: snapshot_response.protected_snapshot_identity.clone(),
+        };
+        v2_request.identity =
+            protected_launcher_secret_delivery_transaction_binding_request_v2_identity(&v2_request)
+                .expect("V2 request identity");
+        let v2_response = derive_secret_delivery_transaction_binding_v2(
+            &v2_request,
+            &snapshot_request,
+            &snapshot_response,
+            &startup_continuation,
+            &identity('d'),
+            &prelude,
+            &fixture.context(),
+            &mut prelude_observation,
+        )
+        .expect("same-child V2 binding");
+        assert_eq!(
+            signing_count.get(),
+            1,
+            "V2 must not sign a second projection"
+        );
+        assert_eq!(v2_response.projection, prelude.response.projection);
+
+        let verifier_path =
+            Path::new(SECRET_DELIVERY_AUTHORITY_DIRECTORY).join(SECRET_DELIVERY_VERIFIER_STORE);
+        let original = fs::read(&verifier_path).expect("V2 verifier bytes");
+        let mut changed = original.clone();
+        changed[0] ^= 1;
+        assert_eq!(changed.len(), original.len());
+        fs::write(&verifier_path, &changed).expect("same-length V2 store drift");
+        assert!(matches!(
+            derive_secret_delivery_transaction_binding_v2(
+                &v2_request,
+                &snapshot_request,
+                &snapshot_response,
+                &startup_continuation,
+                &identity('d'),
+                &prelude,
+                &fixture.context(),
+                &mut prelude_observation,
+            ),
+            Err(ProtectedCapabilityObservationError::Capability(_))
+        ));
+        assert_eq!(signing_count.get(), 1, "refusal must not invoke the signer");
+        fs::write(&verifier_path, &original).expect("restore V2 verifier bytes");
 
         let wrong_key = SigningKey::from_bytes(&[8_u8; 32]);
         let wrong_verifier = projection_verifier(&wrong_key);
