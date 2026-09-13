@@ -38,8 +38,8 @@ use ota_authority_protocol::{
     reconcile_protected_authority_snapshot_response_v1,
     reconcile_protected_launcher_capability_observation_signing_response_v1,
     reconcile_protected_launcher_secret_delivery_transaction_binding_request_v1,
-    reconcile_protected_launcher_secret_delivery_transaction_binding_response_v2,
     reconcile_protected_launcher_secret_delivery_transaction_binding_v1,
+    reconcile_protected_launcher_secret_delivery_transaction_binding_v2,
     validate_protected_launcher_capability_observation_challenge_v1,
     validate_protected_launcher_capability_observation_projection_v1,
     validate_protected_launcher_capability_observation_response_v1,
@@ -368,6 +368,12 @@ pub(crate) fn derive_secret_delivery_transaction_binding_v2(
     };
     binding.identity = protected_launcher_secret_delivery_transaction_binding_v2_identity(&binding)
         .map_err(|_| ProtectedCapabilityObservationError::ProjectionInvalid)?;
+    let evidence = ProtectedLauncherSecretDeliveryTransactionBindingEvidenceV1 {
+        protected_capability: derivation.protected_capability,
+        projection: derivation.response.projection.clone(),
+        verifier: derivation.verifier,
+        installation_evidence_identity: installation_evidence_identity.into(),
+    };
     let response = ProtectedLauncherSecretDeliveryTransactionBindingResponseV2 {
         schema_version: 2,
         message_kind:
@@ -376,16 +382,15 @@ pub(crate) fn derive_secret_delivery_transaction_binding_v2(
         request_identity: request.identity.clone(),
         protected_snapshot_identity: request.protected_snapshot_identity.clone(),
         binding,
-        projection: derivation.response.projection,
+        projection: evidence.projection.clone(),
     };
-    reconcile_protected_launcher_secret_delivery_transaction_binding_response_v2(
+    reconcile_protected_launcher_secret_delivery_transaction_binding_v2(
         request,
         &response,
         snapshot_request,
         snapshot_response,
         startup_continuation,
-        &derivation.verifier,
-        installation_evidence_identity,
+        &evidence,
         observed_at_unix_seconds,
     )
     .map_err(|_| ProtectedCapabilityObservationError::ProjectionInvalid)?;
