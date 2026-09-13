@@ -14,7 +14,8 @@ use std::path::Path;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ota_authority_protocol::{
-    LauncherStartupContinuationV1, ProtectedLauncherCapabilityObservationChallengeV1,
+    LauncherStartupContinuationV1, PROTECTED_SAME_CHILD_CAPABILITY_PRELUDE,
+    ProtectedLauncherCapabilityObservationChallengeV1,
     ProtectedLauncherCapabilityObservationProjectionPayloadV1,
     ProtectedLauncherCapabilityObservationRequestV1,
     ProtectedLauncherCapabilityObservationResponseV1,
@@ -27,7 +28,8 @@ use ota_authority_protocol::{
     ProtectedLauncherSecretDeliveryTransactionBindingRequestV2,
     ProtectedLauncherSecretDeliveryTransactionBindingResponseV1,
     ProtectedLauncherSecretDeliveryTransactionBindingResponseV2,
-    ProtectedLauncherSecretDeliveryTransactionBindingV1, launcher_invocation_request_identity,
+    ProtectedLauncherSecretDeliveryTransactionBindingV1, ProtectedSameChildCapabilityPreludeV1,
+    launcher_invocation_request_identity,
     protected_launcher_capability_observation_challenge_v1_identity,
     protected_launcher_capability_observation_nonce_commitment_v1,
     protected_launcher_capability_observation_projection_v1_identity,
@@ -35,6 +37,8 @@ use ota_authority_protocol::{
     protected_launcher_capability_observation_signing_request_v1_identity,
     protected_launcher_secret_delivery_transaction_binding_v1_identity,
     protected_launcher_secret_delivery_transaction_binding_v2_identity,
+    protected_launcher_secret_delivery_transaction_session_v1_identity,
+    protected_same_child_capability_prelude_v1_identity,
     reconcile_protected_authority_snapshot_response_v1,
     reconcile_protected_launcher_capability_observation_signing_response_v1,
     reconcile_protected_launcher_secret_delivery_transaction_binding_request_v1,
@@ -80,6 +84,12 @@ pub(crate) struct ProtectedCapabilityObservationDerivationV1 {
     pub response: ProtectedLauncherCapabilityObservationResponseV1,
     pub protected_capability: ProtectedLauncherCapabilityV1,
     pub verifier: ProtectedLauncherCapabilityProjectionVerifierV1,
+}
+
+pub(crate) struct ProtectedSameChildCapabilityPreludeDerivationV1 {
+    pub response: ProtectedLauncherCapabilityObservationResponseV1,
+    pub prelude: ProtectedSameChildCapabilityPreludeV1,
+    evidence: ProtectedLauncherSecretDeliveryTransactionBindingEvidenceV1,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -313,13 +323,132 @@ pub(crate) fn derive_secret_delivery_transaction_binding_v1(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn derive_secret_delivery_transaction_binding_v2(
+pub(crate) fn derive_same_child_capability_prelude_v1(
     replay: &ProtectedCapabilityObservationReplayStoreV1,
+    request: &ProtectedLauncherCapabilityObservationRequestV1,
+    startup_continuation: &LauncherStartupContinuationV1,
+    installation_evidence_identity: &str,
+    context: &ProtectedLauncherCapabilityContextV1<'_>,
+    observation: &mut RetainedProtectedLauncherObservationV1,
+) -> Result<ProtectedSameChildCapabilityPreludeDerivationV1, ProtectedCapabilityObservationError> {
+    if request.expected_launcher_request_identity != startup_continuation.launcher_request_identity
+        || !is_sha256_identity(installation_evidence_identity)
+    {
+        return Err(ProtectedCapabilityObservationError::ProjectionInvalid);
+    }
+    let derivation = derive_and_sign_capability_observation_with_evidence_v1(
+        replay,
+        request,
+        context,
+        observation,
+    )?;
+    finish_same_child_capability_prelude_v1(
+        request,
+        startup_continuation,
+        installation_evidence_identity,
+        derivation,
+    )
+}
+
+fn finish_same_child_capability_prelude_v1(
+    request: &ProtectedLauncherCapabilityObservationRequestV1,
+    startup_continuation: &LauncherStartupContinuationV1,
+    installation_evidence_identity: &str,
+    derivation: ProtectedCapabilityObservationDerivationV1,
+) -> Result<ProtectedSameChildCapabilityPreludeDerivationV1, ProtectedCapabilityObservationError> {
+    let mut prelude = ProtectedSameChildCapabilityPreludeV1 {
+        schema_version: 1,
+        record_kind: PROTECTED_SAME_CHILD_CAPABILITY_PRELUDE.into(),
+        identity: String::new(),
+        observation_request_identity: request.identity.clone(),
+        projection_identity: derivation.response.projection.projection_identity.clone(),
+        protected_capability_identity: derivation.protected_capability.identity.clone(),
+        verifier_identity: derivation.verifier.identity.clone(),
+        installation_evidence_identity: installation_evidence_identity.into(),
+        launcher_request_identity: startup_continuation.launcher_request_identity.clone(),
+        startup_continuation_identity: startup_continuation.identity.clone(),
+        session_identity: protected_launcher_secret_delivery_transaction_session_v1_identity(
+            startup_continuation.identity.as_str(),
+        )
+        .map_err(|_| ProtectedCapabilityObservationError::ProjectionInvalid)?,
+        expires_at_unix_seconds: request.challenge.expires_at_unix_seconds,
+    };
+    prelude.identity = protected_same_child_capability_prelude_v1_identity(&prelude)
+        .map_err(|_| ProtectedCapabilityObservationError::ProjectionInvalid)?;
+    let evidence = ProtectedLauncherSecretDeliveryTransactionBindingEvidenceV1 {
+        protected_capability: derivation.protected_capability,
+        projection: derivation.response.projection.clone(),
+        verifier: derivation.verifier,
+        installation_evidence_identity: installation_evidence_identity.into(),
+    };
+    Ok(ProtectedSameChildCapabilityPreludeDerivationV1 {
+        response: derivation.response,
+        prelude,
+        evidence,
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn derive_same_child_capability_prelude_for_test_v1(
+    replay: &ProtectedCapabilityObservationReplayStoreV1,
+    request: &ProtectedLauncherCapabilityObservationRequestV1,
+    startup_continuation: &LauncherStartupContinuationV1,
+    installation_evidence_identity: &str,
+    observed_at_unix_seconds: u64,
+    binding: &ota_authority_protocol::LauncherAttestationProducerBindingV1,
+    verifier: &ProtectedLauncherCapabilityProjectionVerifierV1,
+    context: &ProtectedLauncherCapabilityContextV1<'_>,
+    observation: &mut RetainedProtectedLauncherObservationV1,
+    sign: impl FnOnce(
+        &ota_authority_protocol::LauncherAttestationProducerBindingV1,
+        &ProtectedLauncherCapabilityProjectionVerifierV1,
+        &ProtectedLauncherCapabilityObservationSigningRequestV1,
+    ) -> Result<
+        ProtectedLauncherCapabilityObservationSigningResponseV1,
+        ProtectedCapabilityObservationError,
+    >,
+) -> Result<ProtectedSameChildCapabilityPreludeDerivationV1, ProtectedCapabilityObservationError> {
+    if request.expected_launcher_request_identity != startup_continuation.launcher_request_identity
+        || !is_sha256_identity(installation_evidence_identity)
+    {
+        return Err(ProtectedCapabilityObservationError::ProjectionInvalid);
+    }
+    let derivation = derive_and_sign_capability_observation_at_v1(
+        replay,
+        request,
+        observed_at_unix_seconds,
+        binding,
+        verifier,
+        context,
+        observation,
+        sign,
+    )?;
+    finish_same_child_capability_prelude_v1(
+        request,
+        startup_continuation,
+        installation_evidence_identity,
+        derivation,
+    )
+}
+
+fn is_sha256_identity(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn derive_secret_delivery_transaction_binding_v2(
     request: &ProtectedLauncherSecretDeliveryTransactionBindingRequestV2,
     snapshot_request: &ota_authority_protocol::ProtectedAuthoritySnapshotRequestV1,
     snapshot_response: &ota_authority_protocol::ProtectedAuthoritySnapshotResponseV1,
     startup_continuation: &LauncherStartupContinuationV1,
     installation_evidence_identity: &str,
+    prelude: &ProtectedSameChildCapabilityPreludeDerivationV1,
     context: &ProtectedLauncherCapabilityContextV1<'_>,
     observation: &mut RetainedProtectedLauncherObservationV1,
 ) -> Result<
@@ -340,12 +469,14 @@ pub(crate) fn derive_secret_delivery_transaction_binding_v2(
     if request.protected_snapshot_identity != snapshot_response.protected_snapshot_identity {
         return Err(ProtectedCapabilityObservationError::ProjectionInvalid);
     }
-    let derivation = derive_and_sign_capability_observation_with_evidence_v1(
-        replay,
-        &request.observation,
-        context,
-        observation,
-    )?;
+    let rederived_capability = derive_protected_launcher_capability_v1(context, observation)?;
+    if rederived_capability.identity != prelude.evidence.protected_capability.identity
+        || request.same_child_capability_prelude_identity != prelude.prelude.identity
+        || request.observation.identity != prelude.prelude.observation_request_identity
+        || installation_evidence_identity != prelude.prelude.installation_evidence_identity
+    {
+        return Err(ProtectedCapabilityObservationError::ProjectionInvalid);
+    }
     let mut binding = ota_authority_protocol::ProtectedLauncherSecretDeliveryTransactionBindingV2 {
         schema_version: 2,
         message_kind:
@@ -355,34 +486,30 @@ pub(crate) fn derive_secret_delivery_transaction_binding_v2(
         launcher_request_identity: request.launcher_request_identity.clone(),
         startup_continuation_identity: request.startup_continuation_identity.clone(),
         session_identity: request.session_identity.clone(),
+        same_child_capability_prelude_identity: prelude.prelude.identity.clone(),
         protected_snapshot_identity: request.protected_snapshot_identity.clone(),
-        protected_capability_identity: derivation.protected_capability.identity.clone(),
+        protected_capability_identity: prelude.evidence.protected_capability.identity.clone(),
         secret_transaction_candidate_identity: request
             .secret_transaction_candidate_identity
             .clone(),
         observation_request_identity: request.observation.identity.clone(),
-        projection_identity: derivation.response.projection.projection_identity.clone(),
-        verifier_identity: derivation.verifier.identity.clone(),
+        projection_identity: prelude.evidence.projection.projection_identity.clone(),
+        verifier_identity: prelude.evidence.verifier.identity.clone(),
         installation_evidence_identity: installation_evidence_identity.into(),
         expires_at_unix_seconds: request.observation.challenge.expires_at_unix_seconds,
     };
     binding.identity = protected_launcher_secret_delivery_transaction_binding_v2_identity(&binding)
         .map_err(|_| ProtectedCapabilityObservationError::ProjectionInvalid)?;
-    let evidence = ProtectedLauncherSecretDeliveryTransactionBindingEvidenceV1 {
-        protected_capability: derivation.protected_capability,
-        projection: derivation.response.projection.clone(),
-        verifier: derivation.verifier,
-        installation_evidence_identity: installation_evidence_identity.into(),
-    };
     let response = ProtectedLauncherSecretDeliveryTransactionBindingResponseV2 {
         schema_version: 2,
         message_kind:
             ota_authority_protocol::PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_RESPONSE_V2
                 .into(),
         request_identity: request.identity.clone(),
+        same_child_capability_prelude_identity: prelude.prelude.identity.clone(),
         protected_snapshot_identity: request.protected_snapshot_identity.clone(),
         binding,
-        projection: evidence.projection.clone(),
+        projection: prelude.evidence.projection.clone(),
     };
     reconcile_protected_launcher_secret_delivery_transaction_binding_v2(
         request,
@@ -390,7 +517,8 @@ pub(crate) fn derive_secret_delivery_transaction_binding_v2(
         snapshot_request,
         snapshot_response,
         startup_continuation,
-        &evidence,
+        &prelude.prelude,
+        &prelude.evidence,
         observed_at_unix_seconds,
     )
     .map_err(|_| ProtectedCapabilityObservationError::ProjectionInvalid)?;

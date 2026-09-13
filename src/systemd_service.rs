@@ -646,9 +646,114 @@ fn execute_selected_boundary(
     let process_posture = boundary.process_posture.clone();
     #[cfg(feature = "protected-attestor")]
     let snapshot_exchange = RefCell::new(None);
+    #[cfg(feature = "protected-attestor")]
+    let same_child_prelude = RefCell::new(None);
     let completion = boundary.child.relay_selected_execution_with_secret_binding(
         stream,
         &boundary.consumption,
+        |request, selected_session| {
+            #[cfg(not(feature = "protected-attestor"))]
+            {
+                let _ = (request, selected_session);
+                Err(PreparedChildError::AuthorizationAdmissionMismatch)
+            }
+            #[cfg(feature = "protected-attestor")]
+            {
+                let stores = context
+                    .protected_authority_stores
+                    .as_ref()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let authority =
+                    crate::installation_manifest::load_protected_launcher_authority_context(
+                        context.config,
+                        context.launcher_executable,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let authority = crate::protected_launcher_capability::RetainedProtectedLauncherAuthorityContextV1::acquire(
+                    authority,
+                    context.boot_file
+                        .try_clone()
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?,
+                )
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let runtime_identity =
+                    verify_systemd_runtime(context.config, context.installation, &scope)
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let mut evidence =
+                    crate::closed_profile_observations::collect_live_closed_profile_evidence(
+                        context.config,
+                        context.installation,
+                        context.mapping,
+                        stream,
+                        context.peer,
+                        &child_record,
+                        &scope,
+                        &process_posture,
+                        runtime_identity.as_str(),
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let launcher_instance = collect_launcher_instance(
+                    context.config,
+                    &principal_mapping,
+                    &child_record,
+                    &scope,
+                    &process_posture,
+                    &mut evidence,
+                )
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let cgroup =
+                    crate::protected_launcher_capability::RetainedInvocationCgroupV1::open(&scope)
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let mut observation = crate::protected_launcher_capability::RetainedProtectedLauncherObservationV1::observe(
+                    stores
+                        .try_clone()
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?,
+                    cgroup,
+                    selected_session
+                        .try_clone()
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?,
+                )
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let launcher_profile_identity =
+                    systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let launcher_executable_identity = context
+                    .installation
+                    .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let capability_context =
+                    crate::protected_launcher_capability::ProtectedLauncherCapabilityContextV1 {
+                        request: context.launcher_request,
+                        child: &child_record,
+                        scope: &scope,
+                        principal_mapping: &principal_mapping,
+                        process_posture: &process_posture,
+                        launcher_instance: &launcher_instance,
+                        launcher_executable_identity,
+                        launcher_configuration_identity: context.config.identity.as_str(),
+                        launcher_service_binding_identity: context.config.service_unit_identity.as_str(),
+                        launcher_profile_identity: launcher_profile_identity.as_str(),
+                        service_uid: unsafe { libc::geteuid() },
+                        service_gid: unsafe { libc::getegid() },
+                        authority: &authority,
+                    };
+                let replay = crate::protected_capability_observation::ProtectedCapabilityObservationReplayStoreV1::open()
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let derivation = crate::protected_capability_observation::derive_same_child_capability_prelude_v1(
+                    &replay,
+                    request,
+                    &startup_continuation,
+                    context.installation.identity.as_str(),
+                    &capability_context,
+                    &mut observation,
+                )
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let response = derivation.response.clone();
+                let prelude = derivation.prelude.clone();
+                *same_child_prelude.borrow_mut() = Some((derivation, observation));
+                Ok((response, prelude))
+            }
+        },
         |request, _| {
             #[cfg(not(feature = "protected-attestor"))]
             {
@@ -668,9 +773,15 @@ fn execute_selected_boundary(
                 let reservation = replay
                     .reserve(request, &startup_continuation)
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let response = stores
+                let response = match stores
                     .respond_to_authority_snapshot_v1(request, &startup_continuation)
-                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                {
+                    Ok(response) => response,
+                    Err(_) => {
+                        let _ = replay.refuse(&reservation);
+                        return Err(PreparedChildError::AuthorizationAdmissionMismatch);
+                    }
+                };
                 *snapshot_exchange.borrow_mut() =
                     Some((reservation, request.clone(), response.clone()));
                 Ok(response)
@@ -729,15 +840,14 @@ fn execute_selected_boundary(
                 let cgroup =
                     crate::protected_launcher_capability::RetainedInvocationCgroupV1::open(&scope)
                         .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let selected_session = selected_session
-                    .try_clone()
-                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
                 let mut observation = crate::protected_launcher_capability::RetainedProtectedLauncherObservationV1::observe(
                     stores
                         .try_clone()
                         .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?,
                     cgroup,
-                    selected_session,
+                    selected_session
+                        .try_clone()
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?,
                 )
                 .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
                 let launcher_profile_identity =
@@ -776,125 +886,115 @@ fn execute_selected_boundary(
                 .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)
             }
         },
-        |request, selected_session| {
+        |request, _selected_session| {
             #[cfg(not(feature = "protected-attestor"))]
             {
-                let _ = (request, selected_session);
+                let _ = (request, _selected_session);
                 Err(PreparedChildError::AuthorizationAdmissionMismatch)
             }
             #[cfg(feature = "protected-attestor")]
             {
+                let replay = context
+                    .authority_snapshot_replay
+                    .as_ref()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
                 let (reservation, snapshot_request, snapshot_response) = snapshot_exchange
                     .borrow_mut()
                     .take()
                     .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let stores = context
-                    .protected_authority_stores
-                    .as_ref()
-                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let authority =
-                    crate::installation_manifest::load_protected_launcher_authority_context(
-                        context.config,
-                        context.launcher_executable,
+                let result = (|| {
+                    let authority =
+                        crate::installation_manifest::load_protected_launcher_authority_context(
+                            context.config,
+                            context.launcher_executable,
+                        )
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let authority = crate::protected_launcher_capability::RetainedProtectedLauncherAuthorityContextV1::acquire(
+                        authority,
+                        context.boot_file
+                            .try_clone()
+                            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?,
                     )
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let authority = crate::protected_launcher_capability::RetainedProtectedLauncherAuthorityContextV1::acquire(
-                    authority,
-                    context.boot_file
-                        .try_clone()
-                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?,
-                )
-                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let runtime_identity =
-                    verify_systemd_runtime(context.config, context.installation, &scope)
+                    let runtime_identity =
+                        verify_systemd_runtime(context.config, context.installation, &scope)
+                            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let mut evidence =
+                        crate::closed_profile_observations::collect_live_closed_profile_evidence(
+                            context.config,
+                            context.installation,
+                            context.mapping,
+                            stream,
+                            context.peer,
+                            &child_record,
+                            &scope,
+                            &process_posture,
+                            runtime_identity.as_str(),
+                        )
                         .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let mut evidence =
-                    crate::closed_profile_observations::collect_live_closed_profile_evidence(
+                    let launcher_instance = collect_launcher_instance(
                         context.config,
-                        context.installation,
-                        context.mapping,
-                        stream,
-                        context.peer,
+                        &principal_mapping,
                         &child_record,
                         &scope,
                         &process_posture,
-                        runtime_identity.as_str(),
+                        &mut evidence,
                     )
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let launcher_instance = collect_launcher_instance(
-                    context.config,
-                    &principal_mapping,
-                    &child_record,
-                    &scope,
-                    &process_posture,
-                    &mut evidence,
-                )
-                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let cgroup =
-                    crate::protected_launcher_capability::RetainedInvocationCgroupV1::open(&scope)
+                    let (prelude, mut observation) = same_child_prelude
+                        .borrow_mut()
+                        .take()
+                        .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let launcher_profile_identity =
+                        systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
+                            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let launcher_executable_identity = context
+                        .installation
+                        .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
                         .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let selected_session = selected_session
-                    .try_clone()
+                    let capability_context =
+                        crate::protected_launcher_capability::ProtectedLauncherCapabilityContextV1 {
+                            request: context.launcher_request,
+                            child: &child_record,
+                            scope: &scope,
+                            principal_mapping: &principal_mapping,
+                            process_posture: &process_posture,
+                            launcher_instance: &launcher_instance,
+                            launcher_executable_identity,
+                            launcher_configuration_identity: context.config.identity.as_str(),
+                            launcher_service_binding_identity: context
+                                .config
+                                .service_unit_identity
+                                .as_str(),
+                            launcher_profile_identity: launcher_profile_identity.as_str(),
+                            service_uid: unsafe { libc::geteuid() },
+                            service_gid: unsafe { libc::getegid() },
+                            authority: &authority,
+                        };
+                    let response = crate::protected_capability_observation::derive_secret_delivery_transaction_binding_v2(
+                        request,
+                        &snapshot_request,
+                        &snapshot_response,
+                        &startup_continuation,
+                        context.installation.identity.as_str(),
+                        &prelude,
+                        &capability_context,
+                        &mut observation,
+                    )
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let mut observation = crate::protected_launcher_capability::RetainedProtectedLauncherObservationV1::observe(
-                    stores
-                        .try_clone()
-                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?,
-                    cgroup,
-                    selected_session,
-                )
-                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let launcher_profile_identity =
-                    systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
-                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let launcher_executable_identity = context
-                    .installation
-                    .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
-                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let capability_context =
-                    crate::protected_launcher_capability::ProtectedLauncherCapabilityContextV1 {
-                        request: context.launcher_request,
-                        child: &child_record,
-                        scope: &scope,
-                        principal_mapping: &principal_mapping,
-                        process_posture: &process_posture,
-                        launcher_instance: &launcher_instance,
-                        launcher_executable_identity,
-                        launcher_configuration_identity: context.config.identity.as_str(),
-                        launcher_service_binding_identity: context
-                            .config
-                            .service_unit_identity
-                            .as_str(),
-                        launcher_profile_identity: launcher_profile_identity.as_str(),
-                        service_uid: unsafe { libc::geteuid() },
-                        service_gid: unsafe { libc::getegid() },
-                        authority: &authority,
-                    };
-                let replay = crate::protected_capability_observation::ProtectedCapabilityObservationReplayStoreV1::open()
-                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let response = crate::protected_capability_observation::derive_secret_delivery_transaction_binding_v2(
-                    &replay,
-                    request,
-                    &snapshot_request,
-                    &snapshot_response,
-                    &startup_continuation,
-                    context.installation.identity.as_str(),
-                    &capability_context,
-                    &mut observation,
-                )
-                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                context
-                    .authority_snapshot_replay
-                    .as_ref()
-                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?
-                    .consume(
+                    replay.consume(
                         &reservation,
                         &snapshot_response,
                         request,
                         &response,
                     )
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                Ok(response)
+                    Ok(response)
+                })();
+                if result.is_err() {
+                    let _ = replay.refuse(&reservation);
+                }
+                result
             }
         },
         |completion| {
@@ -906,6 +1006,13 @@ fn execute_selected_boundary(
                     .map_err(|_| PreparedChildError::ExecutionCompletionPersistenceFailed)
         },
     );
+    #[cfg(feature = "protected-attestor")]
+    if completion.is_err()
+        && let Some((reservation, _, _)) = snapshot_exchange.borrow_mut().take()
+        && let Some(replay) = context.authority_snapshot_replay.as_ref()
+    {
+        let _ = replay.refuse(&reservation);
+    }
     let (completion, observed_exit_code) = match completion {
         Ok(completion) => completion,
         Err(error) => {
