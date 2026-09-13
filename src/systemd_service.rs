@@ -1171,13 +1171,25 @@ fn retain_finalization_intent(
 
 fn prepared_child_error_reason(error: &PreparedChildError) -> &'static str {
     match error {
+        PreparedChildError::InvalidInputs => "child_inputs_invalid",
+        PreparedChildError::ForkFailed => "child_create_failed",
+        PreparedChildError::StopFailed => "child_stop_failed",
+        PreparedChildError::ExitedBeforeStop => "child_exited_before_stop",
+        PreparedChildError::IdentityUnavailable => "child_identity_unavailable",
+        PreparedChildError::ResumeFailed => "child_resume_failed",
+        PreparedChildError::PostureUnavailable => "child_posture_unavailable",
+        PreparedChildError::PostureMismatch => "child_posture_mismatch",
+        PreparedChildError::AttestationBridgeUnavailable => "attestation_bridge_unavailable",
+        PreparedChildError::AuthorizationAdmissionMismatch => "authorization_admission_mismatch",
+        PreparedChildError::AuthorizationDecisionBridgeUnavailable => {
+            "authorization_decision_bridge_unavailable"
+        }
         PreparedChildError::ExecutionCompletionUnavailable => "completion_unavailable",
         PreparedChildError::ExecutionCompletionIdentityMismatch => "completion_identity_mismatch",
         PreparedChildError::ExecutionCompletionPersistenceFailed => "completion_persistence_failed",
         PreparedChildError::ExecutionCompletionExitMismatch => "completion_exit_mismatch",
         PreparedChildError::OutputBridgeUnavailable => "output_bridge_unavailable",
         PreparedChildError::CleanupFailed => "child_reap_failed",
-        _ => "child_boundary_failed",
     }
 }
 
@@ -3386,6 +3398,69 @@ mod tests {
             map_prepared_child_error(PreparedChildError::AuthorizationAdmissionMismatch),
             SystemdServiceError::PreAuthorizationProtocolRefused
         ));
+    }
+
+    #[test]
+    fn prepared_child_diagnostics_distinguish_fail_closed_boundaries() {
+        let cases = [
+            (PreparedChildError::InvalidInputs, "child_inputs_invalid"),
+            (PreparedChildError::ForkFailed, "child_create_failed"),
+            (PreparedChildError::StopFailed, "child_stop_failed"),
+            (
+                PreparedChildError::ExitedBeforeStop,
+                "child_exited_before_stop",
+            ),
+            (
+                PreparedChildError::IdentityUnavailable,
+                "child_identity_unavailable",
+            ),
+            (PreparedChildError::CleanupFailed, "child_reap_failed"),
+            (PreparedChildError::ResumeFailed, "child_resume_failed"),
+            (
+                PreparedChildError::PostureUnavailable,
+                "child_posture_unavailable",
+            ),
+            (
+                PreparedChildError::PostureMismatch,
+                "child_posture_mismatch",
+            ),
+            (
+                PreparedChildError::AttestationBridgeUnavailable,
+                "attestation_bridge_unavailable",
+            ),
+            (
+                PreparedChildError::AuthorizationAdmissionMismatch,
+                "authorization_admission_mismatch",
+            ),
+            (
+                PreparedChildError::AuthorizationDecisionBridgeUnavailable,
+                "authorization_decision_bridge_unavailable",
+            ),
+            (
+                PreparedChildError::ExecutionCompletionUnavailable,
+                "completion_unavailable",
+            ),
+            (
+                PreparedChildError::ExecutionCompletionIdentityMismatch,
+                "completion_identity_mismatch",
+            ),
+            (
+                PreparedChildError::ExecutionCompletionPersistenceFailed,
+                "completion_persistence_failed",
+            ),
+            (
+                PreparedChildError::ExecutionCompletionExitMismatch,
+                "completion_exit_mismatch",
+            ),
+            (
+                PreparedChildError::OutputBridgeUnavailable,
+                "output_bridge_unavailable",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(prepared_child_error_reason(&error), expected);
+        }
     }
 
     #[test]

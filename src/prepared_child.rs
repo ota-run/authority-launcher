@@ -695,11 +695,13 @@ impl PreparedChild {
                 Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST),
             ) => {
                 relay_state = advance_secret_delivery_relay_state(relay_state, message_kind)?;
+                pressure_v3_stage("secret_binding_v1_request_received");
                 let request = serde_json::from_value(first)
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
                 let response = bind_secret_delivery(&request, &self.launcher_session)?;
                 write_json_frame_blocking(&mut self.launcher_session, &response)
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                pressure_v3_stage("secret_binding_v1_response_sent");
                 let value = read_json_frame_blocking(&mut self.launcher_session)
                     .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
                 parse_completion_for_state(value, relay_state)?
@@ -709,14 +711,20 @@ impl PreparedChild {
                 Some(PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_REQUEST),
             ) => {
                 relay_state = advance_secret_delivery_relay_state(relay_state, message_kind)?;
+                pressure_v3_stage("capability_observation_request_received");
                 let request = serde_json::from_value(first)
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
                 let (response, prelude) =
-                    observe_same_child_capability(&request, &self.launcher_session)?;
+                    observe_same_child_capability(&request, &self.launcher_session).inspect_err(
+                        |_| {
+                            pressure_v3_stage("capability_observation_refused");
+                        },
+                    )?;
                 write_json_frame_blocking(&mut self.launcher_session, &response)
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
                 write_json_frame_blocking(&mut self.launcher_session, &prelude)
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                pressure_v3_stage("capability_observation_response_sent");
                 let snapshot: serde_json::Value =
                     read_json_frame_blocking(&mut self.launcher_session)
                         .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
@@ -726,11 +734,16 @@ impl PreparedChild {
                         .get("message_kind")
                         .and_then(serde_json::Value::as_str),
                 )?;
+                pressure_v3_stage("authority_snapshot_request_received");
                 let request = serde_json::from_value(snapshot)
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let response = respond_authority_snapshot(&request, &self.launcher_session)?;
+                let response = respond_authority_snapshot(&request, &self.launcher_session)
+                    .inspect_err(|_| {
+                        pressure_v3_stage("authority_snapshot_refused");
+                    })?;
                 write_json_frame_blocking(&mut self.launcher_session, &response)
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                pressure_v3_stage("authority_snapshot_response_sent");
                 let binding: serde_json::Value =
                     read_json_frame_blocking(&mut self.launcher_session)
                         .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
@@ -740,11 +753,16 @@ impl PreparedChild {
                         .get("message_kind")
                         .and_then(serde_json::Value::as_str),
                 )?;
+                pressure_v3_stage("secret_binding_v2_request_received");
                 let request = serde_json::from_value(binding)
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let response = bind_snapshot_secret_delivery(&request, &self.launcher_session)?;
+                let response = bind_snapshot_secret_delivery(&request, &self.launcher_session)
+                    .inspect_err(|_| {
+                        pressure_v3_stage("secret_binding_v2_refused");
+                    })?;
                 write_json_frame_blocking(&mut self.launcher_session, &response)
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                pressure_v3_stage("secret_binding_v2_response_sent");
                 let value = read_json_frame_blocking(&mut self.launcher_session)
                     .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
                 parse_completion_for_state(value, relay_state)?
