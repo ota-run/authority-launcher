@@ -32,7 +32,7 @@ use std::process::Command;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use ota_authority_protocol::{
     ATTESTATION_RESPONSE_DOMAIN_V3, AUTHORIZATION_DECISION_DOMAIN_V1,
     AUTHORIZATION_REQUEST_DOMAIN_V1, BROKER_BINDING_IDENTITY_DOMAIN_V1,
@@ -43,17 +43,28 @@ use ota_authority_protocol::{
     PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_PROJECTION_KEY_USAGE_V1,
     PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_SIGNATURE_DOMAIN_V1,
     PROTECTED_LAUNCHER_CAPABILITY_PROJECTION_VERIFIER, PROTECTED_LAUNCHER_IMPLEMENTATION_SUBJECT,
+    PROTECTED_SECRET_DELIVERY_BINDING_BUNDLE,
+    PROTECTED_SECRET_DELIVERY_BINDING_BUNDLE_KEY_USAGE_V1,
+    PROTECTED_SECRET_DELIVERY_BINDING_BUNDLE_SIGNATURE_DOMAIN_V1,
+    PROTECTED_SECRET_DELIVERY_BINDING_BUNDLE_VERIFIER, PROTECTED_SECRET_DELIVERY_VERIFIER_STORE,
     ProtectedLauncherAuthorityContextV1, ProtectedLauncherCapabilityProjectionVerifierV1,
     ProtectedLauncherImplementationSubjectV1, ProtectedLauncherImplementationTargetV1,
-    RUNNER_ADMINISTRATOR_AUTHORITY, RunnerAdministratorAuthorityV1,
-    SYSTEMD_JOB_PRINCIPAL_PROFILE_ID_V2, SYSTEMD_LAUNCHER_PROFILE_ID_V4,
-    SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1,
-    SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3,
+    ProtectedSecretDeliveryBindingBundleV1, ProtectedSecretDeliveryBindingBundleVerifierV1,
+    ProtectedSecretDeliveryVerifierStoreV1, RUNNER_ADMINISTRATOR_AUTHORITY,
+    RunnerAdministratorAuthorityV1, SYSTEMD_JOB_PRINCIPAL_PROFILE_ID_V2,
+    SYSTEMD_LAUNCHER_PROFILE_ID_V4, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1,
+    SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1, SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3,
     launcher_attestation_producer_binding_v1_identity, launcher_working_directory_identity,
     message_identity, protected_launcher_authority_context_v1_identity,
     protected_launcher_capability_projection_key_identity_v1,
     protected_launcher_capability_projection_verifier_v1_identity,
     protected_launcher_implementation_subject_v1_identity,
+    protected_secret_delivery_binding_bundle_key_identity_v1,
+    protected_secret_delivery_binding_bundle_payload_v1_identity,
+    protected_secret_delivery_binding_bundle_signature_message_v1,
+    protected_secret_delivery_binding_bundle_v1_identity,
+    protected_secret_delivery_binding_bundle_verifier_v1_identity,
+    protected_secret_delivery_verifier_store_v1_identity,
     runner_administrator_authority_v1_identity, sha256_identity,
     systemd_job_principal_profile_identity, systemd_job_principal_profile_v2,
     systemd_launcher_profile_identity, systemd_launcher_profile_v4,
@@ -97,6 +108,10 @@ const ATTESTOR_CONFIG: &str = "/etc/ota/authority-attestor.json";
 const VERIFIER_SET: &str = "/etc/ota/authority-attestor-verifiers.json";
 const INSTALLATION_MANIFEST: &str = "/etc/ota/authority-launcher-installation.json";
 const PUBLIC_INSTALLATION_EVIDENCE_ROOT: &str = "/usr/share/ota/authority-launcher";
+const SECRET_DELIVERY_PRESSURE_INSTALLATION_EVIDENCE: &str =
+    "/usr/share/ota/authority-launcher/secret-delivery-pressure-installation.json";
+const SECRET_DELIVERY_PRESSURE_INSTALLATION_IDENTITY_DOMAIN_V1: &[u8] =
+    b"ota.authority-launcher.secret-delivery-pressure-installation.v1\0";
 const EMPTY_SECRET_DELIVERY_VERIFIER_SNAPSHOT: &[u8] = b"{\"schema_version\":1,\"verifiers\":[]}\n";
 const EMPTY_SECRET_DELIVERY_BINDING_SNAPSHOT: &[u8] = b"{\"schema_version\":1,\"bindings\":[]}\n";
 const PUBLIC_INSTALLATION_EVIDENCE: &str =
@@ -164,6 +179,36 @@ pub(crate) struct ProvisionRequest {
     pub pressure_client_binary: PathBuf,
     pub prepared_runner_binary: Option<PathBuf>,
     pub production_client: bool,
+    pub secret_delivery_pressure_builder_binary: Option<PathBuf>,
+    pub secret_delivery_pressure_request: Option<PathBuf>,
+}
+
+struct SecretDeliveryPressureFixture {
+    builder_binary: PathBuf,
+    request: PathBuf,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SecretDeliveryPressureInstallationV1 {
+    schema_version: u32,
+    record_kind: String,
+    request_identity: String,
+    authority_payload: serde_json::Value,
+    selected_process_environment: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PublicSecretDeliveryPressureInstallationV1 {
+    schema_version: u32,
+    record_kind: String,
+    identity: String,
+    core_source_revision: String,
+    builder_artifact_identity: String,
+    request_identity: String,
+    authority_posture: String,
+    selected_process_environment: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -260,6 +305,21 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
             Ok(protected)
         })
         .transpose()?;
+    let secret_delivery_pressure_fixture = match (
+        request.secret_delivery_pressure_builder_binary.as_deref(),
+        request.secret_delivery_pressure_request.as_deref(),
+    ) {
+        (Some(builder), Some(request_path)) => Some(SecretDeliveryPressureFixture {
+            builder_binary: protected_executable(builder)?,
+            request: protected_pressure_input(request_path)?,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(String::from(
+                "pressure authority builder and request must be supplied together",
+            ));
+        }
+    };
     let job_runner_binary = prepared_runner_binary
         .as_deref()
         .unwrap_or(pressure_client_binary.as_path())
@@ -287,16 +347,6 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     for (path, mode) in protected_directories() {
         create_root_directory(Path::new(path), mode)?;
     }
-    write_root_file(
-        &Path::new(SECRET_DELIVERY_AUTHORITY_DIRECTORY).join(SECRET_DELIVERY_VERIFIER_STORE),
-        EMPTY_SECRET_DELIVERY_VERIFIER_SNAPSHOT,
-        0o400,
-    )?;
-    write_root_file(
-        &Path::new(SECRET_DELIVERY_AUTHORITY_DIRECTORY).join(SECRET_DELIVERY_BINDING_STORE),
-        EMPTY_SECRET_DELIVERY_BINDING_SNAPSHOT,
-        0o400,
-    )?;
     create_root_directory(
         Path::new(POLKIT_RULE)
             .parent()
@@ -477,7 +527,6 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         &capability_projection_verifier,
         0o644,
     )?;
-
     let launcher_service_identity = sha256_file(Path::new(LAUNCHER_SERVICE))?;
     let launcher_socket_identity = sha256_file(Path::new(LAUNCHER_SOCKET_UNIT))?;
     let broker_service_identity = sha256_file(Path::new(BROKER_PROXY_SERVICE))?;
@@ -491,6 +540,19 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
             .map_err(|_| String::from("job profile identity unavailable"))?;
     let launcher_artifact_identity = sha256_file(&launcher_binary)?;
     let ota_artifact_identity = sha256_file(&ota_binary)?;
+    let core_build_identity = protected_launcher_installed_build_identity(
+        "core",
+        "https://github.com/ota-run/ota",
+        &source_revisions.1,
+        &ota_artifact_identity,
+    )
+    .map_err(|_| String::from("Core build identity unavailable"))?;
+    let secret_delivery_pressure_environment = install_secret_delivery_authority(
+        secret_delivery_pressure_fixture.as_ref(),
+        &source_revisions.1,
+        &core_build_identity,
+        &ota_artifact_identity,
+    )?;
     let mut runner_administrator = RunnerAdministratorAuthorityV1 {
         schema_version: 1,
         record_kind: RUNNER_ADMINISTRATOR_AUTHORITY.into(),
@@ -519,13 +581,7 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
             &launcher_artifact_identity,
         )
         .map_err(|_| String::from("launcher build identity unavailable"))?,
-        core_build_identity: protected_launcher_installed_build_identity(
-            "core",
-            "https://github.com/ota-run/ota",
-            &source_revisions.1,
-            &ota_artifact_identity,
-        )
-        .map_err(|_| String::from("Core build identity unavailable"))?,
+        core_build_identity,
         launcher_artifact_identity,
         ota_artifact_identity,
         protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
@@ -573,7 +629,10 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
                 String::from("PATH"),
                 String::from("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
             ),
-        ]),
+        ])
+        .into_iter()
+        .chain(secret_delivery_pressure_environment)
+        .collect(),
         allowed_repository_roots: vec![repository_root.clone()],
         mappings: vec![SystemdPrincipalMappingV1 {
             authority_id: request.authority_id.clone(),
@@ -1273,6 +1332,255 @@ fn protected_executable(path: &Path) -> Result<PathBuf, String> {
         return Err(String::from("protected executable identity is invalid"));
     }
     Ok(path)
+}
+
+fn protected_pressure_input(path: &Path) -> Result<PathBuf, String> {
+    verify_root_protected_chain(path)?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| String::from("pressure authority request is unavailable"))?;
+    if canonical != path {
+        return Err(String::from(
+            "pressure authority request must not use an alias",
+        ));
+    }
+    let metadata = fs::symlink_metadata(&canonical)
+        .map_err(|_| String::from("pressure authority request is unavailable"))?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o777 != 0o400
+        || metadata.len() == 0
+        || metadata.len() > 64 * 1024
+    {
+        return Err(String::from(
+            "pressure authority request protection is invalid",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn install_secret_delivery_authority(
+    fixture: Option<&SecretDeliveryPressureFixture>,
+    core_source_revision: &str,
+    core_build_identity: &str,
+    ota_artifact_identity: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    let Some(fixture) = fixture else {
+        match fs::remove_file(SECRET_DELIVERY_PRESSURE_INSTALLATION_EVIDENCE) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(String::from(
+                    "stale pressure authority installation evidence is unavailable",
+                ));
+            }
+        }
+        write_root_file(
+            &Path::new(SECRET_DELIVERY_AUTHORITY_DIRECTORY).join(SECRET_DELIVERY_VERIFIER_STORE),
+            EMPTY_SECRET_DELIVERY_VERIFIER_SNAPSHOT,
+            0o400,
+        )?;
+        write_root_file(
+            &Path::new(SECRET_DELIVERY_AUTHORITY_DIRECTORY).join(SECRET_DELIVERY_BINDING_STORE),
+            EMPTY_SECRET_DELIVERY_BINDING_SNAPSHOT,
+            0o400,
+        )?;
+        return Ok(BTreeMap::new());
+    };
+
+    let signing_key = SigningKey::from_bytes(&random_seed()?);
+    let verifier = secret_delivery_authority_verifier(&signing_key)?;
+
+    let output = Command::new(&fixture.builder_binary)
+        .arg("--request")
+        .arg(&fixture.request)
+        .arg("--verifier-key-identity")
+        .arg(&verifier.key_identity)
+        .arg("--verifier-identity")
+        .arg(&verifier.identity)
+        .arg("--expected-core-source-revision")
+        .arg(core_source_revision)
+        .arg("--implementation-build-identity")
+        .arg(core_build_identity)
+        .arg("--implementation-artifact-identity")
+        .arg(ota_artifact_identity)
+        .env_clear()
+        .output()
+        .map_err(|_| String::from("pressure authority payload builder is unavailable"))?;
+    if !output.status.success() || output.stdout.is_empty() || output.stdout.len() > 1024 * 1024 {
+        return Err(String::from("pressure authority payload builder refused"));
+    }
+    let installation = parse_secret_delivery_pressure_installation(&output.stdout)?;
+
+    let now = u64::try_from(OffsetDateTime::now_utc().unix_timestamp())
+        .map_err(|_| String::from("pressure authority clock unavailable"))?;
+    let payload = serde_jcs::to_vec(&installation.authority_payload)
+        .map_err(|_| String::from("pressure authority payload is invalid"))?;
+    let (store, bundle) = secret_delivery_authority_records(&payload, now, &signing_key)?;
+
+    // Disable positive authority first so any interrupted paired update remains fail closed.
+    write_root_file(
+        &Path::new(SECRET_DELIVERY_AUTHORITY_DIRECTORY).join(SECRET_DELIVERY_VERIFIER_STORE),
+        EMPTY_SECRET_DELIVERY_VERIFIER_SNAPSHOT,
+        0o400,
+    )?;
+    write_root_file(
+        &Path::new(SECRET_DELIVERY_AUTHORITY_DIRECTORY).join(SECRET_DELIVERY_BINDING_STORE),
+        &serde_jcs::to_vec(&bundle)
+            .map_err(|_| String::from("pressure authority bundle unavailable"))?,
+        0o400,
+    )?;
+    let mut public_evidence = PublicSecretDeliveryPressureInstallationV1 {
+        schema_version: 1,
+        record_kind: String::from("secret_delivery_pressure_public_installation_evidence"),
+        identity: String::new(),
+        core_source_revision: core_source_revision.into(),
+        builder_artifact_identity: sha256_file(&fixture.builder_binary)?,
+        request_identity: installation.request_identity,
+        authority_posture: String::from("synthetic_provider_free_installed"),
+        selected_process_environment: installation.selected_process_environment.clone(),
+    };
+    public_evidence.identity =
+        public_secret_delivery_pressure_installation_identity(&public_evidence)?;
+    write_json(
+        Path::new(SECRET_DELIVERY_PRESSURE_INSTALLATION_EVIDENCE),
+        &public_evidence,
+        0o644,
+    )?;
+    // Activating the verifier is the final write; every earlier failure leaves authority disabled.
+    write_root_file(
+        &Path::new(SECRET_DELIVERY_AUTHORITY_DIRECTORY).join(SECRET_DELIVERY_VERIFIER_STORE),
+        &serde_jcs::to_vec(&store)
+            .map_err(|_| String::from("pressure authority store unavailable"))?,
+        0o400,
+    )?;
+    Ok(installation.selected_process_environment)
+}
+
+fn parse_secret_delivery_pressure_installation(
+    bytes: &[u8],
+) -> Result<SecretDeliveryPressureInstallationV1, String> {
+    let installation: SecretDeliveryPressureInstallationV1 = serde_json::from_slice(bytes)
+        .map_err(|_| String::from("pressure authority payload is invalid"))?;
+    if serde_jcs::to_vec(&installation)
+        .map_err(|_| String::from("pressure authority payload is invalid"))?
+        != bytes
+        || installation.schema_version != 1
+        || installation.record_kind != "secret_delivery_pressure_authority_installation"
+        || installation
+            .selected_process_environment
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            != [
+                "GITHUB_RUN_ATTEMPT",
+                "GITHUB_RUN_ID",
+                "GITHUB_WORKFLOW_REF",
+                "OTA_CAPABILITY_OBSERVATION_RUNNER_VERSION",
+            ]
+        || installation
+            .selected_process_environment
+            .values()
+            .any(String::is_empty)
+    {
+        return Err(String::from(
+            "pressure authority payload is not canonical JSON",
+        ));
+    }
+    Ok(installation)
+}
+
+fn public_secret_delivery_pressure_installation_identity(
+    evidence: &PublicSecretDeliveryPressureInstallationV1,
+) -> Result<String, String> {
+    let mut canonical = evidence.clone();
+    canonical.identity.clear();
+    message_identity(
+        SECRET_DELIVERY_PRESSURE_INSTALLATION_IDENTITY_DOMAIN_V1,
+        &canonical,
+    )
+    .map_err(|_| String::from("pressure authority installation identity unavailable"))
+}
+
+fn secret_delivery_authority_verifier(
+    signing_key: &SigningKey,
+) -> Result<ProtectedSecretDeliveryBindingBundleVerifierV1, String> {
+    let public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes());
+    let mut verifier = ProtectedSecretDeliveryBindingBundleVerifierV1 {
+        schema_version: 1,
+        record_kind: PROTECTED_SECRET_DELIVERY_BINDING_BUNDLE_VERIFIER.into(),
+        identity: String::new(),
+        public_key: public_key.clone(),
+        key_identity: protected_secret_delivery_binding_bundle_key_identity_v1(&public_key)
+            .map_err(|_| String::from("pressure authority key identity unavailable"))?,
+        key_usage: PROTECTED_SECRET_DELIVERY_BINDING_BUNDLE_KEY_USAGE_V1.into(),
+        signature_domain: std::str::from_utf8(
+            PROTECTED_SECRET_DELIVERY_BINDING_BUNDLE_SIGNATURE_DOMAIN_V1,
+        )
+        .map_err(|_| String::from("pressure authority signature domain unavailable"))?
+        .into(),
+    };
+    verifier.identity = protected_secret_delivery_binding_bundle_verifier_v1_identity(&verifier)
+        .map_err(|_| String::from("pressure authority verifier identity unavailable"))?;
+    Ok(verifier)
+}
+
+fn secret_delivery_authority_records(
+    payload: &[u8],
+    now: u64,
+    signing_key: &SigningKey,
+) -> Result<
+    (
+        ProtectedSecretDeliveryVerifierStoreV1,
+        ProtectedSecretDeliveryBindingBundleV1,
+    ),
+    String,
+> {
+    let verifier = secret_delivery_authority_verifier(signing_key)?;
+    let mut bundle = ProtectedSecretDeliveryBindingBundleV1 {
+        schema_version: 1,
+        record_kind: PROTECTED_SECRET_DELIVERY_BINDING_BUNDLE.into(),
+        identity: String::new(),
+        authority_id: String::from("ota-secret-delivery"),
+        generation: 1,
+        issued_at_unix_seconds: now.saturating_sub(60),
+        expires_at_unix_seconds: now
+            .checked_add(3600)
+            .ok_or_else(|| String::from("pressure authority lifetime unavailable"))?,
+        verifier_identity: verifier.identity.clone(),
+        payload: URL_SAFE_NO_PAD.encode(payload),
+        payload_identity: protected_secret_delivery_binding_bundle_payload_v1_identity(payload)
+            .map_err(|_| String::from("pressure authority payload identity unavailable"))?,
+        signature: URL_SAFE_NO_PAD.encode([0_u8; 64]),
+    };
+    bundle.identity = protected_secret_delivery_binding_bundle_v1_identity(&bundle)
+        .map_err(|_| String::from("pressure authority bundle identity unavailable"))?;
+    bundle.signature = URL_SAFE_NO_PAD.encode(
+        signing_key
+            .sign(
+                &protected_secret_delivery_binding_bundle_signature_message_v1(
+                    bundle.identity.as_str(),
+                )
+                .map_err(|_| String::from("pressure authority signature input unavailable"))?,
+            )
+            .to_bytes(),
+    );
+    let mut store = ProtectedSecretDeliveryVerifierStoreV1 {
+        schema_version: 1,
+        record_kind: PROTECTED_SECRET_DELIVERY_VERIFIER_STORE.into(),
+        identity: String::new(),
+        authority_id: bundle.authority_id.clone(),
+        generation: 1,
+        not_before_unix_seconds: bundle.issued_at_unix_seconds,
+        not_after_unix_seconds: bundle.expires_at_unix_seconds,
+        verifiers: vec![verifier],
+        active_binding_bundle_identity: bundle.identity.clone(),
+        active_binding_bundle_generation: bundle.generation,
+    };
+    store.identity = protected_secret_delivery_verifier_store_v1_identity(&store)
+        .map_err(|_| String::from("pressure authority store identity unavailable"))?;
+    Ok((store, bundle))
 }
 
 fn create_root_directory(path: &Path, mode: u32) -> Result<(), String> {
@@ -2016,6 +2324,7 @@ fn run_systemctl(arguments: &[&str]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signature, Verifier};
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     #[test]
@@ -2033,6 +2342,130 @@ mod tests {
         assert!(validate_protected_launcher_core_version("1.6.27").is_err());
         assert!(validate_protected_launcher_core_version("1.7.0").is_err());
         assert!(validate_protected_launcher_core_version("stable").is_err());
+    }
+
+    #[test]
+    fn pressure_secret_delivery_authority_is_signed_and_active() {
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let payload =
+            br#"{"record_kind":"protected_secret_delivery_authority_payload","schema_version":1}"#;
+        let (store, bundle) =
+            secret_delivery_authority_records(payload, 1_788_800_000, &signing_key)
+                .expect("authority records");
+        assert_eq!(store.active_binding_bundle_identity, bundle.identity);
+        assert_eq!(store.active_binding_bundle_generation, bundle.generation);
+        assert_eq!(store.verifiers.len(), 1);
+        assert_eq!(store.verifiers[0].identity, bundle.verifier_identity);
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(bundle.payload.as_bytes())
+                .expect("payload"),
+            payload
+        );
+        let signature = URL_SAFE_NO_PAD
+            .decode(bundle.signature.as_bytes())
+            .expect("signature");
+        signing_key
+            .verifying_key()
+            .verify(
+                &protected_secret_delivery_binding_bundle_signature_message_v1(
+                    bundle.identity.as_str(),
+                )
+                .expect("signature message"),
+                &Signature::from_slice(&signature).expect("signature bytes"),
+            )
+            .expect("valid signature");
+    }
+
+    #[test]
+    fn pressure_secret_delivery_builder_output_is_closed_and_canonical() {
+        let environment = BTreeMap::from([
+            (String::from("GITHUB_RUN_ATTEMPT"), String::from("1")),
+            (String::from("GITHUB_RUN_ID"), String::from("2")),
+            (
+                String::from("GITHUB_WORKFLOW_REF"),
+                String::from("ota-run/ota/.github/workflows/test.yml@refs/heads/main"),
+            ),
+            (
+                String::from("OTA_CAPABILITY_OBSERVATION_RUNNER_VERSION"),
+                String::from("2.337.0"),
+            ),
+        ]);
+        let installation = SecretDeliveryPressureInstallationV1 {
+            schema_version: 1,
+            record_kind: String::from("secret_delivery_pressure_authority_installation"),
+            request_identity: format!("sha256:{}", "1".repeat(64)),
+            authority_payload: serde_json::json!({"schema_version": 1}),
+            selected_process_environment: environment,
+        };
+        let bytes = serde_jcs::to_vec(&installation).expect("canonical installation");
+        assert!(parse_secret_delivery_pressure_installation(&bytes).is_ok());
+
+        let mut unknown: serde_json::Value = serde_json::from_slice(&bytes).expect("installation");
+        unknown["unexpected"] = serde_json::Value::Bool(true);
+        assert!(
+            parse_secret_delivery_pressure_installation(
+                &serde_jcs::to_vec(&unknown).expect("unknown installation")
+            )
+            .is_err()
+        );
+
+        let mut widened: serde_json::Value = serde_json::from_slice(&bytes).expect("installation");
+        widened["selected_process_environment"]["GOOGLE_API_KEY"] =
+            serde_json::Value::String(String::from("not-a-secret"));
+        assert!(
+            parse_secret_delivery_pressure_installation(
+                &serde_jcs::to_vec(&widened).expect("widened installation")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn public_pressure_installation_is_closed_and_identity_bound() {
+        let mut evidence = PublicSecretDeliveryPressureInstallationV1 {
+            schema_version: 1,
+            record_kind: String::from("secret_delivery_pressure_public_installation_evidence"),
+            identity: String::new(),
+            core_source_revision: "a".repeat(40),
+            builder_artifact_identity: format!("sha256:{}", "2".repeat(64)),
+            request_identity: format!("sha256:{}", "3".repeat(64)),
+            authority_posture: String::from("synthetic_provider_free_installed"),
+            selected_process_environment: BTreeMap::from([
+                (String::from("GITHUB_RUN_ATTEMPT"), String::from("1")),
+                (String::from("GITHUB_RUN_ID"), String::from("2")),
+                (
+                    String::from("GITHUB_WORKFLOW_REF"),
+                    String::from("workflow"),
+                ),
+                (
+                    String::from("OTA_CAPABILITY_OBSERVATION_RUNNER_VERSION"),
+                    String::from("2.337.0"),
+                ),
+            ]),
+        };
+        evidence.identity =
+            public_secret_delivery_pressure_installation_identity(&evidence).expect("identity");
+        let bytes = serde_jcs::to_vec(&evidence).expect("evidence");
+        let parsed: PublicSecretDeliveryPressureInstallationV1 =
+            serde_json::from_slice(&bytes).expect("closed evidence");
+        assert_eq!(
+            public_secret_delivery_pressure_installation_identity(&parsed).expect("identity"),
+            parsed.identity
+        );
+
+        let mut substituted = parsed.clone();
+        substituted.core_source_revision = "b".repeat(40);
+        assert_ne!(
+            public_secret_delivery_pressure_installation_identity(&substituted).expect("identity"),
+            substituted.identity
+        );
+
+        let mut unknown: serde_json::Value = serde_json::from_slice(&bytes).expect("evidence");
+        unknown["unexpected"] = serde_json::Value::Bool(true);
+        assert!(
+            serde_json::from_value::<PublicSecretDeliveryPressureInstallationV1>(unknown).is_err()
+        );
     }
 
     #[test]
