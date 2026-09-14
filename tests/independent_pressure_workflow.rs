@@ -44,6 +44,26 @@ fn same_child_bindings_use_canonical_public_installation_evidence() {
 }
 
 #[test]
+fn same_child_v2_reuses_the_prelude_authority_context() {
+    let selected_boundary = SYSTEMD_SERVICE_SOURCE
+        .split_once("fn execute_selected_boundary(")
+        .expect("selected boundary function")
+        .1
+        .split_once("\nfn ")
+        .expect("next function boundary")
+        .0;
+    assert_eq!(
+        selected_boundary
+            .matches("RetainedProtectedLauncherAuthorityContextV1::acquire(")
+            .count(),
+        2,
+        "only the prelude and legacy V1 path may acquire authority; V2 must reuse the prelude context",
+    );
+    assert!(selected_boundary.contains("Some((derivation, observation, authority))"));
+    assert!(selected_boundary.contains("let (prelude, mut observation, authority)"));
+}
+
+#[test]
 fn independent_pressure_workflow_retains_a_narrow_drift_guard() {
     // This is review-oriented drift detection for the committed workflow, not a sandbox. Runtime
     // separation comes from the protected runner principal, systemd unit, and authority paths.

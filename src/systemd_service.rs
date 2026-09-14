@@ -755,7 +755,9 @@ fn execute_selected_boundary(
                 .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
                 let response = derivation.response.clone();
                 let prelude = derivation.prelude.clone();
-                *same_child_prelude.borrow_mut() = Some((derivation, observation));
+                // The capability identity binds the acquisition nonce. Retain the exact authority
+                // context so V2 rederives the same-child capability instead of creating a new one.
+                *same_child_prelude.borrow_mut() = Some((derivation, observation, authority));
                 Ok((response, prelude))
             }
         },
@@ -913,19 +915,6 @@ fn execute_selected_boundary(
                     .take()
                     .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
                 let result = (|| {
-                    let authority =
-                        crate::installation_manifest::load_protected_launcher_authority_context(
-                            context.config,
-                            context.launcher_executable,
-                        )
-                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                    let authority = crate::protected_launcher_capability::RetainedProtectedLauncherAuthorityContextV1::acquire(
-                        authority,
-                        context.boot_file
-                            .try_clone()
-                            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?,
-                    )
-                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
                     let runtime_identity =
                         verify_systemd_runtime(context.config, context.installation, &scope)
                             .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
@@ -951,7 +940,7 @@ fn execute_selected_boundary(
                         &mut evidence,
                     )
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                    let (prelude, mut observation) = same_child_prelude
+                    let (prelude, mut observation, authority) = same_child_prelude
                         .borrow_mut()
                         .take()
                         .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
