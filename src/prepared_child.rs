@@ -29,10 +29,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -75,6 +75,7 @@ use ota_authority_protocol::{
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::config::{RunAs, SystemdLauncherServiceConfigV1};
@@ -124,6 +125,7 @@ pub(crate) struct PreparedChild {
     pid: libc::pid_t,
     pub record: LauncherChildProcessV1,
     launcher_session: UnixStream,
+    selected_session_object: DescriptorObject,
     stdout: Option<OwnedFd>,
     stderr: Option<OwnedFd>,
 }
@@ -586,9 +588,8 @@ impl PreparedChild {
     ) -> Result<OtaProcessPostureV1, PreparedChildError> {
         let posture = receive_process_posture(&mut self.launcher_session, timeout)?;
         validate_process_posture(&posture, &self.record, expected_principal_mapping_identity)?;
-        if process_start_identity(self.pid)? != self.record.process_start_time_identity {
-            return Err(PreparedChildError::PostureMismatch);
-        }
+        verify_running_child_identity(self.pid, &self.record, self.selected_session_object)?;
+        pressure_v3_stage("selected_child_runtime_identity_reconciled");
         Ok(posture)
     }
 
@@ -1038,6 +1039,7 @@ pub(crate) fn prepare_stopped_child(
         UnixStream::pair().map_err(|_| PreparedChildError::ForkFailed)?;
     set_cloexec(launcher_session.as_raw_fd())?;
     set_cloexec(child_session.as_raw_fd())?;
+    let selected_session_object = descriptor_object(child_session.as_raw_fd())?;
     let null = open_null()?;
     let (stdout, child_stdout) = pipe_cloexec()?;
     let (stderr, child_stderr) = pipe_cloexec()?;
@@ -1061,7 +1063,7 @@ pub(crate) fn prepare_stopped_child(
         ),
         (
             SYSTEMD_OTA_SESSION_DESCRIPTOR,
-            descriptor_object(child_session.as_raw_fd())?,
+            selected_session_object,
             false,
         ),
         (
@@ -1148,6 +1150,7 @@ pub(crate) fn prepare_stopped_child(
         pid: child_pid,
         record,
         launcher_session,
+        selected_session_object,
         stdout: Some(stdout),
         stderr: Some(stderr),
     })
@@ -1606,6 +1609,69 @@ fn descriptor_object(descriptor: RawFd) -> Result<DescriptorObject, PreparedChil
     })
 }
 
+fn verify_running_child_identity(
+    pid: libc::pid_t,
+    child: &LauncherChildProcessV1,
+    expected_session_object: DescriptorObject,
+) -> Result<(), PreparedChildError> {
+    let process_start_time_identity = process_start_identity(pid)?;
+    let session_metadata =
+        std::fs::metadata(format!("/proc/{pid}/fd/{SYSTEMD_OTA_SESSION_DESCRIPTOR}"))
+            .map_err(|_| PreparedChildError::PostureMismatch)?;
+    let observed_session_object = DescriptorObject {
+        device: session_metadata.dev(),
+        inode: session_metadata.ino(),
+        file_type: session_metadata.mode() & libc::S_IFMT,
+    };
+    let session_cloexec = descriptor_cloexec(pid, SYSTEMD_OTA_SESSION_DESCRIPTOR)?;
+    let mut executable = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(format!("/proc/{pid}/exe"))
+        .map_err(|_| PreparedChildError::PostureMismatch)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = executable
+            .read(&mut buffer)
+            .map_err(|_| PreparedChildError::PostureMismatch)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let executable_identity = format!("sha256:{:x}", digest.finalize());
+    if process_start_identity(pid)? != process_start_time_identity {
+        return Err(PreparedChildError::PostureMismatch);
+    }
+    reconcile_running_child_identity(
+        child,
+        process_start_time_identity.as_str(),
+        executable_identity.as_str(),
+        expected_session_object,
+        observed_session_object,
+        session_cloexec,
+    )
+}
+
+fn reconcile_running_child_identity(
+    child: &LauncherChildProcessV1,
+    process_start_time_identity: &str,
+    executable_identity: &str,
+    expected_session_object: DescriptorObject,
+    observed_session_object: DescriptorObject,
+    session_cloexec: bool,
+) -> Result<(), PreparedChildError> {
+    if process_start_time_identity != child.process_start_time_identity
+        || executable_identity != child.ota_binary_identity
+        || observed_session_object != expected_session_object
+        || session_cloexec
+    {
+        return Err(PreparedChildError::PostureMismatch);
+    }
+    Ok(())
+}
+
 fn descriptor_cloexec(pid: libc::pid_t, descriptor: RawFd) -> Result<bool, PreparedChildError> {
     let info = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{descriptor}"))
         .map_err(|_| PreparedChildError::IdentityUnavailable)?;
@@ -1752,6 +1818,89 @@ mod tests {
 
     fn identity(character: char) -> String {
         format!("sha256:{}", character.to_string().repeat(64))
+    }
+
+    fn test_descriptor_object() -> DescriptorObject {
+        DescriptorObject {
+            device: 1,
+            inode: 2,
+            file_type: libc::S_IFSOCK,
+        }
+    }
+
+    #[test]
+    fn running_child_identity_reconciliation_refuses_every_substitution() {
+        let session = test_descriptor_object();
+        let child = LauncherChildProcessV1 {
+            schema_version: 1,
+            identity: identity('1'),
+            invocation_id: String::from("invocation"),
+            request_identity: identity('2'),
+            pid: 41,
+            process_start_time_identity: identity('3'),
+            ota_binary_identity: identity('4'),
+            principal_mapping_identity: identity('5'),
+            working_directory_identity: identity('6'),
+        };
+
+        assert_eq!(
+            reconcile_running_child_identity(
+                &child,
+                child.process_start_time_identity.as_str(),
+                child.ota_binary_identity.as_str(),
+                session,
+                session,
+                false,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            reconcile_running_child_identity(
+                &child,
+                identity('7').as_str(),
+                child.ota_binary_identity.as_str(),
+                session,
+                session,
+                false,
+            ),
+            Err(PreparedChildError::PostureMismatch)
+        );
+        assert_eq!(
+            reconcile_running_child_identity(
+                &child,
+                child.process_start_time_identity.as_str(),
+                identity('8').as_str(),
+                session,
+                session,
+                false,
+            ),
+            Err(PreparedChildError::PostureMismatch)
+        );
+        assert_eq!(
+            reconcile_running_child_identity(
+                &child,
+                child.process_start_time_identity.as_str(),
+                child.ota_binary_identity.as_str(),
+                session,
+                DescriptorObject {
+                    inode: 3,
+                    ..session
+                },
+                false,
+            ),
+            Err(PreparedChildError::PostureMismatch)
+        );
+        assert_eq!(
+            reconcile_running_child_identity(
+                &child,
+                child.process_start_time_identity.as_str(),
+                child.ota_binary_identity.as_str(),
+                session,
+                session,
+                true,
+            ),
+            Err(PreparedChildError::PostureMismatch)
+        );
     }
 
     #[cfg(feature = "systemd-pressure-faults")]
@@ -2209,6 +2358,7 @@ mod tests {
             pid: 0,
             record,
             launcher_session,
+            selected_session_object: test_descriptor_object(),
             stdout: None,
             stderr: None,
         };
@@ -2265,6 +2415,7 @@ mod tests {
             pid: 0,
             record: child_record,
             launcher_session,
+            selected_session_object: test_descriptor_object(),
             stdout: None,
             stderr: None,
         };
@@ -2334,6 +2485,7 @@ mod tests {
                 working_directory_identity: identity('d'),
             },
             launcher_session,
+            selected_session_object: test_descriptor_object(),
             stdout: None,
             stderr: None,
         };
@@ -2386,6 +2538,7 @@ mod tests {
             pid: 0,
             record: child.record.clone(),
             launcher_session,
+            selected_session_object: test_descriptor_object(),
             stdout: None,
             stderr: None,
         };
@@ -2425,6 +2578,7 @@ mod tests {
             pid: 0,
             record: child.record.clone(),
             launcher_session,
+            selected_session_object: test_descriptor_object(),
             stdout: None,
             stderr: None,
         };
@@ -2643,6 +2797,7 @@ mod tests {
                 working_directory_identity: identity('e'),
             },
             launcher_session,
+            selected_session_object: test_descriptor_object(),
             stdout: None,
             stderr: None,
         };
@@ -2819,6 +2974,7 @@ mod tests {
                 working_directory_identity: identity('e'),
             },
             launcher_session,
+            selected_session_object: test_descriptor_object(),
             stdout: Some(stdout),
             stderr: Some(stderr),
         };
@@ -2880,6 +3036,7 @@ mod tests {
                 ..child.record.clone()
             },
             launcher_session: direct_session,
+            selected_session_object: test_descriptor_object(),
             stdout: Some(direct_stdout),
             stderr: Some(direct_stderr),
         };
@@ -2930,6 +3087,7 @@ mod tests {
                 ..child.record.clone()
             },
             launcher_session: duplicate_session,
+            selected_session_object: test_descriptor_object(),
             stdout: Some(duplicate_stdout),
             stderr: Some(duplicate_stderr),
         };
@@ -2985,6 +3143,7 @@ mod tests {
                 ..child.record.clone()
             },
             launcher_session: malformed_session,
+            selected_session_object: test_descriptor_object(),
             stdout: Some(malformed_stdout),
             stderr: Some(malformed_stderr),
         };
@@ -3073,6 +3232,7 @@ mod tests {
                     ..child.record.clone()
                 },
                 launcher_session: sequence_session,
+                selected_session_object: test_descriptor_object(),
                 stdout: Some(sequence_stdout),
                 stderr: Some(sequence_stderr),
             };
@@ -3138,6 +3298,7 @@ mod tests {
                 ..child.record.clone()
             },
             launcher_session: direct_v2_session,
+            selected_session_object: test_descriptor_object(),
             stdout: Some(direct_v2_stdout),
             stderr: Some(direct_v2_stderr),
         };
@@ -3187,6 +3348,7 @@ mod tests {
                 working_directory_identity: identity('6'),
             },
             launcher_session,
+            selected_session_object: test_descriptor_object(),
             stdout: None,
             stderr: None,
         };
