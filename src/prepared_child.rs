@@ -903,17 +903,21 @@ fn authority_snapshot_request_shape_marker(value: &serde_json::Value) -> &'stati
     let Some(request) = value.as_object() else {
         return "authority_snapshot_request_not_object";
     };
-    if request
+    let has_unknown_field = request
         .keys()
-        .any(|field| !REQUEST_FIELDS.contains(&field.as_str()))
-    {
-        return "authority_snapshot_request_unknown_field";
-    }
+        .any(|field| !REQUEST_FIELDS.contains(&field.as_str()));
     let missing = REQUEST_FIELDS
         .iter()
         .copied()
         .filter(|field| !request.contains_key(*field))
         .collect::<Vec<_>>();
+    if has_unknown_field {
+        return match missing.as_slice() {
+            [] => "authority_snapshot_request_unknown_field_complete_required_shape",
+            ["challenge"] => "authority_snapshot_request_unknown_field_missing_only_challenge",
+            _ => "authority_snapshot_request_unknown_field_required_shape_incomplete",
+        };
+    }
     match missing.as_slice() {
         [] => "authority_snapshot_request_nested_or_value_invalid",
         // Field names are a closed protocol vocabulary, not protected request material.
@@ -1752,11 +1756,21 @@ mod tests {
             "authority_snapshot_request_multiple_required_fields_missing"
         );
 
-        let mut unknown = complete;
+        let mut unknown = complete.clone();
         unknown.insert("unexpected".into(), serde_json::Value::Null);
         assert_eq!(
             authority_snapshot_request_shape_marker(&serde_json::Value::Object(unknown)),
-            "authority_snapshot_request_unknown_field"
+            "authority_snapshot_request_unknown_field_complete_required_shape"
+        );
+
+        let mut unknown_missing_challenge = complete;
+        unknown_missing_challenge.remove("challenge");
+        unknown_missing_challenge.insert("unexpected".into(), serde_json::Value::Null);
+        assert_eq!(
+            authority_snapshot_request_shape_marker(&serde_json::Value::Object(
+                unknown_missing_challenge
+            )),
+            "authority_snapshot_request_unknown_field_missing_only_challenge"
         );
     }
 
