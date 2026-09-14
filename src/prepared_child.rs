@@ -1614,26 +1614,40 @@ fn verify_running_child_identity(
     child: &LauncherChildProcessV1,
     expected_session_object: DescriptorObject,
 ) -> Result<(), PreparedChildError> {
-    let process_start_time_identity = process_start_identity(pid)?;
+    let process_start_time_identity = process_start_identity(pid).inspect_err(|_| {
+        pressure_v3_stage("selected_child_runtime_start_identity_unavailable");
+    })?;
     let session_metadata =
         std::fs::metadata(format!("/proc/{pid}/fd/{SYSTEMD_OTA_SESSION_DESCRIPTOR}"))
+            .inspect_err(|_| {
+                pressure_v3_stage("selected_child_runtime_session_metadata_unavailable");
+            })
             .map_err(|_| PreparedChildError::PostureMismatch)?;
     let observed_session_object = DescriptorObject {
         device: session_metadata.dev(),
         inode: session_metadata.ino(),
         file_type: session_metadata.mode() & libc::S_IFMT,
     };
-    let session_cloexec = descriptor_cloexec(pid, SYSTEMD_OTA_SESSION_DESCRIPTOR)?;
+    let session_cloexec =
+        descriptor_cloexec(pid, SYSTEMD_OTA_SESSION_DESCRIPTOR).inspect_err(|_| {
+            pressure_v3_stage("selected_child_runtime_session_flags_unavailable");
+        })?;
     let mut executable = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC)
         .open(format!("/proc/{pid}/exe"))
+        .inspect_err(|_| {
+            pressure_v3_stage("selected_child_runtime_executable_unavailable");
+        })
         .map_err(|_| PreparedChildError::PostureMismatch)?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 16 * 1024];
     loop {
         let read = executable
             .read(&mut buffer)
+            .inspect_err(|_| {
+                pressure_v3_stage("selected_child_runtime_executable_read_failed");
+            })
             .map_err(|_| PreparedChildError::PostureMismatch)?;
         if read == 0 {
             break;
@@ -1641,9 +1655,21 @@ fn verify_running_child_identity(
         digest.update(&buffer[..read]);
     }
     let executable_identity = format!("sha256:{:x}", digest.finalize());
-    if process_start_identity(pid)? != process_start_time_identity {
+    if process_start_identity(pid).inspect_err(|_| {
+        pressure_v3_stage("selected_child_runtime_final_start_identity_unavailable");
+    })? != process_start_time_identity
+    {
+        pressure_v3_stage("selected_child_runtime_start_identity_changed");
         return Err(PreparedChildError::PostureMismatch);
     }
+    pressure_running_child_identity_mismatch(
+        child,
+        process_start_time_identity.as_str(),
+        executable_identity.as_str(),
+        expected_session_object,
+        observed_session_object,
+        session_cloexec,
+    );
     reconcile_running_child_identity(
         child,
         process_start_time_identity.as_str(),
@@ -1670,6 +1696,37 @@ fn reconcile_running_child_identity(
         return Err(PreparedChildError::PostureMismatch);
     }
     Ok(())
+}
+
+fn pressure_running_child_identity_mismatch(
+    child: &LauncherChildProcessV1,
+    process_start_time_identity: &str,
+    executable_identity: &str,
+    expected_session_object: DescriptorObject,
+    observed_session_object: DescriptorObject,
+    session_cloexec: bool,
+) {
+    #[cfg(feature = "systemd-pressure-faults")]
+    {
+        if process_start_time_identity != child.process_start_time_identity {
+            pressure_v3_stage("selected_child_runtime_start_identity_mismatch");
+        } else if executable_identity != child.ota_binary_identity {
+            pressure_v3_stage("selected_child_runtime_executable_identity_mismatch");
+        } else if observed_session_object != expected_session_object {
+            pressure_v3_stage("selected_child_runtime_session_object_mismatch");
+        } else if session_cloexec {
+            pressure_v3_stage("selected_child_runtime_session_cloexec_mismatch");
+        }
+    }
+    #[cfg(not(feature = "systemd-pressure-faults"))]
+    let _ = (
+        child,
+        process_start_time_identity,
+        executable_identity,
+        expected_session_object,
+        observed_session_object,
+        session_cloexec,
+    );
 }
 
 fn descriptor_cloexec(pid: libc::pid_t, descriptor: RawFd) -> Result<bool, PreparedChildError> {
