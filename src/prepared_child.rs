@@ -43,12 +43,12 @@ use ota_authority_protocol::{
     AUTHORIZATION_REQUEST, AUTHORIZATION_REQUEST_DOMAIN_V1, AuthorizationDecision,
     AuthorizationDecisionAdmissionV1, AuthorizationDecisionPayload,
     AuthorizationDecisionRelayEvidenceV1, AuthorizationRequest, BrokerChallenge,
-    LAUNCHER_EXECUTION_COMPLETION_PERSISTENCE, LAUNCHER_OUTPUT, LEASE_CONSUME,
-    LEASE_CONSUME_RESPONSE, LEASE_CONSUMPTION_INTENT_PERSISTENCE, LEASE_CONSUMPTION_PERSISTENCE,
-    LEASE_ISSUANCE, LauncherChildProcessV1, LauncherExecutionCompletionPersistenceV1,
-    LauncherExecutionCompletionV1, LauncherOutputFrameV1, LauncherOutputStreamV1,
-    LauncherStartupContinuationV1, LeaseConsumeRequest, LeaseConsumeResponsePayload,
-    LeaseConsumptionAdmissionV1, LeaseConsumptionIntentPersistenceV1,
+    LAUNCHER_EXECUTION_COMPLETION, LAUNCHER_EXECUTION_COMPLETION_PERSISTENCE, LAUNCHER_OUTPUT,
+    LEASE_CONSUME, LEASE_CONSUME_RESPONSE, LEASE_CONSUMPTION_INTENT_PERSISTENCE,
+    LEASE_CONSUMPTION_PERSISTENCE, LEASE_ISSUANCE, LauncherChildProcessV1,
+    LauncherExecutionCompletionPersistenceV1, LauncherExecutionCompletionV1, LauncherOutputFrameV1,
+    LauncherOutputStreamV1, LauncherStartupContinuationV1, LeaseConsumeRequest,
+    LeaseConsumeResponsePayload, LeaseConsumptionAdmissionV1, LeaseConsumptionIntentPersistenceV1,
     LeaseConsumptionIntentRelayEvidenceV1, LeaseConsumptionPersistenceV1,
     LeaseConsumptionRelayEvidenceV1, MAX_FRAME_BYTES, OtaProcessPostureV1,
     PROTECTED_AUTHORITY_SNAPSHOT_REQUEST, PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_REQUEST,
@@ -730,52 +730,67 @@ impl PreparedChild {
                     read_json_frame_blocking(&mut self.launcher_session)
                         .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
                 pressure_v3_stage("selected_child_inbound_frame_2_received");
-                relay_state = advance_secret_delivery_relay_state(
-                    relay_state,
-                    snapshot
-                        .get("message_kind")
-                        .and_then(serde_json::Value::as_str),
-                )?;
-                pressure_v3_stage("authority_snapshot_request_received");
-                #[cfg(feature = "systemd-pressure-faults")]
-                let request = serde_json::from_value(snapshot.clone())
-                    .inspect_err(|_| {
-                        pressure_v3_stage("authority_snapshot_request_invalid");
-                        pressure_v3_stage(authority_snapshot_request_shape_marker(&snapshot));
-                    })
-                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                #[cfg(not(feature = "systemd-pressure-faults"))]
-                let request = serde_json::from_value(snapshot)
-                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let response = respond_authority_snapshot(&request, &self.launcher_session)
-                    .inspect_err(|_| {
-                        pressure_v3_stage("authority_snapshot_refused");
-                    })?;
-                write_json_frame_blocking(&mut self.launcher_session, &response)
-                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                pressure_v3_stage("authority_snapshot_response_sent");
-                let binding: serde_json::Value =
-                    read_json_frame_blocking(&mut self.launcher_session)
-                        .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
-                relay_state = advance_secret_delivery_relay_state(
-                    relay_state,
-                    binding
-                        .get("message_kind")
-                        .and_then(serde_json::Value::as_str),
-                )?;
-                pressure_v3_stage("secret_binding_v2_request_received");
-                let request = serde_json::from_value(binding)
-                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                let response = bind_snapshot_secret_delivery(&request, &self.launcher_session)
-                    .inspect_err(|_| {
-                        pressure_v3_stage("secret_binding_v2_refused");
-                    })?;
-                write_json_frame_blocking(&mut self.launcher_session, &response)
-                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                pressure_v3_stage("secret_binding_v2_response_sent");
-                let value = read_json_frame_blocking(&mut self.launcher_session)
-                    .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
-                parse_completion_for_state(value, relay_state)?
+                if let Some(completion) =
+                    parse_pre_binding_refusal_completion(snapshot.clone(), relay_state)?
+                {
+                    pressure_v3_stage("pre_snapshot_refusal_completion_received");
+                    completion
+                } else {
+                    relay_state = advance_secret_delivery_relay_state(
+                        relay_state,
+                        snapshot
+                            .get("message_kind")
+                            .and_then(serde_json::Value::as_str),
+                    )?;
+                    pressure_v3_stage("authority_snapshot_request_received");
+                    #[cfg(feature = "systemd-pressure-faults")]
+                    let request = serde_json::from_value(snapshot.clone())
+                        .inspect_err(|_| {
+                            pressure_v3_stage("authority_snapshot_request_invalid");
+                            pressure_v3_stage(authority_snapshot_request_shape_marker(&snapshot));
+                        })
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    #[cfg(not(feature = "systemd-pressure-faults"))]
+                    let request = serde_json::from_value(snapshot)
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let response = respond_authority_snapshot(&request, &self.launcher_session)
+                        .inspect_err(|_| {
+                            pressure_v3_stage("authority_snapshot_refused");
+                        })?;
+                    write_json_frame_blocking(&mut self.launcher_session, &response)
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    pressure_v3_stage("authority_snapshot_response_sent");
+                    let binding: serde_json::Value =
+                        read_json_frame_blocking(&mut self.launcher_session)
+                            .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
+                    if let Some(completion) =
+                        parse_pre_binding_refusal_completion(binding.clone(), relay_state)?
+                    {
+                        pressure_v3_stage("pre_binding_refusal_completion_received");
+                        completion
+                    } else {
+                        relay_state = advance_secret_delivery_relay_state(
+                            relay_state,
+                            binding
+                                .get("message_kind")
+                                .and_then(serde_json::Value::as_str),
+                        )?;
+                        pressure_v3_stage("secret_binding_v2_request_received");
+                        let request = serde_json::from_value(binding)
+                            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                        let response =
+                            bind_snapshot_secret_delivery(&request, &self.launcher_session)
+                                .inspect_err(|_| {
+                                    pressure_v3_stage("secret_binding_v2_refused");
+                                })?;
+                        write_json_frame_blocking(&mut self.launcher_session, &response)
+                            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                        pressure_v3_stage("secret_binding_v2_response_sent");
+                        let value = read_json_frame_blocking(&mut self.launcher_session)
+                            .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
+                        parse_completion_for_state(value, relay_state)?
+                    }
+                }
             }
             (
                 SecretDeliveryRelayState::AwaitPreludeOrLegacyOrCompletion,
@@ -877,6 +892,31 @@ fn parse_completion_for_state(
         _ => serde_json::from_value(value)
             .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable),
     }
+}
+
+fn parse_pre_binding_refusal_completion(
+    value: serde_json::Value,
+    state: SecretDeliveryRelayState,
+) -> Result<Option<LauncherExecutionCompletionV1>, PreparedChildError> {
+    if value
+        .get("message_kind")
+        .and_then(serde_json::Value::as_str)
+        != Some(LAUNCHER_EXECUTION_COMPLETION)
+    {
+        return Ok(None);
+    }
+    if !matches!(
+        state,
+        SecretDeliveryRelayState::PreludeResponded | SecretDeliveryRelayState::SnapshotResponded
+    ) {
+        return Err(PreparedChildError::AuthorizationAdmissionMismatch);
+    }
+    let completion: LauncherExecutionCompletionV1 = serde_json::from_value(value)
+        .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
+    if completion.outcome != ota_authority_protocol::LauncherExecutionOutcomeV1::Failed {
+        return Err(PreparedChildError::AuthorizationAdmissionMismatch);
+    }
+    Ok(Some(completion))
 }
 
 fn pressure_v3_stage(stage: &'static str) {
@@ -2130,13 +2170,216 @@ mod tests {
             ),
             Err(PreparedChildError::AuthorizationAdmissionMismatch)
         ));
-        assert!(matches!(
-            parse_completion_for_state(
-                serde_json::json!({"message_kind": "launcher_execution_completion"}),
+        let mut early_refusal = LauncherExecutionCompletionV1 {
+            schema_version: 1,
+            identity: String::new(),
+            message_kind: LAUNCHER_EXECUTION_COMPLETION.into(),
+            invocation_id: "invocation".into(),
+            lease_consumption_admission_identity: identity('1'),
+            work_unit_identity: identity('2'),
+            crossing_transaction_id: "crossing".into(),
+            pending_crossing_transaction_identity: identity('3'),
+            crossing_transaction_identity: identity('4'),
+            receipt_archive_identity: None,
+            outcome: ota_authority_protocol::LauncherExecutionOutcomeV1::Failed,
+            exit_code: Some(1),
+            receipt_status: "not_created".into(),
+        };
+        early_refusal.identity =
+            launcher_execution_completion_v1_identity(&early_refusal).expect("refusal identity");
+        assert_eq!(
+            parse_pre_binding_refusal_completion(
+                serde_json::to_value(&early_refusal).expect("refusal JSON"),
+                SecretDeliveryRelayState::PreludeResponded,
+            ),
+            Ok(Some(early_refusal.clone()))
+        );
+        assert_eq!(
+            parse_pre_binding_refusal_completion(
+                serde_json::to_value(&early_refusal).expect("refusal JSON"),
                 SecretDeliveryRelayState::SnapshotResponded,
+            ),
+            Ok(Some(early_refusal.clone()))
+        );
+        early_refusal.outcome = ota_authority_protocol::LauncherExecutionOutcomeV1::Completed;
+        early_refusal.exit_code = Some(0);
+        assert!(matches!(
+            parse_pre_binding_refusal_completion(
+                serde_json::to_value(&early_refusal).expect("completion JSON"),
+                SecretDeliveryRelayState::PreludeResponded,
             ),
             Err(PreparedChildError::AuthorizationAdmissionMismatch)
         ));
+    }
+
+    #[cfg(feature = "protected-attestor")]
+    #[derive(Clone, Copy)]
+    enum EarlyRefusalPoint {
+        AfterPrelude,
+        AfterSnapshot,
+    }
+
+    #[cfg(feature = "protected-attestor")]
+    #[derive(Clone, Copy)]
+    enum EarlyCompletionCase {
+        ValidFailed,
+        ForgedIdentity,
+        WrongInvocation,
+        Completed,
+        Interrupted,
+    }
+
+    #[cfg(feature = "protected-attestor")]
+    struct EarlyRefusalRelayResult {
+        result: Result<(LauncherExecutionCompletionV1, Option<i32>), PreparedChildError>,
+        persisted: Vec<LauncherExecutionCompletionV1>,
+        snapshot_calls: usize,
+        v2_binding_calls: usize,
+    }
+
+    #[cfg(feature = "protected-attestor")]
+    fn exercise_early_refusal_relay(
+        consumption: &LeaseConsumptionRelayEvidenceV1,
+        record: &LauncherChildProcessV1,
+        point: EarlyRefusalPoint,
+        case: EarlyCompletionCase,
+    ) -> EarlyRefusalRelayResult {
+        let (
+            observation_request,
+            observation_response,
+            prelude,
+            snapshot_request,
+            snapshot_response,
+            _,
+            _,
+        ) = crate::protected_authority_snapshot::tests::relay_protocol_fixture();
+        let mut completion = LauncherExecutionCompletionV1 {
+            schema_version: 1,
+            identity: String::new(),
+            message_kind: LAUNCHER_EXECUTION_COMPLETION.into(),
+            invocation_id: record.invocation_id.clone(),
+            lease_consumption_admission_identity: consumption.admission.identity.clone(),
+            work_unit_identity: consumption.admission.work_unit_identity.clone(),
+            crossing_transaction_id: consumption.admission.crossing_transaction_id.clone(),
+            pending_crossing_transaction_identity: consumption
+                .admission
+                .crossing_transaction_identity
+                .clone(),
+            crossing_transaction_identity: identity('f'),
+            receipt_archive_identity: None,
+            outcome: ota_authority_protocol::LauncherExecutionOutcomeV1::Failed,
+            exit_code: Some(1),
+            receipt_status: String::from("not_created"),
+        };
+        match case {
+            EarlyCompletionCase::ValidFailed | EarlyCompletionCase::ForgedIdentity => {}
+            EarlyCompletionCase::WrongInvocation => {
+                completion.invocation_id = String::from("other-invocation");
+            }
+            EarlyCompletionCase::Completed => {
+                completion.outcome = ota_authority_protocol::LauncherExecutionOutcomeV1::Completed;
+                completion.exit_code = Some(0);
+            }
+            EarlyCompletionCase::Interrupted => {
+                completion.outcome =
+                    ota_authority_protocol::LauncherExecutionOutcomeV1::Interrupted;
+                completion.exit_code = Some(130);
+            }
+        }
+        completion.identity =
+            launcher_execution_completion_v1_identity(&completion).expect("completion identity");
+        if matches!(case, EarlyCompletionCase::ForgedIdentity) {
+            completion.identity = identity('0');
+        }
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork early-refusal child");
+        if pid == 0 {
+            unsafe { libc::_exit(1) };
+        }
+        let (launcher_session, mut core) =
+            UnixStream::pair().expect("early-refusal completion session");
+        let (stdout, stdout_writer) = pipe_cloexec().expect("early-refusal stdout");
+        let (stderr, stderr_writer) = pipe_cloexec().expect("early-refusal stderr");
+        drop(stdout_writer);
+        drop(stderr_writer);
+        let (client, _pressure_client) = UnixStream::pair().expect("early-refusal output session");
+        let expect_persistence = matches!(case, EarlyCompletionCase::ValidFailed);
+        let sent_completion = completion.clone();
+        let expected_observation_response = observation_response.clone();
+        let expected_prelude = prelude.clone();
+        let expected_snapshot_response = snapshot_response.clone();
+        let core_thread = thread::spawn(move || {
+            write_json_frame_blocking(&mut core, &observation_request)
+                .expect("write observation request");
+            let observed_response: ProtectedLauncherCapabilityObservationResponseV1 =
+                read_json_frame_blocking(&mut core).expect("read observation response");
+            let observed_prelude: ProtectedSameChildCapabilityPreludeV1 =
+                read_json_frame_blocking(&mut core).expect("read private prelude");
+            assert_eq!(observed_response, expected_observation_response);
+            assert_eq!(observed_prelude, expected_prelude);
+            if matches!(point, EarlyRefusalPoint::AfterSnapshot) {
+                write_json_frame_blocking(&mut core, &snapshot_request)
+                    .expect("write snapshot request");
+                let observed_snapshot: ProtectedAuthoritySnapshotResponseV1 =
+                    read_json_frame_blocking(&mut core).expect("read snapshot response");
+                assert_eq!(observed_snapshot, expected_snapshot_response);
+            }
+            write_json_frame_blocking(&mut core, &sent_completion).expect("write early completion");
+            if expect_persistence {
+                let persistence: LauncherExecutionCompletionPersistenceV1 =
+                    read_json_frame_blocking(&mut core).expect("read completion persistence");
+                assert_eq!(persistence.completion_identity, sent_completion.identity);
+            }
+        });
+        let mut child = PreparedChild {
+            pid,
+            record: LauncherChildProcessV1 {
+                pid: pid as u32,
+                ..record.clone()
+            },
+            launcher_session,
+            selected_session_object: test_descriptor_object(),
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+        };
+        let mut persisted = Vec::new();
+        let mut snapshot_calls = 0;
+        let mut v2_binding_calls = 0;
+        let result = child.relay_selected_execution_with_secret_binding(
+            &client,
+            consumption,
+            |request, _| {
+                assert_eq!(request.identity, prelude.observation_request_identity);
+                Ok((observation_response, prelude))
+            },
+            |request, _| {
+                snapshot_calls += 1;
+                assert_eq!(request.identity, snapshot_response.request_identity);
+                Ok(snapshot_response)
+            },
+            |_, _| unreachable!("same-child lane must not use legacy binding"),
+            |_, _| {
+                v2_binding_calls += 1;
+                unreachable!("early refusal must not request V2 binding")
+            },
+            |completion| {
+                persisted.push(completion);
+                Ok(())
+            },
+        );
+        if child.pid > 0 {
+            child
+                .terminate_and_reap()
+                .expect("clean rejected early-refusal child");
+        }
+        core_thread.join().expect("early-refusal core thread");
+        EarlyRefusalRelayResult {
+            result,
+            persisted,
+            snapshot_calls,
+            v2_binding_calls,
+        }
     }
 
     fn process_posture(child: &LauncherChildProcessV1, mapping: &str) -> OtaProcessPostureV1 {
@@ -3162,7 +3405,7 @@ mod tests {
                 |_, _| unreachable!("legacy V1 binding must not request V2 binding"),
                 |_| unreachable!("duplicate binding must not reach completion persistence"),
             ),
-            Err(PreparedChildError::ExecutionCompletionUnavailable)
+            Err(PreparedChildError::AuthorizationAdmissionMismatch)
         );
         duplicate_child
             .terminate_and_reap()
@@ -3319,6 +3562,51 @@ mod tests {
             sequence_core_thread
                 .join()
                 .expect("same-child sequence core thread");
+
+            for point in [
+                EarlyRefusalPoint::AfterPrelude,
+                EarlyRefusalPoint::AfterSnapshot,
+            ] {
+                let valid = exercise_early_refusal_relay(
+                    &consumption,
+                    &child.record,
+                    point,
+                    EarlyCompletionCase::ValidFailed,
+                );
+                let (completion, observed_exit) = valid.result.expect("valid early refusal");
+                assert_eq!(
+                    completion.outcome,
+                    ota_authority_protocol::LauncherExecutionOutcomeV1::Failed
+                );
+                assert_eq!(observed_exit, Some(1));
+                assert_eq!(valid.persisted, vec![completion]);
+                assert_eq!(
+                    valid.snapshot_calls,
+                    usize::from(matches!(point, EarlyRefusalPoint::AfterSnapshot))
+                );
+                assert_eq!(valid.v2_binding_calls, 0);
+
+                for case in [
+                    EarlyCompletionCase::ForgedIdentity,
+                    EarlyCompletionCase::WrongInvocation,
+                    EarlyCompletionCase::Completed,
+                    EarlyCompletionCase::Interrupted,
+                ] {
+                    let rejected =
+                        exercise_early_refusal_relay(&consumption, &child.record, point, case);
+                    assert!(matches!(
+                        rejected.result,
+                        Err(PreparedChildError::ExecutionCompletionIdentityMismatch)
+                            | Err(PreparedChildError::AuthorizationAdmissionMismatch)
+                    ));
+                    assert!(rejected.persisted.is_empty());
+                    assert_eq!(
+                        rejected.snapshot_calls,
+                        usize::from(matches!(point, EarlyRefusalPoint::AfterSnapshot))
+                    );
+                    assert_eq!(rejected.v2_binding_calls, 0);
+                }
+            }
         }
 
         let direct_v2_pid = unsafe { libc::fork() };
