@@ -739,11 +739,16 @@ fn execute_selected_boundary(
                     };
                 let replay = crate::protected_capability_observation::ProtectedCapabilityObservationReplayStoreV1::open()
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let installation_evidence_identity =
+                    crate::installation_manifest::load_public_installation_evidence_identity(
+                        context.installation,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
                 let derivation = crate::protected_capability_observation::derive_same_child_capability_prelude_v1(
                     &replay,
                     request,
                     &startup_continuation,
-                    context.installation.identity.as_str(),
+                    installation_evidence_identity.as_str(),
                     &capability_context,
                     &mut observation,
                 )

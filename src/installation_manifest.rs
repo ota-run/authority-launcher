@@ -51,6 +51,9 @@ pub(crate) const SYSTEMD_INSTALLATION_MANIFEST_PATH: &str =
     "/etc/ota/authority-launcher-installation.json";
 pub(crate) const CAPABILITY_PROJECTION_VERIFIER_PATH: &str =
     "/usr/share/ota/authority-launcher/capability-projection-verifier-v1.json";
+pub(crate) const PUBLIC_INSTALLATION_EVIDENCE_ROOT: &str = "/usr/share/ota/authority-launcher";
+pub(crate) const PUBLIC_INSTALLATION_EVIDENCE_PATH: &str =
+    "/usr/share/ota/authority-launcher/installation-evidence.json";
 pub(crate) const PROTECTED_LAUNCHER_AUTHORITY_CONTEXT_PATH: &str =
     "/etc/ota/protected-launcher-authority-context-v1.json";
 pub(crate) const CAPABILITY_OBSERVATION_REPLAY_DIRECTORY: &str =
@@ -63,6 +66,8 @@ const HISTORY_INSTALLATION_IDENTITY_DOMAIN_V1: &str =
     "ota.authority-launcher.history-installation.v1\0";
 const BROKER_PROXY_INSTALLATION_IDENTITY_DOMAIN_V1: &str =
     "ota.authority-launcher.broker-proxy-installation.v1\0";
+const PUBLIC_INSTALLATION_EVIDENCE_IDENTITY_DOMAIN_V1: &[u8] =
+    b"ota.authority-launcher.public-installation-evidence.v1\0";
 pub(crate) const PROTECTED_LAUNCHER_BUILD_IDENTITY_DOMAIN_V1: &[u8] =
     b"ota.authority-launcher.installed-build.v1\0";
 
@@ -477,6 +482,46 @@ pub(crate) struct ProtectedInstallationManifestV1 {
     pub files: Vec<ProtectedInstallationFileV1>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PublicInstallationEvidenceV1 {
+    pub schema_version: u32,
+    pub identity: String,
+    pub protocol_source_revision: String,
+    pub core_source_revision: String,
+    pub launcher_source_revision: String,
+    pub prepared_provisioning_observation: Option<PreparedProvisioningObservationV1>,
+    pub installation_manifest: ProtectedInstallationManifestV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreparedProvisioningObservationV1 {
+    pub schema_version: u32,
+    pub identity: String,
+    pub observed_at: String,
+    pub runner_service_unit: String,
+    pub runner_active_state: String,
+    pub runner_sub_state: String,
+    pub runner_main_pid: u32,
+    pub runner_control_group: String,
+    pub runner_service_fragment_path: String,
+    pub runner_service_drop_in_paths: Vec<String>,
+    pub runner_executable_identity: String,
+    pub runner_service_identity: String,
+    pub runner_drop_in_identity: String,
+    pub job_uid: u32,
+    pub execution_uid: u32,
+    pub live_principal_processes: Vec<u32>,
+    pub authority_state_posture: String,
+    pub authority_state_ancestor_posture: String,
+    pub authority_state_paths_checked: Vec<String>,
+    pub authority_unit_posture: String,
+    pub authority_units_checked: Vec<String>,
+    pub authority_socket_listener_posture: String,
+    pub authority_socket_paths_checked: Vec<String>,
+}
+
 pub(crate) fn resolve_optional_protected_executable_alias(
     alias: &Path,
     expected_owner_uid: u32,
@@ -563,6 +608,48 @@ pub(crate) fn protected_installation_manifest_identity(
         &canonical,
     )
     .map_err(|_| InstallationManifestError::Malformed)
+}
+
+pub(crate) fn public_installation_evidence_identity(
+    evidence: &PublicInstallationEvidenceV1,
+) -> Result<String, InstallationManifestError> {
+    let mut canonical = evidence.clone();
+    canonical.identity.clear();
+    message_identity(PUBLIC_INSTALLATION_EVIDENCE_IDENTITY_DOMAIN_V1, &canonical)
+        .map_err(|_| InstallationManifestError::Malformed)
+}
+
+pub(crate) fn load_public_installation_evidence_identity(
+    protected_manifest: &ProtectedInstallationManifestV1,
+) -> Result<String, InstallationManifestError> {
+    load_public_installation_evidence_identity_at(
+        Path::new(PUBLIC_INSTALLATION_EVIDENCE_PATH),
+        protected_manifest,
+        0,
+        Path::new("/"),
+    )
+}
+
+fn load_public_installation_evidence_identity_at(
+    evidence_path: &Path,
+    protected_manifest: &ProtectedInstallationManifestV1,
+    expected_owner_uid: u32,
+    trusted_root: &Path,
+) -> Result<String, InstallationManifestError> {
+    let evidence_file = open_protected_file(evidence_path, expected_owner_uid, trusted_root)
+        .map_err(map_config_error)?;
+    let evidence: PublicInstallationEvidenceV1 =
+        serde_json::from_reader(evidence_file).map_err(|_| InstallationManifestError::Malformed)?;
+    if evidence.schema_version != 1
+        || evidence.identity != public_installation_evidence_identity(&evidence)?
+        || evidence.installation_manifest.schema_version != 1
+        || evidence.installation_manifest.identity
+            != protected_installation_manifest_identity(&evidence.installation_manifest)?
+        || evidence.installation_manifest != *protected_manifest
+    {
+        return Err(InstallationManifestError::Mismatch);
+    }
+    Ok(evidence.identity)
 }
 
 pub(crate) fn protected_history_installation_identity(
@@ -1020,6 +1107,95 @@ mod tests {
                 root.path(),
             ),
             Err(InstallationManifestError::Mismatch)
+        );
+    }
+
+    #[test]
+    fn public_installation_evidence_reconciles_exact_protected_manifest() {
+        let root = tempdir().expect("temporary protected root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
+            .expect("protected root permissions");
+        let owner = unsafe { libc::geteuid() };
+        let evidence_path = root.path().join("installation-evidence.json");
+        let mut manifest = ProtectedInstallationManifestV1 {
+            schema_version: 1,
+            identity: String::new(),
+            launcher_configuration_identity: identity('1'),
+            launcher_profile_identity: identity('2'),
+            job_principal_profile_identity: identity('3'),
+            files: Vec::new(),
+        };
+        manifest.identity =
+            protected_installation_manifest_identity(&manifest).expect("manifest identity");
+        let mut evidence = PublicInstallationEvidenceV1 {
+            schema_version: 1,
+            identity: String::new(),
+            protocol_source_revision: "1".repeat(40),
+            core_source_revision: "2".repeat(40),
+            launcher_source_revision: "3".repeat(40),
+            prepared_provisioning_observation: None,
+            installation_manifest: manifest.clone(),
+        };
+        evidence.identity =
+            public_installation_evidence_identity(&evidence).expect("evidence identity");
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec(&evidence).expect("serialized evidence"),
+        )
+        .expect("public evidence");
+        fs::set_permissions(&evidence_path, fs::Permissions::from_mode(0o644))
+            .expect("public evidence permissions");
+
+        assert_eq!(
+            load_public_installation_evidence_identity_at(
+                &evidence_path,
+                &manifest,
+                owner,
+                root.path(),
+            )
+            .expect("reconciled evidence"),
+            evidence.identity,
+        );
+
+        let original = evidence.clone();
+        evidence.identity = identity('f');
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec(&evidence).expect("serialized forged evidence"),
+        )
+        .expect("forged evidence");
+        assert_eq!(
+            load_public_installation_evidence_identity_at(
+                &evidence_path,
+                &manifest,
+                owner,
+                root.path(),
+            ),
+            Err(InstallationManifestError::Mismatch),
+        );
+
+        evidence = original;
+        evidence
+            .installation_manifest
+            .launcher_configuration_identity = identity('9');
+        evidence.installation_manifest.identity =
+            protected_installation_manifest_identity(&evidence.installation_manifest)
+                .expect("substituted manifest identity");
+        evidence.identity = public_installation_evidence_identity(&evidence)
+            .expect("substituted evidence identity");
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec(&evidence).expect("serialized substituted evidence"),
+        )
+        .expect("substituted evidence");
+        assert_eq!(
+            load_public_installation_evidence_identity_at(
+                &evidence_path,
+                &manifest,
+                owner,
+                root.path(),
+            ),
+            Err(InstallationManifestError::Mismatch),
         );
     }
 

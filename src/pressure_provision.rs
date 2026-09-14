@@ -85,10 +85,12 @@ use crate::config::{
 use crate::installation_manifest::{
     AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY, CAPABILITY_OBSERVATION_REPLAY_DIRECTORY,
     CAPABILITY_PROJECTION_VERIFIER_PATH, PROTECTED_LAUNCHER_AUTHORITY_CONTEXT_PATH,
-    ProtectedInstallationFileV1, ProtectedInstallationManifestV1, ProtectedInstallationRoleV1,
+    PUBLIC_INSTALLATION_EVIDENCE_PATH, PUBLIC_INSTALLATION_EVIDENCE_ROOT,
+    PreparedProvisioningObservationV1, ProtectedInstallationFileV1,
+    ProtectedInstallationManifestV1, ProtectedInstallationRoleV1, PublicInstallationEvidenceV1,
     broker_proxy_installation_identity, protected_history_installation_identity,
     protected_installation_manifest_identity, protected_launcher_installed_build_identity,
-    resolve_optional_protected_executable_alias,
+    public_installation_evidence_identity, resolve_optional_protected_executable_alias,
 };
 use crate::protected_history::{
     HISTORY_BINDING_PATH, HISTORY_BLOB_ROOT, HISTORY_CATALOG_ROOT, HISTORY_SOCKET_PATH,
@@ -107,18 +109,13 @@ const LAUNCHER_CONFIG: &str = "/etc/ota/authority-launcher-systemd.json";
 const ATTESTOR_CONFIG: &str = "/etc/ota/authority-attestor.json";
 const VERIFIER_SET: &str = "/etc/ota/authority-attestor-verifiers.json";
 const INSTALLATION_MANIFEST: &str = "/etc/ota/authority-launcher-installation.json";
-const PUBLIC_INSTALLATION_EVIDENCE_ROOT: &str = "/usr/share/ota/authority-launcher";
 const SECRET_DELIVERY_PRESSURE_INSTALLATION_EVIDENCE: &str =
     "/usr/share/ota/authority-launcher/secret-delivery-pressure-installation.json";
 const SECRET_DELIVERY_PRESSURE_INSTALLATION_IDENTITY_DOMAIN_V1: &[u8] =
     b"ota.authority-launcher.secret-delivery-pressure-installation.v1\0";
 const EMPTY_SECRET_DELIVERY_VERIFIER_SNAPSHOT: &[u8] = b"{\"schema_version\":1,\"verifiers\":[]}\n";
 const EMPTY_SECRET_DELIVERY_BINDING_SNAPSHOT: &[u8] = b"{\"schema_version\":1,\"bindings\":[]}\n";
-const PUBLIC_INSTALLATION_EVIDENCE: &str =
-    "/usr/share/ota/authority-launcher/installation-evidence.json";
-const RUNNER_PUBLICATION_GATE: &str = PUBLIC_INSTALLATION_EVIDENCE;
-const PUBLIC_INSTALLATION_EVIDENCE_IDENTITY_DOMAIN_V1: &[u8] =
-    b"ota.authority-launcher.public-installation-evidence.v1\0";
+const RUNNER_PUBLICATION_GATE: &str = PUBLIC_INSTALLATION_EVIDENCE_PATH;
 const PREPARED_PROVISIONING_OBSERVATION_IDENTITY_DOMAIN_V1: &[u8] =
     b"ota.authority-launcher.prepared-provisioning-observation.v1\0";
 const BROKER_STORE: &str = "/etc/ota/crossing-brokers.json";
@@ -209,44 +206,6 @@ struct PublicSecretDeliveryPressureInstallationV1 {
     request_identity: String,
     authority_posture: String,
     selected_process_environment: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Serialize)]
-struct PublicInstallationEvidenceV1 {
-    schema_version: u32,
-    identity: String,
-    protocol_source_revision: String,
-    core_source_revision: String,
-    launcher_source_revision: String,
-    prepared_provisioning_observation: Option<PreparedProvisioningObservationV1>,
-    installation_manifest: ProtectedInstallationManifestV1,
-}
-
-#[derive(Clone, Serialize)]
-struct PreparedProvisioningObservationV1 {
-    schema_version: u32,
-    identity: String,
-    observed_at: String,
-    runner_service_unit: String,
-    runner_active_state: String,
-    runner_sub_state: String,
-    runner_main_pid: u32,
-    runner_control_group: String,
-    runner_service_fragment_path: String,
-    runner_service_drop_in_paths: Vec<String>,
-    runner_executable_identity: String,
-    runner_service_identity: String,
-    runner_drop_in_identity: String,
-    job_uid: u32,
-    execution_uid: u32,
-    live_principal_processes: Vec<u32>,
-    authority_state_posture: String,
-    authority_state_ancestor_posture: String,
-    authority_state_paths_checked: Vec<String>,
-    authority_unit_posture: String,
-    authority_units_checked: Vec<String>,
-    authority_socket_listener_posture: String,
-    authority_socket_paths_checked: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -913,7 +872,8 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         prepared_provisioning_observation,
         installation_manifest: manifest,
     };
-    public_evidence.identity = public_installation_evidence_identity(&public_evidence)?;
+    public_evidence.identity = public_installation_evidence_identity(&public_evidence)
+        .map_err(|_| String::from("public installation evidence identity unavailable"))?;
     run_systemctl(&["daemon-reload"])?;
     run_systemctl(&[
         "enable",
@@ -939,12 +899,12 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     verify_activated_socket(Path::new(BROKER_PROXY_SOCKET), 0, 0o600)?;
     // The canonical runner cannot start until this final, durable publication succeeds.
     write_json(
-        Path::new(PUBLIC_INSTALLATION_EVIDENCE),
+        Path::new(PUBLIC_INSTALLATION_EVIDENCE_PATH),
         &public_evidence,
         0o644,
     )?;
-    protected_root_file(Path::new(PUBLIC_INSTALLATION_EVIDENCE), false)?;
-    verify_root_protected_chain(Path::new(PUBLIC_INSTALLATION_EVIDENCE))?;
+    protected_root_file(Path::new(PUBLIC_INSTALLATION_EVIDENCE_PATH), false)?;
+    verify_root_protected_chain(Path::new(PUBLIC_INSTALLATION_EVIDENCE_PATH))?;
     println!(
         "systemd-v3-pressure-provisioned authority={} launcher_config={} installation={}",
         launcher_config.identity, LAUNCHER_CONFIG, public_evidence.installation_manifest.identity
@@ -2283,15 +2243,6 @@ fn verify_root_protected_chain(path: &Path) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn public_installation_evidence_identity(
-    evidence: &PublicInstallationEvidenceV1,
-) -> Result<String, String> {
-    let mut canonical = evidence.clone();
-    canonical.identity.clear();
-    message_identity(PUBLIC_INSTALLATION_EVIDENCE_IDENTITY_DOMAIN_V1, &canonical)
-        .map_err(|_| String::from("public installation evidence identity unavailable"))
 }
 
 fn random_seed() -> Result<[u8; 32], String> {
