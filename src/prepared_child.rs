@@ -903,11 +903,29 @@ fn authority_snapshot_request_shape_marker(value: &serde_json::Value) -> &'stati
     let Some(request) = value.as_object() else {
         return "authority_snapshot_request_not_object";
     };
-    if REQUEST_FIELDS
-        .iter()
-        .any(|field| !request.contains_key(*field))
-    {
-        return "authority_snapshot_request_missing_field";
+    for field in REQUEST_FIELDS {
+        if !request.contains_key(field) {
+            // Field names are a closed protocol vocabulary, not protected request material.
+            return match field {
+                "schema_version" => "authority_snapshot_request_missing_schema_version",
+                "message_kind" => "authority_snapshot_request_missing_message_kind",
+                "identity" => "authority_snapshot_request_missing_identity",
+                "challenge" => "authority_snapshot_request_missing_challenge",
+                "nonce" => "authority_snapshot_request_missing_nonce",
+                "launcher_request_identity" => {
+                    "authority_snapshot_request_missing_launcher_request_identity"
+                }
+                "startup_continuation_identity" => {
+                    "authority_snapshot_request_missing_startup_continuation_identity"
+                }
+                "session_identity" => "authority_snapshot_request_missing_session_identity",
+                "contract_identity" => "authority_snapshot_request_missing_contract_identity",
+                "selected_execution_graph_identity" => {
+                    "authority_snapshot_request_missing_selected_execution_graph_identity"
+                }
+                _ => unreachable!("closed request field list"),
+            };
+        }
     }
     if request
         .keys()
