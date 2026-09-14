@@ -903,6 +903,32 @@ fn authority_snapshot_request_shape_marker(value: &serde_json::Value) -> &'stati
     let Some(request) = value.as_object() else {
         return "authority_snapshot_request_not_object";
     };
+    const SNAPSHOT_CHALLENGE_FIELDS: [&str; 6] = [
+        "schema_version",
+        "message_kind",
+        "identity",
+        "nonce_commitment",
+        "issued_at_unix_seconds",
+        "expires_at_unix_seconds",
+    ];
+    const SNAPSHOT_RESPONSE_FIELDS: [&str; 6] = [
+        "schema_version",
+        "message_kind",
+        "identity",
+        "request_identity",
+        "payload",
+        "protected_snapshot_identity",
+    ];
+    let matches_fields = |fields: &[&str]| {
+        request.len() == fields.len()
+            && request.keys().all(|field| fields.contains(&field.as_str()))
+    };
+    if matches_fields(&SNAPSHOT_CHALLENGE_FIELDS) {
+        return "authority_snapshot_request_matches_snapshot_challenge_root_shape";
+    }
+    if matches_fields(&SNAPSHOT_RESPONSE_FIELDS) {
+        return "authority_snapshot_request_matches_snapshot_response_root_shape";
+    }
     let has_unknown_field = request
         .keys()
         .any(|field| !REQUEST_FIELDS.contains(&field.as_str()));
@@ -1793,6 +1819,32 @@ mod tests {
                 unknown_missing_multiple
             )),
             "authority_snapshot_request_unknown_field_known_field_count_8"
+        );
+
+        let challenge_shape = serde_json::json!({
+            "schema_version": null,
+            "message_kind": null,
+            "identity": null,
+            "nonce_commitment": null,
+            "issued_at_unix_seconds": null,
+            "expires_at_unix_seconds": null,
+        });
+        assert_eq!(
+            authority_snapshot_request_shape_marker(&challenge_shape),
+            "authority_snapshot_request_matches_snapshot_challenge_root_shape"
+        );
+
+        let response_shape = serde_json::json!({
+            "schema_version": null,
+            "message_kind": null,
+            "identity": null,
+            "request_identity": null,
+            "payload": null,
+            "protected_snapshot_identity": null,
+        });
+        assert_eq!(
+            authority_snapshot_request_shape_marker(&response_shape),
+            "authority_snapshot_request_matches_snapshot_response_root_shape"
         );
     }
 
