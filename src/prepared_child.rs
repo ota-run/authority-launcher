@@ -903,37 +903,38 @@ fn authority_snapshot_request_shape_marker(value: &serde_json::Value) -> &'stati
     let Some(request) = value.as_object() else {
         return "authority_snapshot_request_not_object";
     };
-    for field in REQUEST_FIELDS {
-        if !request.contains_key(field) {
-            // Field names are a closed protocol vocabulary, not protected request material.
-            return match field {
-                "schema_version" => "authority_snapshot_request_missing_schema_version",
-                "message_kind" => "authority_snapshot_request_missing_message_kind",
-                "identity" => "authority_snapshot_request_missing_identity",
-                "challenge" => "authority_snapshot_request_missing_challenge",
-                "nonce" => "authority_snapshot_request_missing_nonce",
-                "launcher_request_identity" => {
-                    "authority_snapshot_request_missing_launcher_request_identity"
-                }
-                "startup_continuation_identity" => {
-                    "authority_snapshot_request_missing_startup_continuation_identity"
-                }
-                "session_identity" => "authority_snapshot_request_missing_session_identity",
-                "contract_identity" => "authority_snapshot_request_missing_contract_identity",
-                "selected_execution_graph_identity" => {
-                    "authority_snapshot_request_missing_selected_execution_graph_identity"
-                }
-                _ => unreachable!("closed request field list"),
-            };
-        }
-    }
     if request
         .keys()
         .any(|field| !REQUEST_FIELDS.contains(&field.as_str()))
     {
         return "authority_snapshot_request_unknown_field";
     }
-    "authority_snapshot_request_nested_or_value_invalid"
+    let missing = REQUEST_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| !request.contains_key(*field))
+        .collect::<Vec<_>>();
+    match missing.as_slice() {
+        [] => "authority_snapshot_request_nested_or_value_invalid",
+        // Field names are a closed protocol vocabulary, not protected request material.
+        ["schema_version"] => "authority_snapshot_request_missing_only_schema_version",
+        ["message_kind"] => "authority_snapshot_request_missing_only_message_kind",
+        ["identity"] => "authority_snapshot_request_missing_only_identity",
+        ["challenge"] => "authority_snapshot_request_missing_only_challenge",
+        ["nonce"] => "authority_snapshot_request_missing_only_nonce",
+        ["launcher_request_identity"] => {
+            "authority_snapshot_request_missing_only_launcher_request_identity"
+        }
+        ["startup_continuation_identity"] => {
+            "authority_snapshot_request_missing_only_startup_continuation_identity"
+        }
+        ["session_identity"] => "authority_snapshot_request_missing_only_session_identity",
+        ["contract_identity"] => "authority_snapshot_request_missing_only_contract_identity",
+        ["selected_execution_graph_identity"] => {
+            "authority_snapshot_request_missing_only_selected_execution_graph_identity"
+        }
+        _ => "authority_snapshot_request_multiple_required_fields_missing",
+    }
 }
 
 fn pressure_v3_relay_evidence(
@@ -1709,6 +1710,54 @@ mod tests {
 
     fn identity(character: char) -> String {
         format!("sha256:{}", character.to_string().repeat(64))
+    }
+
+    #[cfg(feature = "systemd-pressure-faults")]
+    #[test]
+    fn snapshot_request_shape_marker_reports_complete_root_shape_without_values() {
+        let fields = [
+            "schema_version",
+            "message_kind",
+            "identity",
+            "challenge",
+            "nonce",
+            "launcher_request_identity",
+            "startup_continuation_identity",
+            "session_identity",
+            "contract_identity",
+            "selected_execution_graph_identity",
+        ];
+        let mut complete = serde_json::Map::new();
+        for field in fields {
+            complete.insert(field.into(), serde_json::Value::Null);
+        }
+
+        assert_eq!(
+            authority_snapshot_request_shape_marker(&serde_json::Value::Object(complete.clone())),
+            "authority_snapshot_request_nested_or_value_invalid"
+        );
+
+        let mut missing_challenge = complete.clone();
+        missing_challenge.remove("challenge");
+        assert_eq!(
+            authority_snapshot_request_shape_marker(&serde_json::Value::Object(missing_challenge)),
+            "authority_snapshot_request_missing_only_challenge"
+        );
+
+        let mut missing_multiple = complete.clone();
+        missing_multiple.remove("challenge");
+        missing_multiple.remove("nonce");
+        assert_eq!(
+            authority_snapshot_request_shape_marker(&serde_json::Value::Object(missing_multiple)),
+            "authority_snapshot_request_multiple_required_fields_missing"
+        );
+
+        let mut unknown = complete;
+        unknown.insert("unexpected".into(), serde_json::Value::Null);
+        assert_eq!(
+            authority_snapshot_request_shape_marker(&serde_json::Value::Object(unknown)),
+            "authority_snapshot_request_unknown_field"
+        );
     }
 
     #[test]
