@@ -735,10 +735,15 @@ impl PreparedChild {
                         .and_then(serde_json::Value::as_str),
                 )?;
                 pressure_v3_stage("authority_snapshot_request_received");
-                let request = serde_json::from_value(snapshot)
+                #[cfg(feature = "systemd-pressure-faults")]
+                let request = serde_json::from_value(snapshot.clone())
                     .inspect_err(|_| {
                         pressure_v3_stage("authority_snapshot_request_invalid");
+                        pressure_v3_stage(authority_snapshot_request_shape_marker(&snapshot));
                     })
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                #[cfg(not(feature = "systemd-pressure-faults"))]
+                let request = serde_json::from_value(snapshot)
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
                 let response = respond_authority_snapshot(&request, &self.launcher_session)
                     .inspect_err(|_| {
@@ -877,6 +882,40 @@ fn pressure_v3_stage(stage: &'static str) {
     eprintln!("ota-authority-launcher: bounded pressure v3 stage={stage}");
     #[cfg(not(feature = "systemd-pressure-faults"))]
     let _ = stage;
+}
+
+/// Classifies only the closed wire shape of a refused snapshot request. It must never emit
+/// request values, identities, or decoder text from the protected channel.
+#[cfg(feature = "systemd-pressure-faults")]
+fn authority_snapshot_request_shape_marker(value: &serde_json::Value) -> &'static str {
+    const REQUEST_FIELDS: [&str; 10] = [
+        "schema_version",
+        "message_kind",
+        "identity",
+        "challenge",
+        "nonce",
+        "launcher_request_identity",
+        "startup_continuation_identity",
+        "session_identity",
+        "contract_identity",
+        "selected_execution_graph_identity",
+    ];
+    let Some(request) = value.as_object() else {
+        return "authority_snapshot_request_not_object";
+    };
+    if REQUEST_FIELDS
+        .iter()
+        .any(|field| !request.contains_key(*field))
+    {
+        return "authority_snapshot_request_missing_field";
+    }
+    if request
+        .keys()
+        .any(|field| !REQUEST_FIELDS.contains(&field.as_str()))
+    {
+        return "authority_snapshot_request_unknown_field";
+    }
+    "authority_snapshot_request_nested_or_value_invalid"
 }
 
 fn pressure_v3_relay_evidence(
