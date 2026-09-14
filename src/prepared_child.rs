@@ -1688,10 +1688,11 @@ fn reconcile_running_child_identity(
     observed_session_object: DescriptorObject,
     session_cloexec: bool,
 ) -> Result<(), PreparedChildError> {
+    // Core must secure the inherited session against further execs before reporting posture.
     if process_start_time_identity != child.process_start_time_identity
         || executable_identity != child.ota_binary_identity
         || observed_session_object != expected_session_object
-        || session_cloexec
+        || !session_cloexec
     {
         return Err(PreparedChildError::PostureMismatch);
     }
@@ -1714,7 +1715,7 @@ fn pressure_running_child_identity_mismatch(
             pressure_v3_stage("selected_child_runtime_executable_identity_mismatch");
         } else if observed_session_object != expected_session_object {
             pressure_v3_stage("selected_child_runtime_session_object_mismatch");
-        } else if session_cloexec {
+        } else if !session_cloexec {
             pressure_v3_stage("selected_child_runtime_session_cloexec_mismatch");
         }
     }
@@ -1907,7 +1908,7 @@ mod tests {
                 child.ota_binary_identity.as_str(),
                 session,
                 session,
-                false,
+                true,
             ),
             Ok(())
         );
@@ -1918,7 +1919,7 @@ mod tests {
                 child.ota_binary_identity.as_str(),
                 session,
                 session,
-                false,
+                true,
             ),
             Err(PreparedChildError::PostureMismatch)
         );
@@ -1929,7 +1930,7 @@ mod tests {
                 identity('8').as_str(),
                 session,
                 session,
-                false,
+                true,
             ),
             Err(PreparedChildError::PostureMismatch)
         );
@@ -1943,7 +1944,7 @@ mod tests {
                     inode: 3,
                     ..session
                 },
-                false,
+                true,
             ),
             Err(PreparedChildError::PostureMismatch)
         );
@@ -1954,7 +1955,7 @@ mod tests {
                 child.ota_binary_identity.as_str(),
                 session,
                 session,
-                true,
+                false,
             ),
             Err(PreparedChildError::PostureMismatch)
         );
