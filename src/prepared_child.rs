@@ -915,7 +915,18 @@ fn authority_snapshot_request_shape_marker(value: &serde_json::Value) -> &'stati
         return match missing.as_slice() {
             [] => "authority_snapshot_request_unknown_field_complete_required_shape",
             ["challenge"] => "authority_snapshot_request_unknown_field_missing_only_challenge",
-            _ => "authority_snapshot_request_unknown_field_required_shape_incomplete",
+            _ => match REQUEST_FIELDS.len() - missing.len() {
+                0 => "authority_snapshot_request_unknown_field_known_field_count_0",
+                1 => "authority_snapshot_request_unknown_field_known_field_count_1",
+                2 => "authority_snapshot_request_unknown_field_known_field_count_2",
+                3 => "authority_snapshot_request_unknown_field_known_field_count_3",
+                4 => "authority_snapshot_request_unknown_field_known_field_count_4",
+                5 => "authority_snapshot_request_unknown_field_known_field_count_5",
+                6 => "authority_snapshot_request_unknown_field_known_field_count_6",
+                7 => "authority_snapshot_request_unknown_field_known_field_count_7",
+                8 => "authority_snapshot_request_unknown_field_known_field_count_8",
+                _ => "authority_snapshot_request_unknown_field_known_field_count_9",
+            },
         };
     }
     match missing.as_slice() {
@@ -1763,7 +1774,7 @@ mod tests {
             "authority_snapshot_request_unknown_field_complete_required_shape"
         );
 
-        let mut unknown_missing_challenge = complete;
+        let mut unknown_missing_challenge = complete.clone();
         unknown_missing_challenge.remove("challenge");
         unknown_missing_challenge.insert("unexpected".into(), serde_json::Value::Null);
         assert_eq!(
@@ -1771,6 +1782,17 @@ mod tests {
                 unknown_missing_challenge
             )),
             "authority_snapshot_request_unknown_field_missing_only_challenge"
+        );
+
+        let mut unknown_missing_multiple = complete;
+        unknown_missing_multiple.remove("challenge");
+        unknown_missing_multiple.remove("nonce");
+        unknown_missing_multiple.insert("unexpected".into(), serde_json::Value::Null);
+        assert_eq!(
+            authority_snapshot_request_shape_marker(&serde_json::Value::Object(
+                unknown_missing_multiple
+            )),
+            "authority_snapshot_request_unknown_field_known_field_count_8"
         );
     }
 
