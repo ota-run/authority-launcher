@@ -880,11 +880,16 @@ fn execute_selected_boundary(
                 };
                 let replay = crate::protected_capability_observation::ProtectedCapabilityObservationReplayStoreV1::open()
                     .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let installation_evidence_identity =
+                    crate::installation_manifest::load_public_installation_evidence_identity(
+                        context.installation,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
                 crate::protected_capability_observation::derive_secret_delivery_transaction_binding_v1(
                     &replay,
                     request,
                     &startup_continuation,
-                    context.installation.identity.as_str(),
+                    installation_evidence_identity.as_str(),
                     &capability_context,
                     &mut observation,
                 )
@@ -976,12 +981,17 @@ fn execute_selected_boundary(
                             service_gid: unsafe { libc::getegid() },
                             authority: &authority,
                         };
+                    let installation_evidence_identity =
+                        crate::installation_manifest::load_public_installation_evidence_identity(
+                            context.installation,
+                        )
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
                     let response = crate::protected_capability_observation::derive_secret_delivery_transaction_binding_v2(
                         request,
                         &snapshot_request,
                         &snapshot_response,
                         &startup_continuation,
-                        context.installation.identity.as_str(),
+                        installation_evidence_identity.as_str(),
                         &prelude,
                         &capability_context,
                         &mut observation,

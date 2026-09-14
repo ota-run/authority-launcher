@@ -26,6 +26,22 @@ const RECOVERY_WORKFLOW: &str =
     include_str!("../.github/workflows/systemd-v3-independently-administered-recovery.yml");
 const RECOVERY_TRIGGER_WORKFLOW: &str =
     include_str!("../.github/workflows/systemd-v3-independently-administered-recovery-trigger.yml");
+const SYSTEMD_SERVICE_SOURCE: &str = include_str!("../src/systemd_service.rs");
+
+#[test]
+fn same_child_bindings_use_canonical_public_installation_evidence() {
+    assert_eq!(
+        SYSTEMD_SERVICE_SOURCE
+            .matches("load_public_installation_evidence_identity(")
+            .count(),
+        3,
+        "prelude, V1, and V2 must each reload canonical public installation evidence",
+    );
+    assert!(
+        !SYSTEMD_SERVICE_SOURCE.contains("context.installation.identity.as_str(),"),
+        "the protected manifest identity is not the public installation-evidence identity",
+    );
+}
 
 #[test]
 fn independent_pressure_workflow_retains_a_narrow_drift_guard() {
