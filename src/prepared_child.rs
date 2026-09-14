@@ -728,6 +728,7 @@ impl PreparedChild {
                 let snapshot: serde_json::Value =
                     read_json_frame_blocking(&mut self.launcher_session)
                         .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
+                pressure_v3_stage("selected_child_inbound_frame_2_received");
                 relay_state = advance_secret_delivery_relay_state(
                     relay_state,
                     snapshot
