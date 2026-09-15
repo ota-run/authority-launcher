@@ -34,8 +34,8 @@ fn same_child_bindings_use_canonical_public_installation_evidence() {
         SYSTEMD_SERVICE_SOURCE
             .matches("load_public_installation_evidence_identity(")
             .count(),
-        3,
-        "prelude, V1, and V2 must each reload canonical public installation evidence",
+        4,
+        "prelude, V1, V2, and V3 must each reload canonical public installation evidence",
     );
     assert!(
         !SYSTEMD_SERVICE_SOURCE.contains("context.installation.identity.as_str(),"),

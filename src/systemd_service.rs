@@ -1001,6 +1001,109 @@ fn execute_selected_boundary(
                 result
             }
         },
+        |request, _selected_session| {
+            #[cfg(not(feature = "protected-attestor"))]
+            {
+                let _ = (request, _selected_session);
+                Err(PreparedChildError::AuthorizationAdmissionMismatch)
+            }
+            #[cfg(feature = "protected-attestor")]
+            {
+                let replay = context
+                    .authority_snapshot_replay
+                    .as_ref()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let (reservation, snapshot_request, snapshot_response) = snapshot_exchange
+                    .borrow_mut()
+                    .take()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let result = (|| {
+                    let runtime_identity =
+                        verify_systemd_runtime(context.config, context.installation, &scope)
+                            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let mut evidence =
+                        crate::closed_profile_observations::collect_live_closed_profile_evidence(
+                            context.config,
+                            context.installation,
+                            context.mapping,
+                            stream,
+                            context.peer,
+                            &child_record,
+                            &scope,
+                            &process_posture,
+                            runtime_identity.as_str(),
+                        )
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let launcher_instance = collect_launcher_instance(
+                        context.config,
+                        &principal_mapping,
+                        &child_record,
+                        &scope,
+                        &process_posture,
+                        &mut evidence,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let (prelude, mut observation, authority) = same_child_prelude
+                        .borrow_mut()
+                        .take()
+                        .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let launcher_profile_identity =
+                        systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
+                            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let launcher_executable_identity = context
+                        .installation
+                        .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let capability_context =
+                        crate::protected_launcher_capability::ProtectedLauncherCapabilityContextV1 {
+                            request: context.launcher_request,
+                            child: &child_record,
+                            scope: &scope,
+                            principal_mapping: &principal_mapping,
+                            process_posture: &process_posture,
+                            launcher_instance: &launcher_instance,
+                            launcher_executable_identity,
+                            launcher_configuration_identity: context.config.identity.as_str(),
+                            launcher_service_binding_identity: context
+                                .config
+                                .service_unit_identity
+                                .as_str(),
+                            launcher_profile_identity: launcher_profile_identity.as_str(),
+                            service_uid: unsafe { libc::geteuid() },
+                            service_gid: unsafe { libc::getegid() },
+                            authority: &authority,
+                        };
+                    let installation_evidence_identity =
+                        crate::installation_manifest::load_public_installation_evidence_identity(
+                            context.installation,
+                        )
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let response = crate::protected_capability_observation::derive_secret_delivery_transaction_binding_v3(
+                        request,
+                        &snapshot_request,
+                        &snapshot_response,
+                        &startup_continuation,
+                        installation_evidence_identity.as_str(),
+                        &prelude,
+                        &capability_context,
+                        &mut observation,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    replay.consume_v3(
+                        &reservation,
+                        &snapshot_response,
+                        request,
+                        &response,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    Ok(response)
+                })();
+                if result.is_err() {
+                    let _ = replay.refuse(&reservation);
+                }
+                result
+            }
+        },
         |completion| {
                 boundary
                     .active_slot

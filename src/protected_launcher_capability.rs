@@ -1851,6 +1851,7 @@ mod privileged_linux_tests {
         derive_same_child_capability_prelude_for_test_v1,
         derive_secret_delivery_transaction_binding_for_test_v1,
         derive_secret_delivery_transaction_binding_v2,
+        derive_secret_delivery_transaction_binding_v3,
     };
 
     struct CapabilityFixture {
@@ -2677,6 +2678,63 @@ mod privileged_linux_tests {
             "V2 must not sign a second projection"
         );
         assert_eq!(v2_response.projection, prelude.response.projection);
+
+        let mut v3_request = ProtectedLauncherSecretDeliveryTransactionBindingRequestV3 {
+            schema_version: 3,
+            message_kind: PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V3.into(),
+            identity: String::new(),
+            launcher_request_identity: request_identity.clone(),
+            observation: prelude_request.clone(),
+            secret_transaction_candidate_identity: identity('c'),
+            startup_continuation_identity: startup_continuation.identity.clone(),
+            session_identity: protected_launcher_secret_delivery_transaction_session_v1_identity(
+                startup_continuation.identity.as_str(),
+            )
+            .expect("V3 session identity"),
+            same_child_capability_prelude_identity: prelude.prelude.identity.clone(),
+            protected_snapshot_identity: snapshot_response.protected_snapshot_identity.clone(),
+            transport_dependency_record_identity: identity('g'),
+        };
+        v3_request.identity =
+            protected_launcher_secret_delivery_transaction_binding_request_v3_identity(&v3_request)
+                .expect("V3 request identity");
+        let v3_response = derive_secret_delivery_transaction_binding_v3(
+            &v3_request,
+            &snapshot_request,
+            &snapshot_response,
+            &startup_continuation,
+            &identity('d'),
+            &prelude,
+            &fixture.context(),
+            &mut prelude_observation,
+        )
+        .expect("same-child V3 binding");
+        assert_eq!(
+            v3_response.binding.transport_dependency_record_identity,
+            v3_request.transport_dependency_record_identity
+        );
+        assert_eq!(v3_response.projection, prelude.response.projection);
+        assert_eq!(
+            signing_count.get(),
+            1,
+            "V3 must not sign a second projection"
+        );
+
+        let mut malformed_v3_request = v3_request.clone();
+        malformed_v3_request.transport_dependency_record_identity = "sha256:changed".into();
+        assert!(matches!(
+            derive_secret_delivery_transaction_binding_v3(
+                &malformed_v3_request,
+                &snapshot_request,
+                &snapshot_response,
+                &startup_continuation,
+                &identity('d'),
+                &prelude,
+                &fixture.context(),
+                &mut prelude_observation,
+            ),
+            Err(ProtectedCapabilityObservationError::ProjectionInvalid)
+        ));
 
         let verifier_path =
             Path::new(SECRET_DELIVERY_AUTHORITY_DIRECTORY).join(SECRET_DELIVERY_VERIFIER_STORE);

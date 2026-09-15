@@ -53,14 +53,17 @@ use ota_authority_protocol::{
     LeaseConsumptionRelayEvidenceV1, MAX_FRAME_BYTES, OtaProcessPostureV1,
     PROTECTED_AUTHORITY_SNAPSHOT_REQUEST, PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_REQUEST,
     PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST,
-    PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V2, PreparedLeasePayload,
+    PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V2,
+    PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V3, PreparedLeasePayload,
     ProtectedAuthoritySnapshotRequestV1, ProtectedAuthoritySnapshotResponseV1,
     ProtectedLauncherCapabilityObservationRequestV1,
     ProtectedLauncherCapabilityObservationResponseV1,
     ProtectedLauncherSecretDeliveryTransactionBindingRequestV1,
     ProtectedLauncherSecretDeliveryTransactionBindingRequestV2,
+    ProtectedLauncherSecretDeliveryTransactionBindingRequestV3,
     ProtectedLauncherSecretDeliveryTransactionBindingResponseV1,
     ProtectedLauncherSecretDeliveryTransactionBindingResponseV2,
+    ProtectedLauncherSecretDeliveryTransactionBindingResponseV3,
     ProtectedSameChildCapabilityPreludeV1, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1,
     SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3, SignedBrokerMessage,
     SignedLauncherAttestationV3, authorization_decision_admission_v1_identity,
@@ -137,6 +140,7 @@ enum SecretDeliveryRelayState {
     SnapshotResponded,
     LegacyBound,
     V2Bound,
+    V3Bound,
 }
 
 fn advance_secret_delivery_relay_state(
@@ -160,10 +164,15 @@ fn advance_secret_delivery_relay_state(
             SecretDeliveryRelayState::SnapshotResponded,
             Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V2),
         ) => Ok(SecretDeliveryRelayState::V2Bound),
+        (
+            SecretDeliveryRelayState::SnapshotResponded,
+            Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V3),
+        ) => Ok(SecretDeliveryRelayState::V3Bound),
         (_, Some(PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_REQUEST))
         | (_, Some(PROTECTED_AUTHORITY_SNAPSHOT_REQUEST))
         | (_, Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST))
-        | (_, Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V2)) => {
+        | (_, Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V2))
+        | (_, Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V3)) => {
             Err(PreparedChildError::AuthorizationAdmissionMismatch)
         }
         _ => Ok(state),
@@ -653,6 +662,13 @@ impl PreparedChild {
             ProtectedLauncherSecretDeliveryTransactionBindingResponseV2,
             PreparedChildError,
         >,
+        bind_snapshot_secret_delivery_v3: impl FnOnce(
+            &ProtectedLauncherSecretDeliveryTransactionBindingRequestV3,
+            &UnixStream,
+        ) -> Result<
+            ProtectedLauncherSecretDeliveryTransactionBindingResponseV3,
+            PreparedChildError,
+        >,
         mut persist_completion: impl FnMut(
             LauncherExecutionCompletionV1,
         ) -> Result<(), PreparedChildError>,
@@ -775,17 +791,55 @@ impl PreparedChild {
                                 .get("message_kind")
                                 .and_then(serde_json::Value::as_str),
                         )?;
-                        pressure_v3_stage("secret_binding_v2_request_received");
-                        let request = serde_json::from_value(binding)
-                            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                        let response =
-                            bind_snapshot_secret_delivery(&request, &self.launcher_session)
-                                .inspect_err(|_| {
-                                    pressure_v3_stage("secret_binding_v2_refused");
+                        let binding_kind = binding
+                            .get("message_kind")
+                            .and_then(serde_json::Value::as_str);
+                        let (response, response_sent_marker) = match binding_kind {
+                            Some(
+                                PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V2,
+                            ) => {
+                                pressure_v3_stage("secret_binding_v2_request_received");
+                                let request = serde_json::from_value(binding).map_err(|_| {
+                                    PreparedChildError::AuthorizationAdmissionMismatch
                                 })?;
+                                let response =
+                                    bind_snapshot_secret_delivery(&request, &self.launcher_session)
+                                        .inspect_err(|_| {
+                                            pressure_v3_stage("secret_binding_v2_refused");
+                                        })?;
+                                (
+                                    serde_json::to_value(response).map_err(|_| {
+                                        PreparedChildError::AuthorizationAdmissionMismatch
+                                    })?,
+                                    "secret_binding_v2_response_sent",
+                                )
+                            }
+                            Some(
+                                PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V3,
+                            ) => {
+                                pressure_v3_stage("secret_binding_v3_request_received");
+                                let request = serde_json::from_value(binding).map_err(|_| {
+                                    PreparedChildError::AuthorizationAdmissionMismatch
+                                })?;
+                                let response = bind_snapshot_secret_delivery_v3(
+                                    &request,
+                                    &self.launcher_session,
+                                )
+                                .inspect_err(|_| {
+                                    pressure_v3_stage("secret_binding_v3_refused");
+                                })?;
+                                (
+                                    serde_json::to_value(response).map_err(|_| {
+                                        PreparedChildError::AuthorizationAdmissionMismatch
+                                    })?,
+                                    "secret_binding_v3_response_sent",
+                                )
+                            }
+                            _ => return Err(PreparedChildError::AuthorizationAdmissionMismatch),
+                        };
                         write_json_frame_blocking(&mut self.launcher_session, &response)
                             .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
-                        pressure_v3_stage("secret_binding_v2_response_sent");
+                        pressure_v3_stage(response_sent_marker);
                         let value = read_json_frame_blocking(&mut self.launcher_session)
                             .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
                         parse_completion_for_state(value, relay_state)?
@@ -795,6 +849,12 @@ impl PreparedChild {
             (
                 SecretDeliveryRelayState::AwaitPreludeOrLegacyOrCompletion,
                 Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V2),
+            ) => {
+                return Err(PreparedChildError::AuthorizationAdmissionMismatch);
+            }
+            (
+                SecretDeliveryRelayState::AwaitPreludeOrLegacyOrCompletion,
+                Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V3),
             ) => {
                 return Err(PreparedChildError::AuthorizationAdmissionMismatch);
             }
@@ -875,7 +935,9 @@ fn parse_completion_for_state(
 ) -> Result<LauncherExecutionCompletionV1, PreparedChildError> {
     if !matches!(
         state,
-        SecretDeliveryRelayState::LegacyBound | SecretDeliveryRelayState::V2Bound
+        SecretDeliveryRelayState::LegacyBound
+            | SecretDeliveryRelayState::V2Bound
+            | SecretDeliveryRelayState::V3Bound
     ) {
         return Err(PreparedChildError::AuthorizationAdmissionMismatch);
     }
@@ -886,7 +948,8 @@ fn parse_completion_for_state(
         Some(PROTECTED_AUTHORITY_SNAPSHOT_REQUEST)
         | Some(PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_REQUEST)
         | Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST)
-        | Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V2) => {
+        | Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V2)
+        | Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V3) => {
             Err(PreparedChildError::AuthorizationAdmissionMismatch)
         }
         _ => serde_json::from_value(value)
@@ -2154,6 +2217,35 @@ mod tests {
             .expect("snapshot-bound V2 binding"),
             SecretDeliveryRelayState::V2Bound
         );
+        assert_eq!(
+            advance_secret_delivery_relay_state(
+                snapshot,
+                Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V3),
+            )
+            .expect("same-child V3 binding request"),
+            SecretDeliveryRelayState::V3Bound
+        );
+        assert!(matches!(
+            advance_secret_delivery_relay_state(
+                SecretDeliveryRelayState::PreludeResponded,
+                Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V3),
+            ),
+            Err(PreparedChildError::AuthorizationAdmissionMismatch)
+        ));
+        assert!(matches!(
+            advance_secret_delivery_relay_state(
+                SecretDeliveryRelayState::V3Bound,
+                Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V3),
+            ),
+            Err(PreparedChildError::AuthorizationAdmissionMismatch)
+        ));
+        assert!(matches!(
+            advance_secret_delivery_relay_state(
+                SecretDeliveryRelayState::V3Bound,
+                Some(PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V2),
+            ),
+            Err(PreparedChildError::AuthorizationAdmissionMismatch)
+        ));
         assert!(matches!(
             advance_secret_delivery_relay_state(
                 awaiting,
@@ -2363,6 +2455,7 @@ mod tests {
                 v2_binding_calls += 1;
                 unreachable!("early refusal must not request V2 binding")
             },
+            |_, _| unreachable!("early refusal must not request V3 binding"),
             |completion| {
                 persisted.push(completion);
                 Ok(())
@@ -3293,6 +3386,7 @@ mod tests {
                     Ok(expected_binding_response)
                 },
                 |_, _| unreachable!("legacy V1 binding must not request V2 binding"),
+                |_, _| unreachable!("legacy V1 binding must not request V3 binding"),
                 |completion| {
                     persisted.push(completion);
                     Ok(())
@@ -3349,6 +3443,7 @@ mod tests {
                 |_, _| unreachable!("ordinary completion must not request a snapshot"),
                 |_, _| unreachable!("ordinary completion must not request secret binding"),
                 |_, _| unreachable!("ordinary completion must not request V2 secret binding"),
+                |_, _| unreachable!("ordinary completion must not request V3 secret binding"),
                 |_| Ok(()),
             )
             .expect("ordinary selected execution relay");
@@ -3403,6 +3498,7 @@ mod tests {
                     Ok(duplicate_binding_response)
                 },
                 |_, _| unreachable!("legacy V1 binding must not request V2 binding"),
+                |_, _| unreachable!("legacy V1 binding must not request V3 binding"),
                 |_| unreachable!("duplicate binding must not reach completion persistence"),
             ),
             Err(PreparedChildError::AuthorizationAdmissionMismatch)
@@ -3456,6 +3552,7 @@ mod tests {
                 |_, _| unreachable!("malformed V1 binding must not request a snapshot"),
                 |_, _| unreachable!("malformed binding must refuse before callback"),
                 |_, _| unreachable!("malformed V1 binding must not request V2 binding"),
+                |_, _| unreachable!("malformed V1 binding must not request V3 binding"),
                 |_| unreachable!("malformed binding must not reach completion persistence"),
             ),
             Err(PreparedChildError::AuthorizationAdmissionMismatch)
@@ -3554,6 +3651,7 @@ mod tests {
                         assert_eq!(request.identity, v2_response.request_identity);
                         Ok(v2_response)
                     },
+                    |_, _| unreachable!("same-child V2 lane must not use V3 binding"),
                     |_| Ok(()),
                 )
                 .expect("same-child framed relay");
@@ -3562,6 +3660,104 @@ mod tests {
             sequence_core_thread
                 .join()
                 .expect("same-child sequence core thread");
+
+            let (
+                observation_request,
+                observation_response,
+                prelude,
+                snapshot_request,
+                snapshot_response,
+                v3_request,
+                v3_response,
+            ) = crate::protected_authority_snapshot::tests::relay_protocol_fixture_v3();
+            let sequence_v3_pid = unsafe { libc::fork() };
+            assert!(sequence_v3_pid >= 0, "fork same-child V3 sequence child");
+            if sequence_v3_pid == 0 {
+                unsafe { libc::_exit(0) };
+            }
+            let (sequence_v3_session, mut sequence_v3_core) =
+                UnixStream::pair().expect("same-child V3 sequence session");
+            let (sequence_v3_stdout, sequence_v3_stdout_writer) =
+                pipe_cloexec().expect("same-child V3 sequence stdout");
+            let (sequence_v3_stderr, sequence_v3_stderr_writer) =
+                pipe_cloexec().expect("same-child V3 sequence stderr");
+            drop(sequence_v3_stdout_writer);
+            drop(sequence_v3_stderr_writer);
+            let expected_observation_response = observation_response.clone();
+            let expected_prelude = prelude.clone();
+            let expected_snapshot_response = snapshot_response.clone();
+            let expected_v3_response = v3_response.clone();
+            let sequence_v3_completion = expected_completion.clone();
+            let sequence_v3_core_thread = thread::spawn(move || {
+                write_json_frame_blocking(&mut sequence_v3_core, &observation_request)
+                    .expect("write V3 observation request");
+                let observed_response: ProtectedLauncherCapabilityObservationResponseV1 =
+                    read_json_frame_blocking(&mut sequence_v3_core)
+                        .expect("read V3 observation response");
+                let observed_prelude: ProtectedSameChildCapabilityPreludeV1 =
+                    read_json_frame_blocking(&mut sequence_v3_core)
+                        .expect("read V3 private prelude");
+                assert_eq!(observed_response, expected_observation_response);
+                assert_eq!(observed_prelude, expected_prelude);
+                write_json_frame_blocking(&mut sequence_v3_core, &snapshot_request)
+                    .expect("write V3 snapshot request");
+                let observed_snapshot: ProtectedAuthoritySnapshotResponseV1 =
+                    read_json_frame_blocking(&mut sequence_v3_core)
+                        .expect("read V3 snapshot response");
+                assert_eq!(observed_snapshot, expected_snapshot_response);
+                write_json_frame_blocking(&mut sequence_v3_core, &v3_request)
+                    .expect("write V3 binding request");
+                let observed_v3: ProtectedLauncherSecretDeliveryTransactionBindingResponseV3 =
+                    read_json_frame_blocking(&mut sequence_v3_core)
+                        .expect("read V3 binding response");
+                assert_eq!(observed_v3, expected_v3_response);
+                write_json_frame_blocking(&mut sequence_v3_core, &sequence_v3_completion)
+                    .expect("write V3 sequence completion");
+                let persistence: LauncherExecutionCompletionPersistenceV1 =
+                    read_json_frame_blocking(&mut sequence_v3_core)
+                        .expect("read V3 sequence completion persistence");
+                assert_eq!(
+                    persistence.completion_identity,
+                    sequence_v3_completion.identity
+                );
+            });
+            let mut sequence_v3_child = PreparedChild {
+                pid: sequence_v3_pid,
+                record: LauncherChildProcessV1 {
+                    pid: sequence_v3_pid as u32,
+                    ..child.record.clone()
+                },
+                launcher_session: sequence_v3_session,
+                selected_session_object: test_descriptor_object(),
+                stdout: Some(sequence_v3_stdout),
+                stderr: Some(sequence_v3_stderr),
+            };
+            let (sequence_v3_observed, sequence_v3_exit) = sequence_v3_child
+                .relay_selected_execution_with_secret_binding(
+                    &client,
+                    &consumption,
+                    |request, _| {
+                        assert_eq!(request.identity, prelude.observation_request_identity);
+                        Ok((observation_response, prelude))
+                    },
+                    |request, _| {
+                        assert_eq!(request.identity, snapshot_response.request_identity);
+                        Ok(snapshot_response)
+                    },
+                    |_, _| unreachable!("same-child V3 lane must not use legacy binding"),
+                    |_, _| unreachable!("same-child V3 lane must not use V2 binding"),
+                    |request, _| {
+                        assert_eq!(request.identity, v3_response.request_identity);
+                        Ok(v3_response)
+                    },
+                    |_| Ok(()),
+                )
+                .expect("same-child framed V3 relay");
+            assert_eq!(sequence_v3_observed, expected_completion);
+            assert_eq!(sequence_v3_exit, Some(0));
+            sequence_v3_core_thread
+                .join()
+                .expect("same-child V3 sequence core thread");
 
             for point in [
                 EarlyRefusalPoint::AfterPrelude,
@@ -3656,6 +3852,7 @@ mod tests {
                 |_, _| unreachable!("direct V2 binding must not request a snapshot"),
                 |_, _| unreachable!("direct V2 binding must not request V1 binding"),
                 |_, _| unreachable!("direct V2 binding must refuse before its callback"),
+                |_, _| unreachable!("direct V2 binding must refuse before a V3 callback"),
                 |_| unreachable!("direct V2 binding must not reach completion persistence"),
             ),
             Err(PreparedChildError::AuthorizationAdmissionMismatch)
@@ -3666,6 +3863,66 @@ mod tests {
         direct_v2_core_thread
             .join()
             .expect("direct V2 binding core thread");
+
+        let direct_v3_pid = unsafe { libc::fork() };
+        assert!(direct_v3_pid >= 0, "fork direct-V3-binding child");
+        if direct_v3_pid == 0 {
+            unsafe { libc::pause() };
+            unsafe { libc::_exit(0) };
+        }
+        let (direct_v3_session, mut direct_v3_core) =
+            UnixStream::pair().expect("direct V3 binding session");
+        let (direct_v3_stdout, direct_v3_stdout_writer) =
+            pipe_cloexec().expect("direct V3 stdout pipe");
+        let (direct_v3_stderr, direct_v3_stderr_writer) =
+            pipe_cloexec().expect("direct V3 stderr pipe");
+        drop(direct_v3_stdout_writer);
+        drop(direct_v3_stderr_writer);
+        let direct_v3_request = {
+            let mut value = serde_json::to_value(&expected_binding_request)
+                .expect("serialize V1 binding request");
+            value["schema_version"] = serde_json::json!(3);
+            value["message_kind"] = serde_json::json!(
+                PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V3
+            );
+            value["protected_snapshot_identity"] = serde_json::json!(identity('f'));
+            value["transport_dependency_record_identity"] = serde_json::json!(identity('g'));
+            value
+        };
+        let direct_v3_core_thread = std::thread::spawn(move || {
+            write_json_frame_blocking(&mut direct_v3_core, &direct_v3_request)
+                .expect("send direct V3 binding request");
+        });
+        let mut direct_v3_child = PreparedChild {
+            pid: direct_v3_pid,
+            record: LauncherChildProcessV1 {
+                pid: direct_v3_pid as u32,
+                ..child.record.clone()
+            },
+            launcher_session: direct_v3_session,
+            selected_session_object: test_descriptor_object(),
+            stdout: Some(direct_v3_stdout),
+            stderr: Some(direct_v3_stderr),
+        };
+        assert_eq!(
+            direct_v3_child.relay_selected_execution_with_secret_binding(
+                &client,
+                &consumption,
+                |_, _| unreachable!("direct V3 binding must not request a prelude"),
+                |_, _| unreachable!("direct V3 binding must not request a snapshot"),
+                |_, _| unreachable!("direct V3 binding must not request V1 binding"),
+                |_, _| unreachable!("direct V3 binding must not request V2 binding"),
+                |_, _| unreachable!("direct V3 binding must refuse before its callback"),
+                |_| unreachable!("direct V3 binding must not reach completion persistence"),
+            ),
+            Err(PreparedChildError::AuthorizationAdmissionMismatch)
+        );
+        direct_v3_child
+            .terminate_and_reap()
+            .expect("clean direct V3 binding child");
+        direct_v3_core_thread
+            .join()
+            .expect("direct V3 binding core thread");
     }
 
     #[test]

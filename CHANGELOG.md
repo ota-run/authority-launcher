@@ -26,6 +26,14 @@
 
 ## Unreleased
 
+- Pin Authority Protocol `63a352f7a926a2fed0866db0de61749fa701df75` and add the additive
+  snapshot-bound V3 transaction-binding relay. V2 remains unchanged. V3 binds one exact
+  Core-derived transport-dependency record identity through the retained selected-child session,
+  same-child prelude, protected snapshot, capability derivation, and replay consumption. Launcher
+  neither parses dependency graphs nor prepares, opens, or dispatches transport. This activates no
+  OIDC request, provider contact, materialization, injection, execution release, positive evidence,
+  Step 8, or V12.2 capability.
+
 - Add the provider-free protected-authority snapshot bridge for the selected child. Launcher opens
   and retains the exact protected stores before child creation, revalidates their descriptors and
   signed bytes before returning one private snapshot, and permits only the ordered snapshot then

@@ -92,7 +92,7 @@ beneath `/etc/ota/secret-delivery`. Launcher opens and retains them before selec
 then revalidates their exact descriptors and signed bytes before private snapshot disclosure. A
 separate root-owned replay directory at
 `/var/lib/ota/authority-launcher/authority-snapshot-replay` reserves before disclosure and is
-consumed only after exact V2 binding reconciliation. Ordinary non-secret completion does not
+consumed only after exact V2 or additive V3 binding reconciliation. Ordinary non-secret completion does not
 require these stores. The empty structural snapshots grant no verifier or provider authority and
 prove no provider contact, materialization, or secret delivery.
 
@@ -317,8 +317,10 @@ root-owned regular mode-`0400` files; retains exact bytes and descriptor identit
 a retained live Unix-stream session descriptor and invocation cgroup before deriving a
 protocol-verified `ProtectedLauncherCapabilityV1`. After signed admission and lease consumption,
 the selected child may either use the immutable V1 binding exchange or request one private
-protected-authority snapshot followed by one snapshot-bound V2 binding over that same inherited
-session. Launcher derives the capability from the exact retained child, scope, cgroup, session,
+protected-authority snapshot followed by one snapshot-bound V2 or additive V3 binding over that
+same inherited session. V3 carries one opaque Core-derived transport-dependency record identity;
+Launcher validates and relays that identity without interpreting a dependency graph or preparing
+transport. Launcher derives the capability from the exact retained child, scope, cgroup, session,
 stores, authority context, installation evidence, and replay state, then returns one
 Protocol-reconciled private binding plus its signed public projection. The private capability
 identity never enters the public projection. Duplicate, interleaved, reversed, or replayed exchange
