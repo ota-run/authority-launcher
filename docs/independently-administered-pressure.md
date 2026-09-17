@@ -221,6 +221,25 @@ only after all protected authority services and state are durable. The
 job principal therefore cannot start through the canonical runner service during provisioning;
 the gate opens only when provisioning completes.
 
+## Hosted Evidence Custody
+
+After the separately reviewed provider-free custody correction is provisioned, the root-owned
+capture path watches only the exact final `COMPLETE` marker for the installation-bound workflow run
+and attempt. It does not watch a broad job-writable directory and it must never be started, edited,
+or repointed by the job principal.
+
+The capture service accepts only its closed success set or its separate closed failure-diagnostic
+set. It records a complete failed job only as `failure`; malformed, incomplete, stale, replayed,
+substituted, or changing input refuses, and a failure record can never satisfy a success gate. The
+service copies through descriptor-relative no-follow reads into a root-only store, recomputes the
+bundle digest as root, then atomically publishes one non-secret root-owned public capture record.
+
+The Core workflow waits for and reconciles that record against the exact installation, request,
+run, attempt, revisions, and expected outcome. Administrators retrieve retained bytes from the
+root-only store. This is a job-inaccessible root-custodied copy of job-produced evidence, not
+independent attestation of job assertions or immutability against the root administrator. It does
+not authorize OIDC, provider contact, materialization, delivery, or selected-work release.
+
 ## Run And Inspect
 
 Dispatch `Systemd V3 independently administered pressure`. The committed workflow:
