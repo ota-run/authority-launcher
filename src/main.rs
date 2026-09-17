@@ -41,6 +41,8 @@ mod installation_manifest;
 #[cfg(target_os = "linux")]
 mod prepared_child;
 #[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
+mod pressure_evidence_capture;
+#[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
 mod pressure_provision;
 #[cfg(all(target_os = "linux", feature = "protected-attestor"))]
 mod protected_authority_snapshot;
@@ -134,6 +136,11 @@ enum Command {
         #[arg(long, requires = "secret_delivery_pressure_builder_binary")]
         secret_delivery_pressure_request: Option<std::path::PathBuf>,
     },
+
+    /// Internal root-only capture of the exact provider-free pressure evidence bundle.
+    #[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
+    #[command(hide = true)]
+    CaptureSecretDeliveryPressureEvidence,
 }
 
 fn main() -> ExitCode {
@@ -175,6 +182,8 @@ fn main() -> ExitCode {
             secret_delivery_pressure_builder_binary,
             secret_delivery_pressure_request,
         }),
+        #[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
+        Command::CaptureSecretDeliveryPressureEvidence => pressure_evidence_capture::capture(),
     };
     match result {
         Ok(code) => ExitCode::from(code),

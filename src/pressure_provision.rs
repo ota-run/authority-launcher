@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -92,6 +93,10 @@ use crate::installation_manifest::{
     protected_installation_manifest_identity, protected_launcher_installed_build_identity,
     public_installation_evidence_identity, resolve_optional_protected_executable_alias,
 };
+use crate::pressure_evidence_capture::{
+    CAPTURE_CONFIG_PATH, CAPTURE_PATH_UNIT, CAPTURE_PUBLIC_ROOT, CAPTURE_SERVICE,
+    CAPTURE_SOURCE_ROOT, CAPTURE_STORE_ROOT, PressureEvidenceCaptureConfigV1, config_identity,
+};
 use crate::protected_history::{
     HISTORY_BINDING_PATH, HISTORY_BLOB_ROOT, HISTORY_CATALOG_ROOT, HISTORY_SOCKET_PATH,
     ProtectedHistoryBindingV1, ProtectedHistoryRepositoryMappingV1,
@@ -99,7 +104,7 @@ use crate::protected_history::{
 };
 use crate::protected_launcher_capability::{
     SECRET_DELIVERY_AUTHORITY_DIRECTORY, SECRET_DELIVERY_BINDING_STORE,
-    SECRET_DELIVERY_VERIFIER_STORE,
+    SECRET_DELIVERY_VERIFIER_STORE, open_root, openat2_beneath_with_mode,
 };
 
 const ETC_OTA: &str = "/etc/ota";
@@ -306,6 +311,9 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     for (path, mode) in protected_directories() {
         create_root_directory(Path::new(path), mode)?;
     }
+    if secret_delivery_pressure_fixture.is_some() {
+        create_job_evidence_root(&job)?;
+    }
     create_root_directory(
         Path::new(POLKIT_RULE)
             .parent()
@@ -509,9 +517,30 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
     let secret_delivery_pressure_environment = install_secret_delivery_authority(
         secret_delivery_pressure_fixture.as_ref(),
         &source_revisions.1,
+        &source_revisions.2,
+        &source_revisions.0,
         &core_build_identity,
         &ota_artifact_identity,
+        &job,
     )?;
+    if secret_delivery_pressure_fixture.is_some() {
+        let run_id = secret_delivery_pressure_environment
+            .get("GITHUB_RUN_ID")
+            .ok_or_else(|| String::from("pressure authority run identifier is unavailable"))?;
+        let attempt = secret_delivery_pressure_environment
+            .get("GITHUB_RUN_ATTEMPT")
+            .ok_or_else(|| String::from("pressure authority run attempt is unavailable"))?;
+        write_root_file(
+            Path::new(CAPTURE_SERVICE),
+            pressure_evidence_capture_service_unit(&launcher_binary).as_bytes(),
+            0o644,
+        )?;
+        write_root_file(
+            Path::new(CAPTURE_PATH_UNIT),
+            pressure_evidence_capture_path_unit(run_id, attempt).as_bytes(),
+            0o644,
+        )?;
+    }
     let mut runner_administrator = RunnerAdministratorAuthorityV1 {
         schema_version: 1,
         record_kind: RUNNER_ADMINISTRATOR_AUTHORITY.into(),
@@ -882,6 +911,10 @@ pub(crate) fn provision(request: ProvisionRequest) -> Result<u8, String> {
         "ota-authority-broker-proxy.socket",
         "ota-authority-history.socket",
     ])?;
+    if secret_delivery_pressure_fixture.is_some() {
+        run_systemctl(&["enable", "ota-authority-pressure-evidence-capture.path"])?;
+        run_systemctl(&["start", "ota-authority-pressure-evidence-capture.path"])?;
+    }
     run_systemctl(&[
         "start",
         "ota-authority-launcher.socket",
@@ -1073,7 +1106,70 @@ fn polkit_deny_rule(job: &Account, execution: &Account) -> Result<String, String
     ))
 }
 
-fn protected_directories() -> [(&'static str, u32); 14] {
+fn create_job_evidence_root(job: &Account) -> Result<(), String> {
+    let parent = open_root(Path::new(STATE_ROOT), 0, 0)
+        .map_err(|_| String::from("pressure evidence root parent is unavailable"))?;
+    let name = Path::new(CAPTURE_SOURCE_ROOT)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| String::from("pressure evidence root is invalid"))?;
+    let name_c =
+        CString::new(name).map_err(|_| String::from("pressure evidence root is invalid"))?;
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name_c.as_ptr(), 0o700) } != 0 {
+        return Err(String::from("pressure evidence root is unavailable"));
+    }
+    let directory = openat2_beneath_with_mode(
+        parent.as_raw_fd(),
+        name.as_bytes(),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        0,
+    )
+    .map_err(|_| String::from("pressure evidence root is unavailable"))?;
+    if unsafe { libc::fchown(directory.as_raw_fd(), 0, job.gid) } != 0 {
+        return Err(String::from(
+            "pressure evidence root ownership is unavailable",
+        ));
+    }
+    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o770) } != 0 {
+        return Err(String::from(
+            "pressure evidence root permissions are unavailable",
+        ));
+    }
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(directory.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(String::from("pressure evidence root is unavailable"));
+    }
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || stat.st_uid != 0
+        || stat.st_gid != job.gid
+        || stat.st_mode & 0o777 != 0o770
+    {
+        return Err(String::from("pressure evidence root protection is invalid"));
+    }
+    Ok(())
+}
+
+fn pressure_evidence_capture_service_unit(launcher: &Path) -> String {
+    format!(
+        "[Unit]\nDescription=Ota root custody capture for provider-free pressure evidence\nAfter=network.target\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nUser=root\nGroup=root\nUMask=0077\nExecStart={} capture-secret-delivery-pressure-evidence\nNoNewPrivileges=yes\nCapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN\nAmbientCapabilities=\nPrivateTmp=yes\nPrivateDevices=yes\nProtectSystem=strict\nProtectHome=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectControlGroups=yes\nProtectProc=invisible\nProcSubset=pid\nRestrictNamespaces=yes\nRestrictAddressFamilies=AF_UNIX\nReadOnlyPaths={} {}\nReadWritePaths={} {}\n",
+        launcher.display(),
+        CAPTURE_CONFIG_PATH,
+        CAPTURE_SOURCE_ROOT,
+        CAPTURE_STORE_ROOT,
+        CAPTURE_PUBLIC_ROOT
+    )
+}
+
+fn pressure_evidence_capture_path_unit(run_id: &str, attempt: &str) -> String {
+    format!(
+        "[Unit]\nDescription=Ota exact provider-free pressure evidence capture trigger\n\n[Path]\nPathExists={}/{}/COMPLETE\nUnit=ota-authority-pressure-evidence-capture.service\n\n[Install]\nWantedBy=multi-user.target\n",
+        CAPTURE_SOURCE_ROOT,
+        format_args!("{run_id}-{attempt}"),
+    )
+}
+
+fn protected_directories() -> [(&'static str, u32); 16] {
     [
         (ETC_OTA, 0o755),
         (STATE_ROOT, 0o755),
@@ -1089,6 +1185,8 @@ fn protected_directories() -> [(&'static str, u32); 14] {
         (LAUNCHER_RUNTIME, 0o700),
         (HISTORY_BLOB_ROOT, 0o700),
         (HISTORY_CATALOG_ROOT, 0o700),
+        (CAPTURE_STORE_ROOT, 0o700),
+        (CAPTURE_PUBLIC_ROOT, 0o755),
     ]
 }
 
@@ -1323,8 +1421,11 @@ fn protected_pressure_input(path: &Path) -> Result<PathBuf, String> {
 fn install_secret_delivery_authority(
     fixture: Option<&SecretDeliveryPressureFixture>,
     core_source_revision: &str,
+    launcher_source_revision: &str,
+    protocol_source_revision: &str,
     core_build_identity: &str,
     ota_artifact_identity: &str,
+    job: &Account,
 ) -> Result<BTreeMap<String, String>, String> {
     let Some(fixture) = fixture else {
         match fs::remove_file(SECRET_DELIVERY_PRESSURE_INSTALLATION_EVIDENCE) {
@@ -1334,6 +1435,17 @@ fn install_secret_delivery_authority(
                 return Err(String::from(
                     "stale pressure authority installation evidence is unavailable",
                 ));
+            }
+        }
+        for path in [CAPTURE_CONFIG_PATH, CAPTURE_SERVICE, CAPTURE_PATH_UNIT] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err(String::from(
+                        "stale pressure evidence capture state is unavailable",
+                    ));
+                }
             }
         }
         write_root_file(
@@ -1407,6 +1519,35 @@ fn install_secret_delivery_authority(
         Path::new(SECRET_DELIVERY_PRESSURE_INSTALLATION_EVIDENCE),
         &public_evidence,
         0o644,
+    )?;
+    let mut capture_config = PressureEvidenceCaptureConfigV1 {
+        schema_version: 1,
+        record_kind: String::from("secret_delivery_pressure_evidence_capture_config"),
+        identity: String::new(),
+        installation_identity: public_evidence.identity.clone(),
+        request_identity: public_evidence.request_identity.clone(),
+        core_source_revision: core_source_revision.into(),
+        launcher_source_revision: launcher_source_revision.into(),
+        protocol_source_revision: protocol_source_revision.into(),
+        workflow_run_id: installation
+            .selected_process_environment
+            .get("GITHUB_RUN_ID")
+            .cloned()
+            .ok_or_else(|| String::from("pressure authority run identifier is unavailable"))?,
+        workflow_run_attempt: installation
+            .selected_process_environment
+            .get("GITHUB_RUN_ATTEMPT")
+            .cloned()
+            .ok_or_else(|| String::from("pressure authority run attempt is unavailable"))?,
+        job_uid: job.uid,
+        job_gid: job.gid,
+    };
+    capture_config.identity = config_identity(&capture_config)?;
+    write_root_file(
+        Path::new(CAPTURE_CONFIG_PATH),
+        &serde_jcs::to_vec(&capture_config)
+            .map_err(|_| String::from("pressure evidence capture configuration is unavailable"))?,
+        0o400,
     )?;
     // Activating the verifier is the final write; every earlier failure leaves authority disabled.
     write_root_file(
@@ -1930,6 +2071,10 @@ fn managed_authority_state_paths() -> Vec<&'static str> {
         CAPABILITY_OBSERVATION_REPLAY_DIRECTORY,
         AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY,
         SECRET_DELIVERY_AUTHORITY_DIRECTORY,
+        CAPTURE_CONFIG_PATH,
+        CAPTURE_SOURCE_ROOT,
+        CAPTURE_STORE_ROOT,
+        CAPTURE_PUBLIC_ROOT,
         LAUNCHER_RUNTIME,
         LAUNCHER_SOCKET,
         ATTESTOR_SOCKET,
@@ -1949,11 +2094,13 @@ fn managed_authority_state_paths() -> Vec<&'static str> {
         HISTORY_SERVICE,
         HISTORY_SOCKET_UNIT,
         INVOCATION_SLICE,
+        CAPTURE_SERVICE,
+        CAPTURE_PATH_UNIT,
         POLKIT_RULE,
     ]
 }
 
-fn managed_authority_units() -> [&'static str; 8] {
+fn managed_authority_units() -> [&'static str; 10] {
     [
         "ota-authority-launcher.service",
         "ota-authority-launcher.socket",
@@ -1963,6 +2110,8 @@ fn managed_authority_units() -> [&'static str; 8] {
         "ota-authority-broker-proxy.socket",
         "ota-authority-history.service",
         "ota-authority-history.socket",
+        "ota-authority-pressure-evidence-capture.service",
+        "ota-authority-pressure-evidence-capture.path",
     ]
 }
 
@@ -2563,8 +2712,30 @@ mod tests {
                 "ota-authority-broker-proxy.socket",
                 "ota-authority-history.service",
                 "ota-authority-history.socket",
+                "ota-authority-pressure-evidence-capture.service",
+                "ota-authority-pressure-evidence-capture.path",
             ]
         );
+    }
+
+    #[test]
+    fn pressure_evidence_capture_units_are_exact_and_one_shot_terminal() {
+        let service = pressure_evidence_capture_service_unit(Path::new(
+            "/usr/lib/ota-authority/bin/ota-authority-launcher",
+        ));
+        assert!(service.contains("Type=oneshot\nRemainAfterExit=yes\n"));
+        assert!(service.contains("capture-secret-delivery-pressure-evidence"));
+        assert!(service.contains(&format!(
+            "ReadWritePaths={} {}",
+            CAPTURE_STORE_ROOT, CAPTURE_PUBLIC_ROOT
+        )));
+
+        let path = pressure_evidence_capture_path_unit("123", "4");
+        assert!(path.contains(&format!(
+            "PathExists={}/123-4/COMPLETE",
+            CAPTURE_SOURCE_ROOT
+        )));
+        assert!(path.contains("Unit=ota-authority-pressure-evidence-capture.service"));
     }
 
     #[test]
