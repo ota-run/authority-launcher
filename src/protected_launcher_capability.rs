@@ -30,21 +30,28 @@
 use ota_authority_protocol::{
     LauncherChildProcessV1, LauncherInvocationRequestV1, LauncherPrincipalMappingV1,
     LauncherSystemdScopeV1, OtaProcessPostureV1, PROTECTED_AUTHORITY_SNAPSHOT,
-    PROTECTED_AUTHORITY_SNAPSHOT_RESPONSE, PROTECTED_LAUNCHER_CAPABILITY,
-    ProtectedAuthoritySnapshotPayloadV1, ProtectedAuthoritySnapshotRequestV1,
-    ProtectedAuthoritySnapshotResponseV1, ProtectedLauncherAuthorityContextV1,
-    ProtectedLauncherCapabilityEvidenceV1, ProtectedLauncherCapabilityV1,
-    ProtectedLauncherDescriptorRoleV1, ProtectedLauncherDescriptorV1,
-    ProtectedSecretDeliveryBindingBundleV1, ProtectedSecretDeliveryVerifierStoreV1,
-    SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, SystemdProtectedLauncherInstanceEvidenceV2,
-    launcher_invocation_request_identity, protected_authority_snapshot_payload_v1_identity,
+    PROTECTED_AUTHORITY_SNAPSHOT_RESPONSE, PROTECTED_AUTHORITY_SNAPSHOT_RESPONSE_V2,
+    PROTECTED_AUTHORITY_SNAPSHOT_V2, PROTECTED_LAUNCHER_CAPABILITY,
+    ProtectedAuthoritySnapshotPayloadV1, ProtectedAuthoritySnapshotPayloadV2,
+    ProtectedAuthoritySnapshotRequestV1, ProtectedAuthoritySnapshotRequestV2,
+    ProtectedAuthoritySnapshotResponseV1, ProtectedAuthoritySnapshotResponseV2,
+    ProtectedLauncherAuthorityContextV1, ProtectedLauncherCapabilityEvidenceV1,
+    ProtectedLauncherCapabilityV1, ProtectedLauncherDescriptorRoleV1,
+    ProtectedLauncherDescriptorV1, ProtectedSecretDeliveryBindingBundleV1,
+    ProtectedSecretDeliveryVerifierStoreV1, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1,
+    SystemdProtectedLauncherInstanceEvidenceV2, launcher_invocation_request_identity,
+    protected_authority_snapshot_payload_v1_identity,
+    protected_authority_snapshot_payload_v2_identity,
     protected_authority_snapshot_response_v1_identity,
+    protected_authority_snapshot_response_v2_identity,
     protected_launcher_authority_context_v1_identity, protected_launcher_boot_v1_identity,
     protected_launcher_capability_v1_identity, protected_launcher_cgroup_v1_identity,
     protected_launcher_invocation_nonce_v1_identity,
     protected_secret_delivery_binding_bundle_signature_message_v1,
     reconcile_protected_authority_snapshot_request_v1,
+    reconcile_protected_authority_snapshot_request_v2,
     reconcile_protected_authority_snapshot_response_v1,
+    reconcile_protected_authority_snapshot_response_v2,
     reconcile_protected_secret_delivery_authority_bundle_v1,
     validate_protected_launcher_capability_v1,
 };
@@ -608,6 +615,58 @@ impl ProtectedAuthorityStoresV1 {
         response.identity = protected_authority_snapshot_response_v1_identity(&response)
             .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
         reconcile_protected_authority_snapshot_response_v1(
+            request,
+            &response,
+            startup_continuation,
+            observed_at_unix_seconds,
+        )
+        .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        Ok(response)
+    }
+
+    pub(crate) fn respond_to_authority_snapshot_v2(
+        &self,
+        request: &ProtectedAuthoritySnapshotRequestV2,
+        startup_continuation: &ota_authority_protocol::LauncherStartupContinuationV1,
+    ) -> Result<ProtectedAuthoritySnapshotResponseV2, ProtectedLauncherCapabilityError> {
+        let observed_at_unix_seconds = u64::try_from(OffsetDateTime::now_utc().unix_timestamp())
+            .map_err(|_| ProtectedLauncherCapabilityError::Unavailable)?;
+        reconcile_protected_authority_snapshot_request_v2(
+            request,
+            startup_continuation,
+            observed_at_unix_seconds,
+        )
+        .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        let verified =
+            self.verify_secret_delivery_authority_bundle_inner_v1(observed_at_unix_seconds)?;
+        let payload = ProtectedAuthoritySnapshotPayloadV2 {
+            schema_version: 2,
+            record_kind: PROTECTED_AUTHORITY_SNAPSHOT_V2.into(),
+            request_identity: request.identity.clone(),
+            launcher_request_identity: request.launcher_request_identity.clone(),
+            startup_continuation_identity: request.startup_continuation_identity.clone(),
+            session_identity: request.session_identity.clone(),
+            contract_identity: request.contract_identity.clone(),
+            selected_execution_graph_identity: request.selected_execution_graph_identity.clone(),
+            verifier_store_descriptor: verified.verifier_store_descriptor,
+            binding_store_descriptor: verified.binding_store_descriptor,
+            verifier_store_bytes: URL_SAFE_NO_PAD.encode(verified.verifier_store_bytes),
+            binding_store_bytes: URL_SAFE_NO_PAD.encode(verified.binding_store_bytes),
+        };
+        let protected_snapshot_identity =
+            protected_authority_snapshot_payload_v2_identity(&payload)
+                .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        let mut response = ProtectedAuthoritySnapshotResponseV2 {
+            schema_version: 2,
+            message_kind: PROTECTED_AUTHORITY_SNAPSHOT_RESPONSE_V2.into(),
+            identity: String::new(),
+            request_identity: request.identity.clone(),
+            payload,
+            protected_snapshot_identity,
+        };
+        response.identity = protected_authority_snapshot_response_v2_identity(&response)
+            .map_err(|_| ProtectedLauncherCapabilityError::ReconciliationFailed)?;
+        reconcile_protected_authority_snapshot_response_v2(
             request,
             &response,
             startup_continuation,
@@ -1407,6 +1466,83 @@ mod linux_tests {
     }
 
     #[test]
+    fn retained_authority_snapshot_v2_reconciles_exact_request_and_stores() {
+        let now = u64::try_from(OffsetDateTime::now_utc().unix_timestamp()).expect("clock");
+        let (root, _, _, _) = create_signed_authority_bundle_store_tree_at(now - 1, now + 300);
+        let metadata = root.path().metadata().expect("root metadata");
+        let stores = ProtectedAuthorityStoresV1::open_beneath(
+            root.path(),
+            Path::new("authority"),
+            metadata.uid(),
+            metadata.gid(),
+        )
+        .expect("retained stores");
+        let mut startup = LauncherStartupContinuationV1 {
+            schema_version: 1,
+            identity: String::new(),
+            message_kind: LAUNCHER_STARTUP_CONTINUATION.into(),
+            invocation_id: "snapshot-v2-test".into(),
+            launcher_request_identity: format!("sha256:{}", "a".repeat(64)),
+            child_process_identity: format!("sha256:{}", "b".repeat(64)),
+            working_directory_identity: format!("sha256:{}", "c".repeat(64)),
+            process_posture_identity: format!("sha256:{}", "d".repeat(64)),
+            principal_mapping_identity: format!("sha256:{}", "e".repeat(64)),
+        };
+        startup.identity = launcher_startup_continuation_identity(&startup).expect("startup");
+        let nonce = [12_u8; 32];
+        let mut challenge = ProtectedAuthoritySnapshotChallengeV1 {
+            schema_version: 1,
+            message_kind: PROTECTED_AUTHORITY_SNAPSHOT_CHALLENGE.into(),
+            identity: String::new(),
+            nonce_commitment: protected_authority_snapshot_nonce_commitment_v1(&nonce)
+                .expect("nonce commitment"),
+            issued_at_unix_seconds: now - 1,
+            expires_at_unix_seconds: now + 299,
+        };
+        challenge.identity =
+            protected_authority_snapshot_challenge_v1_identity(&challenge).expect("challenge");
+        let mut request = ProtectedAuthoritySnapshotRequestV2 {
+            schema_version: 2,
+            message_kind: PROTECTED_AUTHORITY_SNAPSHOT_REQUEST_V2.into(),
+            identity: String::new(),
+            challenge,
+            nonce: URL_SAFE_NO_PAD.encode(nonce),
+            launcher_request_identity: startup.launcher_request_identity.clone(),
+            startup_continuation_identity: startup.identity.clone(),
+            session_identity: protected_launcher_secret_delivery_transaction_session_v1_identity(
+                &startup.identity,
+            )
+            .expect("session"),
+            contract_identity: format!("sha256:{}", "f".repeat(64)),
+            selected_execution_graph_identity: format!("sha256:{}", "0".repeat(64)),
+        };
+        request.identity =
+            protected_authority_snapshot_request_v2_identity(&request).expect("snapshot request");
+        let response = stores
+            .respond_to_authority_snapshot_v2(&request, &startup)
+            .expect("retained V2 response");
+        assert_eq!(response.request_identity, request.identity);
+        assert_eq!(
+            response.payload.verifier_store_bytes,
+            URL_SAFE_NO_PAD.encode(stores.verifier_store_bytes())
+        );
+        assert_eq!(
+            response.payload.binding_store_bytes,
+            URL_SAFE_NO_PAD.encode(stores.binding_store_bytes())
+        );
+
+        let mut substituted_startup = startup.clone();
+        substituted_startup.launcher_request_identity = format!("sha256:{}", "1".repeat(64));
+        substituted_startup.identity =
+            launcher_startup_continuation_identity(&substituted_startup).expect("substitution");
+        assert!(
+            stores
+                .respond_to_authority_snapshot_v2(&request, &substituted_startup)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn retained_authority_bundle_verifies_signature_and_descriptor_bytes() {
         let (root, _store, bundle, payload) = create_signed_authority_bundle_store_tree();
         let metadata = root.path().metadata().expect("root metadata");
@@ -1852,6 +1988,7 @@ mod privileged_linux_tests {
         derive_secret_delivery_transaction_binding_for_test_v1,
         derive_secret_delivery_transaction_binding_v2,
         derive_secret_delivery_transaction_binding_v3,
+        derive_secret_delivery_transaction_binding_v4,
     };
 
     struct CapabilityFixture {
@@ -2693,7 +2830,7 @@ mod privileged_linux_tests {
             .expect("V3 session identity"),
             same_child_capability_prelude_identity: prelude.prelude.identity.clone(),
             protected_snapshot_identity: snapshot_response.protected_snapshot_identity.clone(),
-            transport_dependency_record_identity: identity('g'),
+            transport_dependency_record_identity: identity('a'),
         };
         v3_request.identity =
             protected_launcher_secret_delivery_transaction_binding_request_v3_identity(&v3_request)
@@ -2718,6 +2855,80 @@ mod privileged_linux_tests {
             signing_count.get(),
             1,
             "V3 must not sign a second projection"
+        );
+
+        let mut snapshot_request_v2 = ProtectedAuthoritySnapshotRequestV2 {
+            schema_version: 2,
+            message_kind: PROTECTED_AUTHORITY_SNAPSHOT_REQUEST_V2.into(),
+            identity: String::new(),
+            challenge: snapshot_request.challenge.clone(),
+            nonce: snapshot_request.nonce.clone(),
+            launcher_request_identity: snapshot_request.launcher_request_identity.clone(),
+            startup_continuation_identity: snapshot_request.startup_continuation_identity.clone(),
+            session_identity: snapshot_request.session_identity.clone(),
+            contract_identity: snapshot_request.contract_identity.clone(),
+            selected_execution_graph_identity: snapshot_request
+                .selected_execution_graph_identity
+                .clone(),
+        };
+        snapshot_request_v2.identity =
+            protected_authority_snapshot_request_v2_identity(&snapshot_request_v2)
+                .expect("V2 snapshot request identity");
+        let snapshot_response_v2 = prelude_observation
+            .stores
+            .respond_to_authority_snapshot_v2(&snapshot_request_v2, &startup_continuation)
+            .expect("V2 snapshot response");
+        let mut v4_request = ProtectedLauncherSecretDeliveryTransactionBindingRequestV4 {
+            schema_version: 4,
+            message_kind: PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V4.into(),
+            identity: String::new(),
+            launcher_request_identity: request_identity.clone(),
+            observation: prelude_request.clone(),
+            secret_transaction_candidate_identity: identity('c'),
+            startup_continuation_identity: startup_continuation.identity.clone(),
+            session_identity: snapshot_request_v2.session_identity.clone(),
+            same_child_capability_prelude_identity: prelude.prelude.identity.clone(),
+            protected_snapshot_identity: snapshot_response_v2.protected_snapshot_identity.clone(),
+            protected_snapshot_schema_version: 2,
+            protected_snapshot_record_kind: PROTECTED_AUTHORITY_SNAPSHOT_V2.into(),
+            transport_dependency_record_identity: identity('a'),
+        };
+        v4_request.identity =
+            protected_launcher_secret_delivery_transaction_binding_request_v4_identity(&v4_request)
+                .expect("V4 request identity");
+        let v4_response = derive_secret_delivery_transaction_binding_v4(
+            &v4_request,
+            &snapshot_request_v2,
+            &snapshot_response_v2,
+            &startup_continuation,
+            &identity('d'),
+            &prelude,
+            &fixture.context(),
+            &mut prelude_observation,
+        )
+        .expect("same-child V4 binding");
+        assert_eq!(v4_response.projection, prelude.response.projection);
+        assert_eq!(v4_response.binding.protected_snapshot_schema_version, 2);
+        assert_eq!(
+            signing_count.get(),
+            1,
+            "V4 must reuse the signed projection"
+        );
+
+        let mut substituted_v4_request = v4_request.clone();
+        substituted_v4_request.protected_snapshot_record_kind = PROTECTED_AUTHORITY_SNAPSHOT.into();
+        assert!(
+            derive_secret_delivery_transaction_binding_v4(
+                &substituted_v4_request,
+                &snapshot_request_v2,
+                &snapshot_response_v2,
+                &startup_continuation,
+                &identity('d'),
+                &prelude,
+                &fixture.context(),
+                &mut prelude_observation,
+            )
+            .is_err()
         );
 
         let mut malformed_v3_request = v3_request.clone();

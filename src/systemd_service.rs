@@ -39,6 +39,10 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(feature = "protected-attestor")]
+use crate::protected_authority_snapshot::{
+    ProtectedAuthoritySnapshotReplayStoreV1, ProtectedAuthoritySnapshotReservationV2,
+};
 #[cfg(test)]
 use ota_authority_launcher::linux_observations::LinuxObservationError;
 use ota_authority_launcher::linux_observations::{
@@ -76,6 +80,7 @@ use ota_authority_protocol::{
 };
 #[cfg(feature = "protected-attestor")]
 use ota_authority_protocol::{
+    ProtectedAuthoritySnapshotRequestV2, ProtectedAuthoritySnapshotResponseV2,
     ProtectedLauncherCapabilityObservationProbeRequestV1,
     ProtectedLauncherCapabilityObservationResponseV1,
     protected_launcher_capability_observation_probe_request_v1_identity,
@@ -631,6 +636,24 @@ fn refuse_secret_delivery_binding_without_protected_attestor() -> Result<
     Err(PreparedChildError::AuthorizationAdmissionMismatch)
 }
 
+#[cfg(feature = "protected-attestor")]
+fn refuse_unconsumed_snapshot_v2(
+    exchange: &RefCell<
+        Option<(
+            ProtectedAuthoritySnapshotReservationV2,
+            ProtectedAuthoritySnapshotRequestV2,
+            ProtectedAuthoritySnapshotResponseV2,
+        )>,
+    >,
+    replay: Option<&ProtectedAuthoritySnapshotReplayStoreV1>,
+) {
+    if let Some((reservation, _, _)) = exchange.borrow_mut().take()
+        && let Some(replay) = replay
+    {
+        let _ = replay.refuse(&reservation);
+    }
+}
+
 #[cfg_attr(not(feature = "protected-attestor"), allow(unused_variables))]
 fn execute_selected_boundary(
     context: SelectedBoundaryExecutionContext<'_>,
@@ -646,6 +669,8 @@ fn execute_selected_boundary(
     let process_posture = boundary.process_posture.clone();
     #[cfg(feature = "protected-attestor")]
     let snapshot_exchange = RefCell::new(None);
+    #[cfg(feature = "protected-attestor")]
+    let snapshot_v2_exchange = RefCell::new(None);
     #[cfg(feature = "protected-attestor")]
     let same_child_prelude = RefCell::new(None);
     let completion = boundary.child.relay_selected_execution_with_secret_binding(
@@ -790,6 +815,39 @@ fn execute_selected_boundary(
                     }
                 };
                 *snapshot_exchange.borrow_mut() =
+                    Some((reservation, request.clone(), response.clone()));
+                Ok(response)
+            }
+        },
+        |request, _| {
+            #[cfg(not(feature = "protected-attestor"))]
+            {
+                let _ = request;
+                Err(PreparedChildError::AuthorizationAdmissionMismatch)
+            }
+            #[cfg(feature = "protected-attestor")]
+            {
+                let stores = context
+                    .protected_authority_stores
+                    .as_ref()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let replay = context
+                    .authority_snapshot_replay
+                    .as_ref()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let reservation = replay
+                    .reserve_v2(request, &startup_continuation)
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let response = match stores
+                    .respond_to_authority_snapshot_v2(request, &startup_continuation)
+                {
+                    Ok(response) => response,
+                    Err(_) => {
+                        let _ = replay.refuse(&reservation);
+                        return Err(PreparedChildError::AuthorizationAdmissionMismatch);
+                    }
+                };
+                *snapshot_v2_exchange.borrow_mut() =
                     Some((reservation, request.clone(), response.clone()));
                 Ok(response)
             }
@@ -1104,6 +1162,101 @@ fn execute_selected_boundary(
                 result
             }
         },
+        |request, _selected_session| {
+            #[cfg(not(feature = "protected-attestor"))]
+            {
+                let _ = (request, _selected_session);
+                Err(PreparedChildError::AuthorizationAdmissionMismatch)
+            }
+            #[cfg(feature = "protected-attestor")]
+            {
+                let replay = context
+                    .authority_snapshot_replay
+                    .as_ref()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let (reservation, snapshot_request, snapshot_response) = snapshot_v2_exchange
+                    .borrow_mut()
+                    .take()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let result = (|| {
+                    let runtime_identity =
+                        verify_systemd_runtime(context.config, context.installation, &scope)
+                            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let mut evidence =
+                        crate::closed_profile_observations::collect_live_closed_profile_evidence(
+                            context.config,
+                            context.installation,
+                            context.mapping,
+                            stream,
+                            context.peer,
+                            &child_record,
+                            &scope,
+                            &process_posture,
+                            runtime_identity.as_str(),
+                        )
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let launcher_instance = collect_launcher_instance(
+                        context.config,
+                        &principal_mapping,
+                        &child_record,
+                        &scope,
+                        &process_posture,
+                        &mut evidence,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let (prelude, mut observation, authority) = same_child_prelude
+                        .borrow_mut()
+                        .take()
+                        .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let launcher_profile_identity =
+                        systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
+                            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let launcher_executable_identity = context
+                        .installation
+                        .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let capability_context =
+                        crate::protected_launcher_capability::ProtectedLauncherCapabilityContextV1 {
+                            request: context.launcher_request,
+                            child: &child_record,
+                            scope: &scope,
+                            principal_mapping: &principal_mapping,
+                            process_posture: &process_posture,
+                            launcher_instance: &launcher_instance,
+                            launcher_executable_identity,
+                            launcher_configuration_identity: context.config.identity.as_str(),
+                            launcher_service_binding_identity: context.config.service_unit_identity.as_str(),
+                            launcher_profile_identity: launcher_profile_identity.as_str(),
+                            service_uid: unsafe { libc::geteuid() },
+                            service_gid: unsafe { libc::getegid() },
+                            authority: &authority,
+                        };
+                    let installation_evidence_identity =
+                        crate::installation_manifest::load_public_installation_evidence_identity(
+                            context.installation,
+                        )
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let response = crate::protected_capability_observation::derive_secret_delivery_transaction_binding_v4(
+                        request,
+                        &snapshot_request,
+                        &snapshot_response,
+                        &startup_continuation,
+                        installation_evidence_identity.as_str(),
+                        &prelude,
+                        &capability_context,
+                        &mut observation,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    replay.consume_v4(&reservation, &snapshot_response, request, &response)
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    Ok(response)
+                })();
+                if result.is_err() {
+                    let _ = replay.refuse(&reservation);
+                }
+                result
+            }
+        },
         |completion| {
                 boundary
                     .active_slot
@@ -1120,6 +1273,11 @@ fn execute_selected_boundary(
     {
         let _ = replay.refuse(&reservation);
     }
+    #[cfg(feature = "protected-attestor")]
+    refuse_unconsumed_snapshot_v2(
+        &snapshot_v2_exchange,
+        context.authority_snapshot_replay.as_ref(),
+    );
     let (completion, observed_exit_code) = match completion {
         Ok(completion) => completion,
         Err(error) => {
@@ -2906,8 +3064,30 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "protected-attestor")]
+    use crate::protected_authority_snapshot::SnapshotReservation;
+
     fn test_identity(character: char) -> String {
         format!("sha256:{}", character.to_string().repeat(64))
+    }
+
+    #[cfg(feature = "protected-attestor")]
+    #[test]
+    fn unconsumed_v2_snapshot_is_terminally_refused_after_relay() {
+        let (directory, store, reservation, request, response) =
+            crate::protected_authority_snapshot::tests::service_cleanup_fixture_v2();
+        let record_name = reservation.record_name().to_owned();
+        let exchange = RefCell::new(Some((reservation, request, response)));
+
+        // A valid failed pre-binding completion returns Ok from the relay; cleanup is unconditional.
+        refuse_unconsumed_snapshot_v2(&exchange, Some(&store));
+
+        assert!(exchange.borrow().is_none());
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(directory.path().join(record_name)).expect("durable replay record"),
+        )
+        .expect("replay record JSON");
+        assert_eq!(record["status"], "refused");
     }
 
     #[cfg(not(feature = "protected-attestor"))]

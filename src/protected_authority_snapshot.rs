@@ -13,18 +13,25 @@ use std::path::Path;
 
 use ota_authority_protocol::{
     LauncherStartupContinuationV1, ProtectedAuthoritySnapshotRequestV1,
-    ProtectedAuthoritySnapshotResponseV1,
+    ProtectedAuthoritySnapshotRequestV2, ProtectedAuthoritySnapshotResponseV1,
+    ProtectedAuthoritySnapshotResponseV2,
     ProtectedLauncherSecretDeliveryTransactionBindingRequestV2,
     ProtectedLauncherSecretDeliveryTransactionBindingRequestV3,
+    ProtectedLauncherSecretDeliveryTransactionBindingRequestV4,
     ProtectedLauncherSecretDeliveryTransactionBindingResponseV2,
     ProtectedLauncherSecretDeliveryTransactionBindingResponseV3,
+    ProtectedLauncherSecretDeliveryTransactionBindingResponseV4,
     protected_authority_snapshot_response_v1_identity,
     reconcile_protected_authority_snapshot_request_v1,
+    reconcile_protected_authority_snapshot_request_v2,
     reconcile_protected_authority_snapshot_response_v1,
+    reconcile_protected_authority_snapshot_response_v2,
     validate_protected_launcher_secret_delivery_transaction_binding_request_v2,
     validate_protected_launcher_secret_delivery_transaction_binding_request_v3,
+    validate_protected_launcher_secret_delivery_transaction_binding_request_v4,
     validate_protected_launcher_secret_delivery_transaction_binding_v2,
     validate_protected_launcher_secret_delivery_transaction_binding_v3,
+    validate_protected_launcher_secret_delivery_transaction_binding_v4,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -79,6 +86,49 @@ pub(crate) struct ProtectedAuthoritySnapshotReservationV1 {
     startup_continuation: LauncherStartupContinuationV1,
 }
 
+pub(crate) struct ProtectedAuthoritySnapshotReservationV2 {
+    record_name: String,
+    request_identity: String,
+    challenge_identity: String,
+    startup_continuation_identity: String,
+    session_identity: String,
+    request: ProtectedAuthoritySnapshotRequestV2,
+    startup_continuation: LauncherStartupContinuationV1,
+}
+
+pub(crate) trait SnapshotReservation {
+    fn record_name(&self) -> &str;
+    fn request_identity(&self) -> &str;
+    fn challenge_identity(&self) -> &str;
+    fn startup_continuation_identity(&self) -> &str;
+    fn session_identity(&self) -> &str;
+}
+
+macro_rules! snapshot_reservation_fields {
+    ($type:ty) => {
+        impl SnapshotReservation for $type {
+            fn record_name(&self) -> &str {
+                &self.record_name
+            }
+            fn request_identity(&self) -> &str {
+                &self.request_identity
+            }
+            fn challenge_identity(&self) -> &str {
+                &self.challenge_identity
+            }
+            fn startup_continuation_identity(&self) -> &str {
+                &self.startup_continuation_identity
+            }
+            fn session_identity(&self) -> &str {
+                &self.session_identity
+            }
+        }
+    };
+}
+
+snapshot_reservation_fields!(ProtectedAuthoritySnapshotReservationV1);
+snapshot_reservation_fields!(ProtectedAuthoritySnapshotReservationV2);
+
 pub(crate) struct ProtectedAuthoritySnapshotReplayStoreV1 {
     directory: File,
     expected_uid: u32,
@@ -114,22 +164,24 @@ struct SnapshotConsumptionLinksV1 {
 }
 
 fn reconcile_consumption_links(
-    reservation: &ProtectedAuthoritySnapshotReservationV1,
+    reservation: &impl SnapshotReservation,
     links: &SnapshotConsumptionLinksV1,
 ) -> Result<ReconciledSnapshotConsumptionV1, ProtectedAuthoritySnapshotReplayError> {
-    if links.response_request_identity != reservation.request_identity
-        || links.payload_request_identity != reservation.request_identity
-        || links.payload_startup_continuation_identity != reservation.startup_continuation_identity
-        || links.payload_session_identity != reservation.session_identity
+    if links.response_request_identity != reservation.request_identity()
+        || links.payload_request_identity != reservation.request_identity()
+        || links.payload_startup_continuation_identity
+            != reservation.startup_continuation_identity()
+        || links.payload_session_identity != reservation.session_identity()
         || links.binding_request_startup_continuation_identity
-            != reservation.startup_continuation_identity
-        || links.binding_request_session_identity != reservation.session_identity
+            != reservation.startup_continuation_identity()
+        || links.binding_request_session_identity != reservation.session_identity()
         || links.binding_request_protected_snapshot_identity != links.protected_snapshot_identity
         || links.binding_response_request_identity != links.binding_request_identity
         || links.binding_response_protected_snapshot_identity != links.protected_snapshot_identity
         || links.binding_request_identity_in_binding != links.binding_request_identity
-        || links.binding_startup_continuation_identity != reservation.startup_continuation_identity
-        || links.binding_session_identity != reservation.session_identity
+        || links.binding_startup_continuation_identity
+            != reservation.startup_continuation_identity()
+        || links.binding_session_identity != reservation.session_identity()
         || links.binding_protected_snapshot_identity != links.protected_snapshot_identity
     {
         return Err(ProtectedAuthoritySnapshotReplayError::Mismatch);
@@ -215,6 +267,48 @@ impl ProtectedAuthoritySnapshotReplayStoreV1 {
             .sync_all()
             .map_err(|_| ProtectedAuthoritySnapshotReplayError::Unavailable)?;
         Ok(ProtectedAuthoritySnapshotReservationV1 {
+            record_name,
+            request_identity: request.identity.clone(),
+            challenge_identity: request.challenge.identity.clone(),
+            startup_continuation_identity: startup_continuation.identity.clone(),
+            session_identity: request.session_identity.clone(),
+            request: request.clone(),
+            startup_continuation: startup_continuation.clone(),
+        })
+    }
+
+    pub(crate) fn reserve_v2(
+        &self,
+        request: &ProtectedAuthoritySnapshotRequestV2,
+        startup_continuation: &LauncherStartupContinuationV1,
+    ) -> Result<ProtectedAuthoritySnapshotReservationV2, ProtectedAuthoritySnapshotReplayError>
+    {
+        reconcile_protected_authority_snapshot_request_v2(
+            request,
+            startup_continuation,
+            current_time()?,
+        )
+        .map_err(|_| ProtectedAuthoritySnapshotReplayError::Mismatch)?;
+        let record_name = record_name(&request.identity)?;
+        let lock = self.lock()?;
+        let _guard = FileLockGuard(&lock);
+        let record = SnapshotReplayRecordV1 {
+            schema_version: 1,
+            request_identity: request.identity.clone(),
+            challenge_identity: request.challenge.identity.clone(),
+            startup_continuation_identity: startup_continuation.identity.clone(),
+            session_identity: request.session_identity.clone(),
+            status: SnapshotReplayStatusV1::Reserved,
+            response_identity: None,
+            protected_snapshot_identity: None,
+            binding_request_identity: None,
+            binding_identity: None,
+        };
+        write_new_record(self.directory.as_raw_fd(), &record_name, &record)?;
+        self.directory
+            .sync_all()
+            .map_err(|_| ProtectedAuthoritySnapshotReplayError::Unavailable)?;
+        Ok(ProtectedAuthoritySnapshotReservationV2 {
             record_name,
             request_identity: request.identity.clone(),
             challenge_identity: request.challenge.identity.clone(),
@@ -363,16 +457,91 @@ impl ProtectedAuthoritySnapshotReplayStoreV1 {
         self.consume_reconciled(reservation, &consumption)
     }
 
+    pub(crate) fn consume_v4(
+        &self,
+        reservation: &ProtectedAuthoritySnapshotReservationV2,
+        response: &ProtectedAuthoritySnapshotResponseV2,
+        binding_request: &ProtectedLauncherSecretDeliveryTransactionBindingRequestV4,
+        binding_response: &ProtectedLauncherSecretDeliveryTransactionBindingResponseV4,
+    ) -> Result<(), ProtectedAuthoritySnapshotReplayError> {
+        reconcile_protected_authority_snapshot_response_v2(
+            &reservation.request,
+            response,
+            &reservation.startup_continuation,
+            current_time()?,
+        )
+        .map_err(|_| ProtectedAuthoritySnapshotReplayError::Mismatch)?;
+        validate_protected_launcher_secret_delivery_transaction_binding_request_v4(binding_request)
+            .map_err(|_| ProtectedAuthoritySnapshotReplayError::Mismatch)?;
+        validate_protected_launcher_secret_delivery_transaction_binding_v4(
+            &binding_response.binding,
+        )
+        .map_err(|_| ProtectedAuthoritySnapshotReplayError::Mismatch)?;
+        if binding_request.protected_snapshot_schema_version != response.payload.schema_version
+            || binding_request.protected_snapshot_record_kind != response.payload.record_kind
+            || binding_response.protected_snapshot_schema_version
+                != binding_request.protected_snapshot_schema_version
+            || binding_response.protected_snapshot_record_kind
+                != binding_request.protected_snapshot_record_kind
+            || binding_response.binding.protected_snapshot_schema_version
+                != binding_request.protected_snapshot_schema_version
+            || binding_response.binding.protected_snapshot_record_kind
+                != binding_request.protected_snapshot_record_kind
+            || binding_response
+                .binding
+                .transport_dependency_record_identity
+                != binding_request.transport_dependency_record_identity
+        {
+            return Err(ProtectedAuthoritySnapshotReplayError::Mismatch);
+        }
+        let links = SnapshotConsumptionLinksV1 {
+            response_identity: response.identity.clone(),
+            response_request_identity: response.request_identity.clone(),
+            payload_request_identity: response.payload.request_identity.clone(),
+            payload_startup_continuation_identity: response
+                .payload
+                .startup_continuation_identity
+                .clone(),
+            payload_session_identity: response.payload.session_identity.clone(),
+            protected_snapshot_identity: response.protected_snapshot_identity.clone(),
+            binding_request_identity: binding_request.identity.clone(),
+            binding_request_startup_continuation_identity: binding_request
+                .startup_continuation_identity
+                .clone(),
+            binding_request_session_identity: binding_request.session_identity.clone(),
+            binding_request_protected_snapshot_identity: binding_request
+                .protected_snapshot_identity
+                .clone(),
+            binding_response_request_identity: binding_response.request_identity.clone(),
+            binding_response_protected_snapshot_identity: binding_response
+                .protected_snapshot_identity
+                .clone(),
+            binding_request_identity_in_binding: binding_response.binding.request_identity.clone(),
+            binding_startup_continuation_identity: binding_response
+                .binding
+                .startup_continuation_identity
+                .clone(),
+            binding_session_identity: binding_response.binding.session_identity.clone(),
+            binding_protected_snapshot_identity: binding_response
+                .binding
+                .protected_snapshot_identity
+                .clone(),
+            binding_identity: binding_response.binding.identity.clone(),
+        };
+        let consumption = reconcile_consumption_links(reservation, &links)?;
+        self.consume_reconciled(reservation, &consumption)
+    }
+
     pub(crate) fn refuse(
         &self,
-        reservation: &ProtectedAuthoritySnapshotReservationV1,
+        reservation: &impl SnapshotReservation,
     ) -> Result<(), ProtectedAuthoritySnapshotReplayError> {
         let lock = self.lock()?;
         let _guard = FileLockGuard(&lock);
         let mut file = File::from(
             openat2_beneath(
                 self.directory.as_raw_fd(),
-                reservation.record_name.as_bytes(),
+                reservation.record_name().as_bytes(),
                 libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             )
             .map_err(|_| ProtectedAuthoritySnapshotReplayError::Unavailable)?,
@@ -385,10 +554,10 @@ impl ProtectedAuthoritySnapshotReplayStoreV1 {
             .map_err(|_| ProtectedAuthoritySnapshotReplayError::Unavailable)?;
         if record.schema_version != 1
             || record.status != SnapshotReplayStatusV1::Reserved
-            || record.request_identity != reservation.request_identity
-            || record.challenge_identity != reservation.challenge_identity
-            || record.startup_continuation_identity != reservation.startup_continuation_identity
-            || record.session_identity != reservation.session_identity
+            || record.request_identity != reservation.request_identity()
+            || record.challenge_identity != reservation.challenge_identity()
+            || record.startup_continuation_identity != reservation.startup_continuation_identity()
+            || record.session_identity != reservation.session_identity()
             || record.response_identity.is_some()
             || record.protected_snapshot_identity.is_some()
             || record.binding_request_identity.is_some()
@@ -399,7 +568,7 @@ impl ProtectedAuthoritySnapshotReplayStoreV1 {
         record.status = SnapshotReplayStatusV1::Refused;
         replace_record(
             self.directory.as_raw_fd(),
-            &reservation.record_name,
+            reservation.record_name(),
             &record,
         )?;
         self.directory
@@ -409,7 +578,7 @@ impl ProtectedAuthoritySnapshotReplayStoreV1 {
 
     fn consume_reconciled(
         &self,
-        reservation: &ProtectedAuthoritySnapshotReservationV1,
+        reservation: &impl SnapshotReservation,
         consumption: &ReconciledSnapshotConsumptionV1,
     ) -> Result<(), ProtectedAuthoritySnapshotReplayError> {
         let lock = self.lock()?;
@@ -417,7 +586,7 @@ impl ProtectedAuthoritySnapshotReplayStoreV1 {
         let mut file = File::from(
             openat2_beneath(
                 self.directory.as_raw_fd(),
-                reservation.record_name.as_bytes(),
+                reservation.record_name().as_bytes(),
                 libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             )
             .map_err(|_| ProtectedAuthoritySnapshotReplayError::Unavailable)?,
@@ -430,10 +599,10 @@ impl ProtectedAuthoritySnapshotReplayStoreV1 {
             .map_err(|_| ProtectedAuthoritySnapshotReplayError::Unavailable)?;
         if record.schema_version != 1
             || record.status != SnapshotReplayStatusV1::Reserved
-            || record.request_identity != reservation.request_identity
-            || record.challenge_identity != reservation.challenge_identity
-            || record.startup_continuation_identity != reservation.startup_continuation_identity
-            || record.session_identity != reservation.session_identity
+            || record.request_identity != reservation.request_identity()
+            || record.challenge_identity != reservation.challenge_identity()
+            || record.startup_continuation_identity != reservation.startup_continuation_identity()
+            || record.session_identity != reservation.session_identity()
             || record.response_identity.is_some()
             || record.protected_snapshot_identity.is_some()
             || record.binding_request_identity.is_some()
@@ -448,7 +617,7 @@ impl ProtectedAuthoritySnapshotReplayStoreV1 {
         record.binding_identity = Some(consumption.binding_identity.clone());
         replace_record(
             self.directory.as_raw_fd(),
-            &reservation.record_name,
+            reservation.record_name(),
             &record,
         )?;
         self.directory
@@ -699,7 +868,7 @@ pub(crate) mod tests {
             session_identity: request.session_identity,
             same_child_capability_prelude_identity: request.same_child_capability_prelude_identity,
             protected_snapshot_identity: request.protected_snapshot_identity,
-            transport_dependency_record_identity: identity('g'),
+            transport_dependency_record_identity: identity('a'),
         };
         request_v3.identity =
             protected_launcher_secret_delivery_transaction_binding_request_v3_identity(&request_v3)
@@ -751,6 +920,170 @@ pub(crate) mod tests {
             request_v3,
             response_v3,
         )
+    }
+
+    fn protocol_replay_fixture_v4() -> (
+        tempfile::TempDir,
+        ProtectedAuthoritySnapshotReplayStoreV1,
+        ProtectedAuthoritySnapshotReservationV2,
+        ProtectedAuthoritySnapshotResponseV2,
+        ProtectedLauncherSecretDeliveryTransactionBindingRequestV4,
+        ProtectedLauncherSecretDeliveryTransactionBindingResponseV4,
+    ) {
+        let directory = tempdir().expect("replay directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("replay directory mode");
+        let metadata = directory.path().metadata().expect("metadata");
+        let store = ProtectedAuthoritySnapshotReplayStoreV1::open_for_test(
+            directory.path(),
+            metadata.uid(),
+            metadata.gid(),
+        )
+        .expect("replay store");
+        let (startup, request_v1) = exchange();
+        let (response_v1, request_binding_v2, response_binding_v2) =
+            protocol_records(&startup, &request_v1);
+        let mut request_v2 = ProtectedAuthoritySnapshotRequestV2 {
+            schema_version: 2,
+            message_kind: PROTECTED_AUTHORITY_SNAPSHOT_REQUEST_V2.into(),
+            identity: String::new(),
+            challenge: request_v1.challenge,
+            nonce: request_v1.nonce,
+            launcher_request_identity: request_v1.launcher_request_identity,
+            startup_continuation_identity: request_v1.startup_continuation_identity,
+            session_identity: request_v1.session_identity,
+            contract_identity: request_v1.contract_identity,
+            selected_execution_graph_identity: request_v1.selected_execution_graph_identity,
+        };
+        request_v2.identity = protected_authority_snapshot_request_v2_identity(&request_v2)
+            .expect("V2 request identity");
+        let reservation = store
+            .reserve_v2(&request_v2, &startup)
+            .expect("V2 reservation");
+        let payload_v1 = response_v1.payload;
+        let verifier_bytes =
+            serde_jcs::to_vec(&payload_v1.verifier_store).expect("canonical verifier store");
+        let binding_bytes =
+            serde_jcs::to_vec(&payload_v1.binding_bundle).expect("canonical binding store");
+        let payload_v2 = ProtectedAuthoritySnapshotPayloadV2 {
+            schema_version: 2,
+            record_kind: PROTECTED_AUTHORITY_SNAPSHOT_V2.into(),
+            request_identity: request_v2.identity.clone(),
+            launcher_request_identity: payload_v1.launcher_request_identity,
+            startup_continuation_identity: payload_v1.startup_continuation_identity,
+            session_identity: payload_v1.session_identity,
+            contract_identity: payload_v1.contract_identity,
+            selected_execution_graph_identity: payload_v1.selected_execution_graph_identity,
+            verifier_store_descriptor: store_descriptor(
+                ProtectedLauncherDescriptorRoleV1::VerifierStore,
+                11,
+                &verifier_bytes,
+            ),
+            binding_store_descriptor: store_descriptor(
+                ProtectedLauncherDescriptorRoleV1::BindingStore,
+                12,
+                &binding_bytes,
+            ),
+            verifier_store_bytes: URL_SAFE_NO_PAD.encode(verifier_bytes),
+            binding_store_bytes: URL_SAFE_NO_PAD.encode(binding_bytes),
+        };
+        let mut response_v2 = ProtectedAuthoritySnapshotResponseV2 {
+            schema_version: 2,
+            message_kind: PROTECTED_AUTHORITY_SNAPSHOT_RESPONSE_V2.into(),
+            identity: String::new(),
+            request_identity: request_v2.identity,
+            protected_snapshot_identity: protected_authority_snapshot_payload_v2_identity(
+                &payload_v2,
+            )
+            .expect("V2 payload identity"),
+            payload: payload_v2,
+        };
+        response_v2.identity = protected_authority_snapshot_response_v2_identity(&response_v2)
+            .expect("V2 response identity");
+        let mut binding_request = ProtectedLauncherSecretDeliveryTransactionBindingRequestV4 {
+            schema_version: 4,
+            message_kind: PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V4.into(),
+            identity: String::new(),
+            launcher_request_identity: request_binding_v2.launcher_request_identity,
+            observation: request_binding_v2.observation,
+            secret_transaction_candidate_identity: request_binding_v2
+                .secret_transaction_candidate_identity,
+            startup_continuation_identity: request_binding_v2.startup_continuation_identity,
+            session_identity: request_binding_v2.session_identity,
+            same_child_capability_prelude_identity: request_binding_v2
+                .same_child_capability_prelude_identity,
+            protected_snapshot_identity: response_v2.protected_snapshot_identity.clone(),
+            protected_snapshot_schema_version: 2,
+            protected_snapshot_record_kind: PROTECTED_AUTHORITY_SNAPSHOT_V2.into(),
+            transport_dependency_record_identity: identity('a'),
+        };
+        binding_request.identity =
+            protected_launcher_secret_delivery_transaction_binding_request_v4_identity(
+                &binding_request,
+            )
+            .expect("V4 request identity");
+        let old_binding = response_binding_v2.binding;
+        let mut binding = ProtectedLauncherSecretDeliveryTransactionBindingV4 {
+            schema_version: 4,
+            message_kind: PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_V4.into(),
+            identity: String::new(),
+            request_identity: binding_request.identity.clone(),
+            launcher_request_identity: old_binding.launcher_request_identity,
+            startup_continuation_identity: old_binding.startup_continuation_identity,
+            session_identity: old_binding.session_identity,
+            same_child_capability_prelude_identity: old_binding
+                .same_child_capability_prelude_identity,
+            protected_snapshot_identity: response_v2.protected_snapshot_identity.clone(),
+            protected_snapshot_schema_version: 2,
+            protected_snapshot_record_kind: PROTECTED_AUTHORITY_SNAPSHOT_V2.into(),
+            protected_capability_identity: old_binding.protected_capability_identity,
+            secret_transaction_candidate_identity: old_binding
+                .secret_transaction_candidate_identity,
+            observation_request_identity: old_binding.observation_request_identity,
+            projection_identity: old_binding.projection_identity,
+            verifier_identity: old_binding.verifier_identity,
+            installation_evidence_identity: old_binding.installation_evidence_identity,
+            expires_at_unix_seconds: old_binding.expires_at_unix_seconds,
+            transport_dependency_record_identity: binding_request
+                .transport_dependency_record_identity
+                .clone(),
+        };
+        binding.identity =
+            protected_launcher_secret_delivery_transaction_binding_v4_identity(&binding)
+                .expect("V4 binding identity");
+        let binding_response = ProtectedLauncherSecretDeliveryTransactionBindingResponseV4 {
+            schema_version: 4,
+            message_kind: PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_RESPONSE_V4.into(),
+            request_identity: binding_request.identity.clone(),
+            same_child_capability_prelude_identity: binding_request
+                .same_child_capability_prelude_identity
+                .clone(),
+            protected_snapshot_identity: response_v2.protected_snapshot_identity.clone(),
+            protected_snapshot_schema_version: 2,
+            protected_snapshot_record_kind: PROTECTED_AUTHORITY_SNAPSHOT_V2.into(),
+            binding,
+            projection: response_binding_v2.projection,
+        };
+        (
+            directory,
+            store,
+            reservation,
+            response_v2,
+            binding_request,
+            binding_response,
+        )
+    }
+
+    pub(crate) fn service_cleanup_fixture_v2() -> (
+        tempfile::TempDir,
+        ProtectedAuthoritySnapshotReplayStoreV1,
+        ProtectedAuthoritySnapshotReservationV2,
+        ProtectedAuthoritySnapshotRequestV2,
+        ProtectedAuthoritySnapshotResponseV2,
+    ) {
+        let (directory, store, reservation, response, _, _) = protocol_replay_fixture_v4();
+        let request = reservation.request.clone();
+        (directory, store, reservation, request, response)
     }
 
     pub(crate) fn relay_protocol_fixture() -> (
@@ -841,6 +1174,59 @@ pub(crate) mod tests {
         prelude.identity =
             ota_authority_protocol::protected_same_child_capability_prelude_v1_identity(&prelude)
                 .expect("relay V3 prelude identity");
+        let response = ota_authority_protocol::ProtectedLauncherCapabilityObservationResponseV1 {
+            schema_version: 1,
+            message_kind:
+                ota_authority_protocol::PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_RESPONSE.into(),
+            request_identity: observation.identity.clone(),
+            projection: binding_response.projection.clone(),
+        };
+        (
+            observation,
+            response,
+            prelude,
+            reservation.request,
+            snapshot_response,
+            binding_request,
+            binding_response,
+        )
+    }
+
+    pub(crate) fn relay_protocol_fixture_v4() -> (
+        ProtectedLauncherCapabilityObservationRequestV1,
+        ota_authority_protocol::ProtectedLauncherCapabilityObservationResponseV1,
+        ota_authority_protocol::ProtectedSameChildCapabilityPreludeV1,
+        ProtectedAuthoritySnapshotRequestV2,
+        ProtectedAuthoritySnapshotResponseV2,
+        ProtectedLauncherSecretDeliveryTransactionBindingRequestV4,
+        ProtectedLauncherSecretDeliveryTransactionBindingResponseV4,
+    ) {
+        let (_, _, reservation, snapshot_response, binding_request, binding_response) =
+            protocol_replay_fixture_v4();
+        let observation = binding_request.observation.clone();
+        let mut prelude = ota_authority_protocol::ProtectedSameChildCapabilityPreludeV1 {
+            schema_version: 1,
+            record_kind: ota_authority_protocol::PROTECTED_SAME_CHILD_CAPABILITY_PRELUDE.into(),
+            identity: String::new(),
+            observation_request_identity: observation.identity.clone(),
+            projection_identity: binding_response.projection.projection_identity.clone(),
+            protected_capability_identity: binding_response
+                .binding
+                .protected_capability_identity
+                .clone(),
+            verifier_identity: binding_response.binding.verifier_identity.clone(),
+            installation_evidence_identity: binding_response
+                .binding
+                .installation_evidence_identity
+                .clone(),
+            launcher_request_identity: binding_request.launcher_request_identity.clone(),
+            startup_continuation_identity: binding_request.startup_continuation_identity.clone(),
+            session_identity: binding_request.session_identity.clone(),
+            expires_at_unix_seconds: observation.challenge.expires_at_unix_seconds,
+        };
+        prelude.identity =
+            ota_authority_protocol::protected_same_child_capability_prelude_v1_identity(&prelude)
+                .expect("relay V4 prelude identity");
         let response = ota_authority_protocol::ProtectedLauncherCapabilityObservationResponseV1 {
             schema_version: 1,
             message_kind:
@@ -1175,10 +1561,10 @@ pub(crate) mod tests {
 
     fn read_record(
         directory: &Path,
-        reservation: &ProtectedAuthoritySnapshotReservationV1,
+        reservation: &impl SnapshotReservation,
     ) -> SnapshotReplayRecordV1 {
         serde_json::from_slice(
-            &fs::read(directory.join(&reservation.record_name)).expect("record bytes"),
+            &fs::read(directory.join(reservation.record_name())).expect("record bytes"),
         )
         .expect("replay record")
     }
@@ -1214,6 +1600,96 @@ pub(crate) mod tests {
             store.reserve(&sibling, &startup),
             Err(ProtectedAuthoritySnapshotReplayError::Mismatch)
         ));
+    }
+
+    #[test]
+    fn snapshot_v2_reservation_refuses_replay_and_cannot_be_reused_after_refusal() {
+        let directory = tempdir().expect("replay directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("replay directory mode");
+        let metadata = directory.path().metadata().expect("metadata");
+        let store = ProtectedAuthoritySnapshotReplayStoreV1::open_for_test(
+            directory.path(),
+            metadata.uid(),
+            metadata.gid(),
+        )
+        .expect("replay store");
+        let (startup, request_v1) = exchange();
+        let mut request_v2 = ProtectedAuthoritySnapshotRequestV2 {
+            schema_version: 2,
+            message_kind: PROTECTED_AUTHORITY_SNAPSHOT_REQUEST_V2.into(),
+            identity: String::new(),
+            challenge: request_v1.challenge,
+            nonce: request_v1.nonce,
+            launcher_request_identity: request_v1.launcher_request_identity,
+            startup_continuation_identity: request_v1.startup_continuation_identity,
+            session_identity: request_v1.session_identity,
+            contract_identity: request_v1.contract_identity,
+            selected_execution_graph_identity: request_v1.selected_execution_graph_identity,
+        };
+        request_v2.identity = protected_authority_snapshot_request_v2_identity(&request_v2)
+            .expect("V2 request identity");
+        let reservation = store
+            .reserve_v2(&request_v2, &startup)
+            .expect("V2 reservation");
+        assert!(matches!(
+            store.reserve_v2(&request_v2, &startup),
+            Err(ProtectedAuthoritySnapshotReplayError::ReplayDetected)
+        ));
+        store.refuse(&reservation).expect("terminal refusal");
+        assert!(matches!(
+            store.reserve_v2(&request_v2, &startup),
+            Err(ProtectedAuthoritySnapshotReplayError::ReplayDetected)
+        ));
+        assert_eq!(
+            store.refuse(&reservation),
+            Err(ProtectedAuthoritySnapshotReplayError::Mismatch)
+        );
+    }
+
+    #[test]
+    fn snapshot_v2_v4_consumption_is_exact_durable_and_one_use() {
+        let (directory, store, reservation, response, request, binding_response) =
+            protocol_replay_fixture_v4();
+        store
+            .consume_v4(&reservation, &response, &request, &binding_response)
+            .expect("exact V2/V4 consumption");
+        let record = read_record(directory.path(), &reservation);
+        assert_eq!(record.status, SnapshotReplayStatusV1::Consumed);
+        assert_eq!(
+            record.response_identity.as_deref(),
+            Some(response.identity.as_str())
+        );
+        assert_eq!(
+            record.binding_identity.as_deref(),
+            Some(binding_response.binding.identity.as_str())
+        );
+        assert_eq!(
+            store.consume_v4(&reservation, &response, &request, &binding_response),
+            Err(ProtectedAuthoritySnapshotReplayError::Mismatch)
+        );
+    }
+
+    #[test]
+    fn snapshot_v2_v4_substituted_record_refuses_without_consuming() {
+        let (directory, store, reservation, response, request, mut binding_response) =
+            protocol_replay_fixture_v4();
+        binding_response
+            .binding
+            .transport_dependency_record_identity = identity('b');
+        binding_response.binding.identity =
+            protected_launcher_secret_delivery_transaction_binding_v4_identity(
+                &binding_response.binding,
+            )
+            .expect("substituted binding identity");
+        assert_eq!(
+            store.consume_v4(&reservation, &response, &request, &binding_response),
+            Err(ProtectedAuthoritySnapshotReplayError::Mismatch)
+        );
+        assert_eq!(
+            read_record(directory.path(), &reservation).status,
+            SnapshotReplayStatusV1::Reserved
+        );
     }
 
     #[test]
