@@ -121,6 +121,11 @@ const SECRET_DELIVERY_PRESSURE_INSTALLATION_IDENTITY_DOMAIN_V1: &[u8] =
 const EMPTY_SECRET_DELIVERY_VERIFIER_SNAPSHOT: &[u8] = b"{\"schema_version\":1,\"verifiers\":[]}\n";
 const EMPTY_SECRET_DELIVERY_BINDING_SNAPSHOT: &[u8] = b"{\"schema_version\":1,\"bindings\":[]}\n";
 const RUNNER_PUBLICATION_GATE: &str = PUBLIC_INSTALLATION_EVIDENCE_PATH;
+const PREPARED_RUNNER_WRITABLE_PATHS: [&str; 3] = [
+    "/opt/ota-actions-runner/_diag",
+    "/opt/ota-actions-runner/_work",
+    CAPTURE_SOURCE_ROOT,
+];
 const PREPARED_PROVISIONING_OBSERVATION_IDENTITY_DOMAIN_V1: &[u8] =
     b"ota.authority-launcher.prepared-provisioning-observation.v1\0";
 const BROKER_STORE: &str = "/etc/ota/crossing-brokers.json";
@@ -1856,6 +1861,8 @@ fn observe_prepared_provisioning_precondition(
             "ControlGroup",
             "FragmentPath",
             "DropInPaths",
+            "ProtectSystem",
+            "ReadWritePaths",
         ],
     )?;
     let load_state = properties
@@ -1895,6 +1902,7 @@ fn observe_prepared_provisioning_precondition(
             "prepared runner service must use the exact fragment and drop-in set",
         ));
     }
+    verify_prepared_runner_sandbox(&properties)?;
     if load_state != "loaded"
         || active_state != "inactive"
         || sub_state != "dead"
@@ -1957,6 +1965,33 @@ fn observe_prepared_provisioning_precondition(
     };
     observation.identity = prepared_provisioning_observation_identity(&observation)?;
     Ok(observation)
+}
+
+fn verify_prepared_runner_sandbox(properties: &BTreeMap<String, String>) -> Result<(), String> {
+    if properties.get("ProtectSystem").map(String::as_str) != Some("strict") {
+        return Err(String::from(
+            "prepared runner service must retain ProtectSystem=strict",
+        ));
+    }
+
+    let mut observed_paths = properties
+        .get("ReadWritePaths")
+        .ok_or_else(|| String::from("prepared runner writable-path observation is unavailable"))?
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut expected_paths = PREPARED_RUNNER_WRITABLE_PATHS
+        .iter()
+        .map(|path| (*path).to_owned())
+        .collect::<Vec<_>>();
+    observed_paths.sort();
+    expected_paths.sort();
+    if observed_paths != expected_paths {
+        return Err(String::from(
+            "prepared runner service must use the exact writable-path whitelist",
+        ));
+    }
+    Ok(())
 }
 
 fn verify_runner_publication_gate(service: &Path, drop_ins: &[PathBuf]) -> Result<(), String> {
@@ -2445,6 +2480,33 @@ mod tests {
     }
 
     #[test]
+    fn prepared_runner_sandbox_requires_the_exact_evidence_write_whitelist() {
+        let mut properties = BTreeMap::from([
+            (String::from("ProtectSystem"), String::from("strict")),
+            (
+                String::from("ReadWritePaths"),
+                PREPARED_RUNNER_WRITABLE_PATHS.join(" "),
+            ),
+        ]);
+        assert!(verify_prepared_runner_sandbox(&properties).is_ok());
+
+        properties.insert(
+            String::from("ReadWritePaths"),
+            String::from("/opt/ota-actions-runner/_diag /opt/ota-actions-runner/_work"),
+        );
+        assert!(verify_prepared_runner_sandbox(&properties).is_err());
+
+        properties.insert(
+            String::from("ReadWritePaths"),
+            format!("{} /tmp", PREPARED_RUNNER_WRITABLE_PATHS.join(" ")),
+        );
+        assert!(verify_prepared_runner_sandbox(&properties).is_err());
+
+        properties.insert(String::from("ProtectSystem"), String::from("full"));
+        assert!(verify_prepared_runner_sandbox(&properties).is_err());
+    }
+
+    #[test]
     fn pressure_secret_delivery_authority_is_signed_and_active() {
         let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
         let payload =
@@ -2889,6 +2951,14 @@ mod tests {
         );
         assert!(runner_hardening_drop_in().contains("NoNewPrivileges=yes"));
         assert!(runner_hardening_drop_in().contains("CapabilityBoundingSet=\n"));
+        assert_eq!(
+            PREPARED_RUNNER_WRITABLE_PATHS,
+            [
+                "/opt/ota-actions-runner/_diag",
+                "/opt/ota-actions-runner/_work",
+                CAPTURE_SOURCE_ROOT,
+            ]
+        );
         assert!(service.contains("RestrictSUIDSGID=no"));
         assert!(service.contains("AmbientCapabilities=CAP_SETUID"));
         assert!(service.contains("RuntimeDirectory=ota/authority-launcher"));

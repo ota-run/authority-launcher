@@ -101,9 +101,16 @@ updates disabled, and create the root-owned unit
 required hardening properties in the root-owned drop-in
 `/etc/systemd/system/ota-authority-pressure-runner.service.d/zzzz-ota-pressure-hardening.conf`.
 The service must carry `NoNewPrivileges=yes`, empty supplementary groups and capabilities, the
-fixed runner working directory, and only the narrowly required writable runner state. Do not use
-the runner's generated `actions.runner.*.service`: Launcher admits the exact canonical unit above,
-and every job-principal process must remain inside that unit's cgroup.
+fixed runner working directory, and exactly these `ReadWritePaths` entries:
+`/opt/ota-actions-runner/_diag`, `/opt/ota-actions-runner/_work`, and
+`/var/lib/ota/authority-job-evidence`. The service must also set `ProtectSystem=strict`. The last
+path is the dedicated root-owned, job-group-writable evidence-source root: the job-owned
+run-attempt bundle beneath it is separately captured by root. It does not grant the job write
+authority over the private capture store or public-record root. Launcher rechecks the effective
+`ProtectSystem=strict` and exact writable-path whitelist before provisioning, and Core rechecks it
+before job evidence is created. Do not use the runner's generated `actions.runner.*.service`:
+Launcher admits the exact canonical unit above, and every job-principal process must remain inside
+that unit's cgroup.
 
 ## Provision Outside GitHub Actions
 
