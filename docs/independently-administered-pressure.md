@@ -229,16 +229,18 @@ and attempt. It does not watch a broad job-writable directory and it must never 
 or repointed by the job principal.
 
 The capture service accepts only its closed success set or its separate closed failure-diagnostic
-set. It records a complete failed job only as `failure`; malformed, incomplete, stale, replayed,
-substituted, or changing input refuses, and a failure record can never satisfy a success gate. The
-service copies through descriptor-relative no-follow reads into a root-only store, recomputes the
-bundle digest as root, then atomically publishes one non-secret root-owned public capture record.
+set. It records a complete failed job only as `failure_diagnostic_set`; malformed, incomplete,
+stale, replayed, substituted, or changing input refuses, and that class can never satisfy the
+`success_set` custody gate. The service copies through descriptor-relative no-follow reads into a
+root-only store, recomputes the bundle digest as root, then atomically publishes one non-secret
+root-owned public capture record.
 
 The Core workflow waits for and reconciles that record against the exact installation, request,
-run, attempt, revisions, and expected outcome. Administrators retrieve retained bytes from the
-root-only store. This is a job-inaccessible root-custodied copy of job-produced evidence, not
+run, attempt, revisions, and expected capture class. Administrators retrieve retained bytes from
+the root-only store. This is a job-inaccessible root-custodied copy of job-produced evidence, not
 independent attestation of job assertions or immutability against the root administrator. It does
-not authorize OIDC, provider contact, materialization, delivery, or selected-work release.
+not validate the job's assertions or authorize OIDC, provider contact, materialization, delivery,
+or selected-work release.
 
 ## Run And Inspect
 
