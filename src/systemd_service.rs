@@ -509,7 +509,7 @@ fn serve_capability_observation(
         config,
         launcher_executable,
     )
-    .map_err(|_| SystemdServiceError::InstallationIdentityUnavailable)?;
+    .map_err(report_authority_context_load_failure)?;
     let authority =
         crate::protected_launcher_capability::RetainedProtectedLauncherAuthorityContextV1::acquire(
             authority,
@@ -628,6 +628,20 @@ fn serve_capability_observation(
     Ok(0)
 }
 
+fn report_authority_context_load_failure(
+    error: crate::installation_manifest::ProtectedLauncherAuthorityContextLoadError,
+) -> SystemdServiceError {
+    eprintln!("{}", authority_context_load_failure_message(error.stage()));
+    SystemdServiceError::InstallationIdentityUnavailable
+}
+
+fn authority_context_load_failure_message(stage: &str) -> String {
+    format!(
+        "ota-authority-launcher: protected authority context load failure stage={}",
+        stage
+    )
+}
+
 #[cfg(not(feature = "protected-attestor"))]
 fn refuse_secret_delivery_binding_without_protected_attestor() -> Result<
     ota_authority_protocol::ProtectedLauncherSecretDeliveryTransactionBindingResponseV1,
@@ -693,7 +707,10 @@ fn execute_selected_boundary(
                         context.config,
                         context.launcher_executable,
                     )
-                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    .map_err(|error| {
+                        report_authority_context_load_failure(error);
+                        PreparedChildError::AuthorizationAdmissionMismatch
+                    })?;
                 let authority = crate::protected_launcher_capability::RetainedProtectedLauncherAuthorityContextV1::acquire(
                     authority,
                     context.boot_file
@@ -865,7 +882,10 @@ fn execute_selected_boundary(
                         context.config,
                         context.launcher_executable,
                     )
-                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    .map_err(|error| {
+                        report_authority_context_load_failure(error);
+                        PreparedChildError::AuthorizationAdmissionMismatch
+                    })?;
                 let authority = crate::protected_launcher_capability::RetainedProtectedLauncherAuthorityContextV1::acquire(
                     authority,
                     context.boot_file
@@ -3069,6 +3089,14 @@ mod tests {
 
     fn test_identity(character: char) -> String {
         format!("sha256:{}", character.to_string().repeat(64))
+    }
+
+    #[test]
+    fn authority_context_failure_message_is_stage_only() {
+        assert_eq!(
+            authority_context_load_failure_message("semantic_binding"),
+            "ota-authority-launcher: protected authority context load failure stage=semantic_binding"
+        );
     }
 
     #[cfg(feature = "protected-attestor")]

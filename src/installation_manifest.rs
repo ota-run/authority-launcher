@@ -81,6 +81,58 @@ pub(crate) enum InstallationManifestError {
     Mismatch,
 }
 
+#[derive(Debug)]
+pub(crate) struct ProtectedLauncherAuthorityContextLoadError {
+    stage: ProtectedLauncherAuthorityContextLoadStage,
+    #[cfg_attr(not(test), allow(dead_code))]
+    error: InstallationManifestError,
+}
+
+impl ProtectedLauncherAuthorityContextLoadError {
+    pub(crate) fn stage(&self) -> &'static str {
+        self.stage.as_str()
+    }
+
+    #[cfg(test)]
+    fn error(&self) -> &InstallationManifestError {
+        &self.error
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtectedLauncherAuthorityContextLoadStage {
+    InstallationManifest,
+    RetainedManifest,
+    ContextFile,
+    LauncherExecutable,
+    OtaExecutable,
+    ContextDecode,
+    RoleBinding,
+    SemanticBinding,
+}
+
+impl ProtectedLauncherAuthorityContextLoadStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::InstallationManifest => "authority_context_manifest",
+            Self::RetainedManifest => "retained_manifest",
+            Self::ContextFile => "context_file",
+            Self::LauncherExecutable => "launcher_executable",
+            Self::OtaExecutable => "ota_executable",
+            Self::ContextDecode => "context_decode",
+            Self::RoleBinding => "role_binding",
+            Self::SemanticBinding => "semantic_binding",
+        }
+    }
+}
+
+fn authority_context_load_error(
+    stage: ProtectedLauncherAuthorityContextLoadStage,
+    error: InstallationManifestError,
+) -> ProtectedLauncherAuthorityContextLoadError {
+    ProtectedLauncherAuthorityContextLoadError { stage, error }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProtectedInstallationRoleV1 {
@@ -286,7 +338,10 @@ impl RetainedProtectedLauncherAuthorityInstallationV1 {
 pub(crate) fn load_protected_launcher_authority_context(
     config: &SystemdLauncherServiceConfigV1,
     launcher_executable: &Path,
-) -> Result<RetainedProtectedLauncherAuthorityInstallationV1, InstallationManifestError> {
+) -> Result<
+    RetainedProtectedLauncherAuthorityInstallationV1,
+    ProtectedLauncherAuthorityContextLoadError,
+> {
     load_protected_launcher_authority_context_at(
         Path::new(SYSTEMD_INSTALLATION_MANIFEST_PATH),
         Path::new(PROTECTED_LAUNCHER_AUTHORITY_CONTEXT_PATH),
@@ -307,7 +362,39 @@ fn load_protected_launcher_authority_context_at(
     config: &SystemdLauncherServiceConfigV1,
     expected_owner_uid: u32,
     trusted_root: &Path,
-) -> Result<RetainedProtectedLauncherAuthorityInstallationV1, InstallationManifestError> {
+) -> Result<
+    RetainedProtectedLauncherAuthorityInstallationV1,
+    ProtectedLauncherAuthorityContextLoadError,
+> {
+    load_protected_launcher_authority_context_at_with_after_manifest(
+        manifest_path,
+        context_path,
+        config_path,
+        launcher_executable,
+        config,
+        expected_owner_uid,
+        trusted_root,
+        || {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_protected_launcher_authority_context_at_with_after_manifest<F>(
+    manifest_path: &Path,
+    context_path: &Path,
+    config_path: &Path,
+    launcher_executable: &Path,
+    config: &SystemdLauncherServiceConfigV1,
+    expected_owner_uid: u32,
+    trusted_root: &Path,
+    after_manifest: F,
+) -> Result<
+    RetainedProtectedLauncherAuthorityInstallationV1,
+    ProtectedLauncherAuthorityContextLoadError,
+>
+where
+    F: FnOnce(),
+{
     let manifest = load_protected_installation_manifest_at(
         manifest_path,
         config_path,
@@ -315,42 +402,110 @@ fn load_protected_launcher_authority_context_at(
         config,
         expected_owner_uid,
         trusted_root,
-    )?;
+    )
+    .map_err(|error| {
+        authority_context_load_error(
+            ProtectedLauncherAuthorityContextLoadStage::InstallationManifest,
+            error,
+        )
+    })?;
+    after_manifest();
     let retained_manifest = RetainedProtectedInstallationFileV1::open(
         manifest_path,
         expected_owner_uid,
         trusted_root,
         false,
-    )?;
+    )
+    .map_err(|error| {
+        authority_context_load_error(
+            ProtectedLauncherAuthorityContextLoadStage::RetainedManifest,
+            error,
+        )
+    })?;
     let context_file = RetainedProtectedInstallationFileV1::open(
         context_path,
         expected_owner_uid,
         trusted_root,
         false,
-    )?;
+    )
+    .map_err(|error| {
+        authority_context_load_error(
+            ProtectedLauncherAuthorityContextLoadStage::ContextFile,
+            error,
+        )
+    })?;
     let launcher = RetainedProtectedInstallationFileV1::open(
         launcher_executable,
         expected_owner_uid,
         trusted_root,
         true,
-    )?;
+    )
+    .map_err(|error| {
+        authority_context_load_error(
+            ProtectedLauncherAuthorityContextLoadStage::LauncherExecutable,
+            error,
+        )
+    })?;
     let ota = RetainedProtectedInstallationFileV1::open(
         &config.ota_binary,
         expected_owner_uid,
         trusted_root,
         true,
-    )?;
-    let context: ProtectedLauncherAuthorityContextV1 = context_file.read_json()?;
-    if context_file.identity
-        != manifest
-            .singular_identity(ProtectedInstallationRoleV1::ProtectedLauncherAuthorityContext)?
-        || launcher.identity
-            != manifest.singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)?
-        || ota.identity != manifest.singular_identity(ProtectedInstallationRoleV1::OtaExecutable)?
+    )
+    .map_err(|error| {
+        authority_context_load_error(
+            ProtectedLauncherAuthorityContextLoadStage::OtaExecutable,
+            error,
+        )
+    })?;
+    let context: ProtectedLauncherAuthorityContextV1 =
+        context_file.read_json().map_err(|error| {
+            authority_context_load_error(
+                ProtectedLauncherAuthorityContextLoadStage::ContextDecode,
+                error,
+            )
+        })?;
+    let context_identity = manifest
+        .singular_identity(ProtectedInstallationRoleV1::ProtectedLauncherAuthorityContext)
+        .map_err(|error| {
+            authority_context_load_error(
+                ProtectedLauncherAuthorityContextLoadStage::RoleBinding,
+                error,
+            )
+        })?;
+    let launcher_identity = manifest
+        .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
+        .map_err(|error| {
+            authority_context_load_error(
+                ProtectedLauncherAuthorityContextLoadStage::RoleBinding,
+                error,
+            )
+        })?;
+    let ota_identity = manifest
+        .singular_identity(ProtectedInstallationRoleV1::OtaExecutable)
+        .map_err(|error| {
+            authority_context_load_error(
+                ProtectedLauncherAuthorityContextLoadStage::RoleBinding,
+                error,
+            )
+        })?;
+    if context_file.identity != context_identity
+        || launcher.identity != launcher_identity
+        || ota.identity != ota_identity
     {
-        return Err(InstallationManifestError::Mismatch);
+        return Err(authority_context_load_error(
+            ProtectedLauncherAuthorityContextLoadStage::RoleBinding,
+            InstallationManifestError::Mismatch,
+        ));
     }
-    validate_authority_context_against_installation(&context, &manifest, context_path)?;
+    validate_authority_context_against_installation(&context, &manifest, context_path).map_err(
+        |error| {
+            authority_context_load_error(
+                ProtectedLauncherAuthorityContextLoadStage::SemanticBinding,
+                error,
+            )
+        },
+    )?;
     let retained = RetainedProtectedLauncherAuthorityInstallationV1 {
         context,
         manifest_identity: manifest.identity.clone(),
@@ -1028,6 +1183,32 @@ mod tests {
     };
 
     #[test]
+    fn authority_context_load_stages_are_closed_and_nonsecret() {
+        assert_eq!(
+            [
+                ProtectedLauncherAuthorityContextLoadStage::InstallationManifest.as_str(),
+                ProtectedLauncherAuthorityContextLoadStage::RetainedManifest.as_str(),
+                ProtectedLauncherAuthorityContextLoadStage::ContextFile.as_str(),
+                ProtectedLauncherAuthorityContextLoadStage::LauncherExecutable.as_str(),
+                ProtectedLauncherAuthorityContextLoadStage::OtaExecutable.as_str(),
+                ProtectedLauncherAuthorityContextLoadStage::ContextDecode.as_str(),
+                ProtectedLauncherAuthorityContextLoadStage::RoleBinding.as_str(),
+                ProtectedLauncherAuthorityContextLoadStage::SemanticBinding.as_str(),
+            ],
+            [
+                "authority_context_manifest",
+                "retained_manifest",
+                "context_file",
+                "launcher_executable",
+                "ota_executable",
+                "context_decode",
+                "role_binding",
+                "semantic_binding",
+            ]
+        );
+    }
+
+    #[test]
     fn capability_projection_verifier_is_bound_to_protected_installation() {
         let root = tempdir().expect("temporary protected root");
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))
@@ -1527,6 +1708,119 @@ mod tests {
             &authority_context,
         );
 
+        macro_rules! assert_load_stage {
+            ($expected:literal, $after_manifest:expr) => {{
+                let error = match load_protected_launcher_authority_context_at_with_after_manifest(
+                    &manifest_path,
+                    &authority_context_path,
+                    &config_path,
+                    &launcher_path,
+                    &config,
+                    owner,
+                    root.path(),
+                    $after_manifest,
+                ) {
+                    Ok(_) => panic!("authority-context load must refuse at {}", $expected),
+                    Err(error) => error,
+                };
+                assert_eq!(error.stage(), $expected);
+            }};
+        }
+
+        let original_manifest_mode = fs::metadata(&manifest_path)
+            .expect("manifest metadata")
+            .permissions()
+            .mode();
+        assert_load_stage!("retained_manifest", || {
+            fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o660))
+                .expect("manifest metadata substitution");
+        });
+        fs::set_permissions(
+            &manifest_path,
+            fs::Permissions::from_mode(original_manifest_mode),
+        )
+        .expect("manifest metadata restoration");
+
+        let original_context = fs::read(&authority_context_path).expect("authority context bytes");
+        let original_context_mode = fs::metadata(&authority_context_path)
+            .expect("context metadata")
+            .permissions()
+            .mode();
+        assert_load_stage!("context_file", || {
+            fs::set_permissions(&authority_context_path, fs::Permissions::from_mode(0o660))
+                .expect("context metadata substitution");
+        });
+        fs::set_permissions(
+            &authority_context_path,
+            fs::Permissions::from_mode(original_context_mode),
+        )
+        .expect("context metadata restoration");
+
+        assert_load_stage!("context_decode", || {
+            fs::write(&authority_context_path, b"{}").expect("malformed authority context");
+        });
+        fs::write(&authority_context_path, &original_context).expect("context restoration");
+
+        assert_load_stage!("role_binding", || {
+            let mut substituted = original_context.clone();
+            substituted.push(b'\n');
+            fs::write(&authority_context_path, substituted).expect("context identity substitution");
+        });
+        fs::write(&authority_context_path, &original_context).expect("context restoration");
+
+        let original_launcher_mode = fs::metadata(&launcher_path)
+            .expect("launcher metadata")
+            .permissions()
+            .mode();
+        assert_load_stage!("launcher_executable", || {
+            fs::set_permissions(&launcher_path, fs::Permissions::from_mode(0o600))
+                .expect("launcher metadata substitution");
+        });
+        fs::set_permissions(
+            &launcher_path,
+            fs::Permissions::from_mode(original_launcher_mode),
+        )
+        .expect("launcher metadata restoration");
+
+        let ota_path = manifest
+            .singular_path(ProtectedInstallationRoleV1::OtaExecutable)
+            .expect("Ota fixture path")
+            .to_path_buf();
+        let original_ota_mode = fs::metadata(&ota_path)
+            .expect("Ota metadata")
+            .permissions()
+            .mode();
+        assert_load_stage!("ota_executable", || {
+            fs::set_permissions(&ota_path, fs::Permissions::from_mode(0o600))
+                .expect("Ota metadata substitution");
+        });
+        fs::set_permissions(&ota_path, fs::Permissions::from_mode(original_ota_mode))
+            .expect("Ota metadata restoration");
+
+        let attestor_path = manifest
+            .files
+            .iter()
+            .find(|entry| entry.role == ProtectedInstallationRoleV1::AttestorExecutable)
+            .expect("attestor entry")
+            .path
+            .clone();
+        let original_attestor = fs::read(&attestor_path).expect("attestor fixture bytes");
+        fs::write(&attestor_path, b"substituted").expect("substituted attestor");
+        let error = match load_protected_launcher_authority_context_at(
+            &manifest_path,
+            &authority_context_path,
+            &config_path,
+            &launcher_path,
+            &config,
+            owner,
+            root.path(),
+        ) {
+            Ok(_) => panic!("substituted manifest file must refuse"),
+            Err(error) => error,
+        };
+        assert_eq!(error.stage(), "authority_context_manifest");
+        fs::write(&attestor_path, &original_attestor).expect("attestor restoration");
+
         let original_manifest = manifest.clone();
         let mut substituted_context = authority_context.clone();
         substituted_context
@@ -1560,6 +1854,20 @@ mod tests {
             serde_json::to_vec(&manifest).expect("serialized substituted manifest"),
         )
         .expect("substituted manifest file");
+        let error = match load_protected_launcher_authority_context_at(
+            &manifest_path,
+            &authority_context_path,
+            &config_path,
+            &launcher_path,
+            &config,
+            owner,
+            root.path(),
+        ) {
+            Ok(_) => panic!("self-consistent substituted context must refuse"),
+            Err(error) => error,
+        };
+        assert_eq!(error.stage(), "semantic_binding");
+        assert_eq!(error.error(), &InstallationManifestError::Mismatch);
         assert_eq!(
             retained_authority.reconcile(),
             Err(InstallationManifestError::Mismatch),
@@ -1591,18 +1899,15 @@ mod tests {
             .reconcile()
             .expect("restored launcher installation");
 
-        let ota_path = original_manifest
-            .singular_path(ProtectedInstallationRoleV1::OtaExecutable)
-            .expect("Ota fixture path");
-        let original_ota = fs::read(ota_path).expect("Ota fixture bytes");
+        let original_ota = fs::read(&ota_path).expect("Ota fixture bytes");
         let mut substituted_ota = original_ota.clone();
         substituted_ota[0] ^= 1;
-        fs::write(ota_path, &substituted_ota).expect("substituted Ota bytes");
+        fs::write(&ota_path, &substituted_ota).expect("substituted Ota bytes");
         assert_eq!(
             retained_authority.reconcile(),
             Err(InstallationManifestError::Mismatch),
         );
-        fs::write(ota_path, &original_ota).expect("restored Ota bytes");
+        fs::write(&ota_path, &original_ota).expect("restored Ota bytes");
         retained_authority
             .reconcile()
             .expect("restored Ota installation");
@@ -1619,13 +1924,6 @@ mod tests {
             .reconcile()
             .expect("restored context metadata");
 
-        let attestor_path = original_manifest
-            .files
-            .iter()
-            .find(|entry| entry.role == ProtectedInstallationRoleV1::AttestorExecutable)
-            .expect("attestor entry")
-            .path
-            .clone();
         fs::write(attestor_path, b"substituted").expect("substituted attestor");
         assert_eq!(
             load_protected_installation_manifest_at(
