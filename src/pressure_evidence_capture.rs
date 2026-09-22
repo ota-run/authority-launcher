@@ -346,10 +346,35 @@ fn directory_names(directory: std::os::fd::RawFd) -> Result<BTreeSet<String>, St
 }
 
 fn open_directory(path: &str, uid: u32, gid: u32, mode: u32) -> Result<File, String> {
-    let directory = open_root(Path::new(path), uid, gid)
+    let protected = File::from(
+        open_root(Path::new(path), uid, gid)
+            .map_err(|_| String::from("pressure evidence directory is unavailable"))?,
+    );
+    verify_directory(&protected, uid, gid, mode)?;
+    let protected_metadata = protected
+        .metadata()
         .map_err(|_| String::from("pressure evidence directory is unavailable"))?;
-    let directory = File::from(directory);
+
+    // `open_root` deliberately returns O_PATH. Reopen its exact verified directory for fsync.
+    let directory = File::from(
+        openat2_beneath(
+            protected.as_raw_fd(),
+            b".",
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+        .map_err(|_| String::from("pressure evidence directory is unavailable"))?,
+    );
     verify_directory(&directory, uid, gid, mode)?;
+    let directory_metadata = directory
+        .metadata()
+        .map_err(|_| String::from("pressure evidence directory is unavailable"))?;
+    if protected_metadata.dev() != directory_metadata.dev()
+        || protected_metadata.ino() != directory_metadata.ino()
+    {
+        return Err(String::from(
+            "pressure evidence directory protection is invalid",
+        ));
+    }
     Ok(directory)
 }
 
@@ -580,9 +605,16 @@ fn publish_record_to_directory(
     )
     .map_err(|_| String::from("pressure evidence capture record is unavailable"))?;
     let mut file = File::from(descriptor);
-    file.write_all(bytes)
+    let persistence = file
+        .write_all(bytes)
         .and_then(|()| file.sync_all())
-        .map_err(|_| String::from("pressure evidence capture record persistence failed"))?;
+        .map_err(|_| String::from("pressure evidence capture record persistence failed"))
+        .and_then(|()| finalize_public_record_protection(&file, owner_uid, owner_gid, bytes.len()));
+    if let Err(error) = persistence {
+        drop(file);
+        remove_file(directory.as_raw_fd(), &temporary);
+        return Err(error);
+    }
     drop(file);
     if rename_no_replace(directory.as_raw_fd(), &temporary, &format!("{name}.json")).is_err() {
         remove_file(directory.as_raw_fd(), &temporary);
@@ -594,6 +626,35 @@ fn publish_record_to_directory(
     directory
         .sync_all()
         .map_err(|_| String::from("pressure evidence capture record sync failed"))
+}
+
+fn finalize_public_record_protection(
+    file: &File,
+    owner_uid: u32,
+    owner_gid: u32,
+    expected_len: usize,
+) -> Result<(), String> {
+    if unsafe { libc::fchmod(file.as_raw_fd(), 0o644) } != 0 {
+        return Err(String::from(
+            "pressure evidence capture record protection is unavailable",
+        ));
+    }
+    let metadata = file
+        .metadata()
+        .map_err(|_| String::from("pressure evidence capture record protection is unavailable"))?;
+    if !metadata.is_file()
+        || metadata.uid() != owner_uid
+        || metadata.gid() != owner_gid
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o777 != 0o644
+        || metadata.len() != expected_len as u64
+    {
+        return Err(String::from(
+            "pressure evidence capture record protection is invalid",
+        ));
+    }
+    file.sync_all()
+        .map_err(|_| String::from("pressure evidence capture record protection is unavailable"))
 }
 
 fn remove_file(parent: i32, name: &str) {
@@ -670,6 +731,7 @@ fn is_revision(value: &str) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
 
     fn names(values: &[&str]) -> BTreeSet<String> {
         values.iter().map(|value| (*value).into()).collect()
@@ -753,5 +815,88 @@ mod tests {
         )
         .expect("weaken record permissions");
         assert!(publish_record_to_directory(&directory_file, "mode", b"{}", uid, gid).is_err());
+    }
+
+    #[test]
+    fn capture_directory_descriptor_is_syncable() {
+        let directory = tempfile::tempdir().expect("capture directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("protected capture directory mode");
+        let metadata = fs::metadata(directory.path()).expect("capture metadata");
+        let directory = open_directory(
+            directory.path().to_str().expect("capture path"),
+            metadata.uid(),
+            metadata.gid(),
+            0o700,
+        )
+        .expect("syncable capture directory");
+        let flags = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_GETFL) };
+        assert_ne!(flags, -1, "capture directory flags");
+        assert_eq!(flags & libc::O_PATH, 0, "capture directory is not O_PATH");
+        let reopened = directory.metadata().expect("reopened capture metadata");
+        assert_eq!(reopened.dev(), metadata.dev(), "capture directory device");
+        assert_eq!(reopened.ino(), metadata.ino(), "capture directory inode");
+        assert_eq!(reopened.mode() & 0o777, 0o700, "capture directory mode");
+        directory.sync_all().expect("capture directory sync");
+    }
+
+    #[test]
+    fn public_record_protection_is_explicitly_finalized() {
+        let directory = tempfile::tempdir().expect("capture directory");
+        let path = directory.path().join("record.json");
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("record file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("restricted record mode");
+        file.write_all(b"complete record")
+            .and_then(|()| file.sync_all())
+            .expect("record persistence");
+
+        finalize_public_record_protection(
+            &file,
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            b"complete record".len(),
+        )
+        .expect("public record protection");
+        assert_eq!(
+            fs::metadata(path).expect("record metadata").mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn publication_with_service_umask_is_exactly_public() {
+        const CHILD_ENV: &str = "OTA_PRESSURE_EVIDENCE_CAPTURE_UMASK_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "pressure_evidence_capture::tests::publication_with_service_umask_is_exactly_public",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .status()
+                .expect("isolated umask test");
+            assert!(status.success(), "isolated umask test failed");
+            return;
+        }
+
+        unsafe { libc::umask(0o077) };
+        let directory = tempfile::tempdir().expect("capture directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755))
+            .expect("public capture directory mode");
+        let directory_file = File::open(directory.path()).expect("capture descriptor");
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+
+        publish_record_to_directory(&directory_file, "umask", b"{\"capture\":true}", uid, gid)
+            .expect("public record");
+        let metadata = fs::metadata(directory.path().join("umask.json")).expect("record metadata");
+        assert_eq!(metadata.mode() & 0o777, 0o644, "exact public record mode");
     }
 }

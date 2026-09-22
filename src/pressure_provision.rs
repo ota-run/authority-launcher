@@ -2786,6 +2786,7 @@ mod tests {
             "/usr/lib/ota-authority/bin/ota-authority-launcher",
         ));
         assert!(service.contains("Type=oneshot\nRemainAfterExit=yes\n"));
+        assert!(service.contains("UMask=0077\n"));
         assert!(service.contains("capture-secret-delivery-pressure-evidence"));
         assert!(service.contains(&format!(
             "ReadWritePaths={} {}",
