@@ -97,6 +97,37 @@ fn selected_execution_pressure_workflow_uses_current_immutable_sources() {
         4,
         "every selected-execution gate must validate the Cargo-locked Protocol revision",
     );
+    for unsupported_provision_argument in [
+        "--protocol-source-revision",
+        "--core-source-revision",
+        "--launcher-source-revision",
+    ] {
+        assert!(
+            !SELECTED_EXECUTION_WORKFLOW.contains(unsupported_provision_argument),
+            "the provisioner must derive source identity from its protected builds, not accept {unsupported_provision_argument}",
+        );
+    }
+    assert_eq!(
+        SELECTED_EXECUTION_WORKFLOW
+            .matches(".protocol_source_revision == $protocol")
+            .count(),
+        2,
+        "both provisioned installation records must reconcile Protocol source identity",
+    );
+    assert_eq!(
+        SELECTED_EXECUTION_WORKFLOW
+            .matches(".core_source_revision == $core")
+            .count(),
+        2,
+        "both provisioned installation records must reconcile Core source identity",
+    );
+    assert_eq!(
+        SELECTED_EXECUTION_WORKFLOW
+            .matches(".launcher_source_revision == $launcher")
+            .count(),
+        2,
+        "both provisioned installation records must reconcile Launcher source identity",
+    );
 }
 
 #[test]

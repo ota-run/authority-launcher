@@ -151,9 +151,6 @@ jobs:
             --broker-decision-binary /usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer \
             --ota-binary /usr/lib/ota-authority/bin/ota \
             --pressure-client-binary /usr/lib/ota-authority/bin/ota-authority-systemd-pressure-client \
-            --protocol-source-revision "$EXPECTED_PROTOCOL_REVISION" \
-            --core-source-revision "$EXPECTED_CORE_REVISION" \
-            --launcher-source-revision "$(git rev-parse HEAD)" \
             | tee "$EVIDENCE_DIR/provision.txt"
 
           sha256sum \
@@ -177,6 +174,15 @@ jobs:
             "$EVIDENCE_DIR/attestor-verifiers.json" \
             "$EVIDENCE_DIR/broker-verifier-binding.json" \
             "$EVIDENCE_DIR/protected-history-binding.json"
+          jq -e \
+            --arg protocol "$EXPECTED_PROTOCOL_REVISION" \
+            --arg core "$EXPECTED_CORE_REVISION" \
+            --arg launcher "$(git rev-parse HEAD)" \
+            '.schema_version == 1
+             and .protocol_source_revision == $protocol
+             and .core_source_revision == $core
+             and .launcher_source_revision == $launcher' \
+            "$EVIDENCE_DIR/installation-manifest.json"
           jq -e \
             '.schema_version == 1
              and (.bindings | length) == 1
@@ -1565,9 +1571,6 @@ jobs:
             --broker-decision-binary /usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer \
             --ota-binary /usr/lib/ota-authority/bin/ota \
             --pressure-client-binary /usr/lib/ota-authority/bin/ota-authority-systemd-client \
-            --protocol-source-revision "$EXPECTED_PROTOCOL_REVISION" \
-            --core-source-revision "$EXPECTED_CORE_REVISION" \
-            --launcher-source-revision "$(git rev-parse HEAD)" \
             --production-client \
             | tee "$EVIDENCE_DIR/provision.txt"
           sudo cp /etc/ota/authority-launcher-installation.json \
@@ -1581,6 +1584,15 @@ jobs:
           sudo cp /etc/ota/authority-launcher-systemd.json \
             "$EVIDENCE_DIR/launcher-binding.json"
           sudo chown "$(id -u):$(id -g)" "$EVIDENCE_DIR"/*.json
+          jq -e \
+            --arg protocol "$EXPECTED_PROTOCOL_REVISION" \
+            --arg core "$EXPECTED_CORE_REVISION" \
+            --arg launcher "$(git rev-parse HEAD)" \
+            '.schema_version == 1
+             and .protocol_source_revision == $protocol
+             and .core_source_revision == $core
+             and .launcher_source_revision == $launcher' \
+            "$EVIDENCE_DIR/installation-manifest.json"
           jq -e \
             '.schema_version == 1
              and .installed_client_path == "/usr/lib/ota-authority/bin/ota"
