@@ -173,6 +173,9 @@ fn root_boundary_workflow_retains_root_owned_store_fixture_coverage() {
         1,
         "root-boundary workflow must run the exact root namespace regression"
     );
+    assert!(public_namespace_step.contains(
+        "^test result: ok\\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;"
+    ));
 }
 
 #[test]
