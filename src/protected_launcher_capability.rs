@@ -1326,6 +1326,16 @@ mod linux_tests {
     }
 
     fn create_store_tree() -> tempfile::TempDir {
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            0,
+            "test requires root-owned stores"
+        );
+        assert_eq!(
+            unsafe { libc::getegid() },
+            0,
+            "test requires root-owned stores"
+        );
         let root = tempdir().expect("root");
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("root mode");
         let authority = root.path().join("authority");
@@ -1346,6 +1356,25 @@ mod linux_tests {
             fs::set_permissions(path, fs::Permissions::from_mode(0o400)).expect("store mode");
         }
         root
+    }
+
+    fn open_root_owned_test_stores(root: &tempfile::TempDir) -> ProtectedAuthorityStoresV1 {
+        let metadata = root.path().metadata().expect("root metadata");
+        assert_eq!(metadata.uid(), 0, "root-owned fixture root");
+        assert_eq!(metadata.gid(), 0, "root-owned fixture root");
+        let stores = ProtectedAuthorityStoresV1::open_beneath(
+            root.path(),
+            Path::new("authority"),
+            metadata.uid(),
+            metadata.gid(),
+        )
+        .expect("root-owned protected stores");
+        assert_eq!(
+            stores.descriptors().len(),
+            2,
+            "two retained store descriptors"
+        );
+        stores
     }
 
     fn create_signed_authority_bundle_store_tree() -> (
@@ -1466,17 +1495,11 @@ mod linux_tests {
     }
 
     #[test]
+    #[ignore = "requires root-owned authority store descriptors"]
     fn retained_authority_snapshot_v2_reconciles_exact_request_and_stores() {
         let now = u64::try_from(OffsetDateTime::now_utc().unix_timestamp()).expect("clock");
         let (root, _, _, _) = create_signed_authority_bundle_store_tree_at(now - 1, now + 300);
-        let metadata = root.path().metadata().expect("root metadata");
-        let stores = ProtectedAuthorityStoresV1::open_beneath(
-            root.path(),
-            Path::new("authority"),
-            metadata.uid(),
-            metadata.gid(),
-        )
-        .expect("retained stores");
+        let stores = open_root_owned_test_stores(&root);
         let mut startup = LauncherStartupContinuationV1 {
             schema_version: 1,
             identity: String::new(),
@@ -1543,16 +1566,10 @@ mod linux_tests {
     }
 
     #[test]
+    #[ignore = "requires root-owned authority store descriptors"]
     fn retained_authority_bundle_verifies_signature_and_descriptor_bytes() {
         let (root, _store, bundle, payload) = create_signed_authority_bundle_store_tree();
-        let metadata = root.path().metadata().expect("root metadata");
-        let stores = ProtectedAuthorityStoresV1::open_beneath(
-            root.path(),
-            Path::new("authority"),
-            metadata.uid(),
-            metadata.gid(),
-        )
-        .expect("retained stores");
+        let stores = open_root_owned_test_stores(&root);
         let verified = stores
             .verify_secret_delivery_authority_bundle_at_v1(bundle.issued_at_unix_seconds)
             .expect("current signed bundle");
@@ -1612,8 +1629,12 @@ mod linux_tests {
     }
 
     #[test]
+    #[ignore = "requires root-owned authority store descriptors"]
     fn retained_authority_bundle_refuses_structurally_valid_wrong_signature() {
         let (root, _store, bundle, _) = create_signed_authority_bundle_store_tree();
+        open_root_owned_test_stores(&root)
+            .verify_secret_delivery_authority_bundle_at_v1(bundle.issued_at_unix_seconds)
+            .expect("baseline signed bundle");
         let binding_path = root
             .path()
             .join("authority")
@@ -1628,14 +1649,7 @@ mod linux_tests {
         .expect("invalid bundle");
         fs::set_permissions(&binding_path, fs::Permissions::from_mode(0o400))
             .expect("protected mode");
-        let metadata = root.path().metadata().expect("root metadata");
-        let stores = ProtectedAuthorityStoresV1::open_beneath(
-            root.path(),
-            Path::new("authority"),
-            metadata.uid(),
-            metadata.gid(),
-        )
-        .expect("retained stores");
+        let stores = open_root_owned_test_stores(&root);
         assert!(matches!(
             stores.verify_secret_delivery_authority_bundle_at_v1(invalid.issued_at_unix_seconds),
             Err(ProtectedLauncherCapabilityError::ReconciliationFailed)
@@ -1643,6 +1657,7 @@ mod linux_tests {
     }
 
     #[test]
+    #[ignore = "requires root-owned authority store descriptors"]
     fn retained_authority_bundle_refuses_weak_keys_and_protocol_substitutions() {
         let verify_mutation = |mutate: &dyn Fn(
             &mut ProtectedSecretDeliveryVerifierStoreV1,
@@ -1654,6 +1669,9 @@ mod linux_tests {
         ),
                                observed_at: u64| {
             let (root, mut store, mut bundle, _) = create_signed_authority_bundle_store_tree();
+            open_root_owned_test_stores(&root)
+                .verify_secret_delivery_authority_bundle_at_v1(bundle.issued_at_unix_seconds)
+                .expect("baseline signed bundle");
             mutate(&mut store, &mut bundle);
             let signing_key = SigningKey::from_bytes(&[9; 32]);
             sign_authority_bundle(&mut bundle, &signing_key);
@@ -1662,14 +1680,7 @@ mod linux_tests {
             store.identity = protected_secret_delivery_verifier_store_v1_identity(&store)
                 .expect("mutated store identity");
             write_authority_bundle_records(&root.path().join("authority"), &store, &bundle);
-            let metadata = root.path().metadata().expect("root metadata");
-            let stores = ProtectedAuthorityStoresV1::open_beneath(
-                root.path(),
-                Path::new("authority"),
-                metadata.uid(),
-                metadata.gid(),
-            )
-            .expect("retained stores");
+            let stores = open_root_owned_test_stores(&root);
             stores.verify_secret_delivery_authority_bundle_at_v1(observed_at)
         };
         const OBSERVED_AT: u64 = 1_788_800_001;
@@ -1739,6 +1750,9 @@ mod linux_tests {
         ));
 
         let (root, mut store, mut bundle, _) = create_signed_authority_bundle_store_tree();
+        open_root_owned_test_stores(&root)
+            .verify_secret_delivery_authority_bundle_at_v1(bundle.issued_at_unix_seconds)
+            .expect("baseline signed bundle");
         let weak_public_key = URL_SAFE_NO_PAD.encode([
             1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0,
@@ -1762,20 +1776,16 @@ mod linux_tests {
         store.identity = protected_secret_delivery_verifier_store_v1_identity(&store)
             .expect("weak store identity");
         write_authority_bundle_records(&root.path().join("authority"), &store, &bundle);
-        let metadata = root.path().metadata().expect("root metadata");
-        let stores = ProtectedAuthorityStoresV1::open_beneath(
-            root.path(),
-            Path::new("authority"),
-            metadata.uid(),
-            metadata.gid(),
-        )
-        .expect("weak retained stores");
+        let stores = open_root_owned_test_stores(&root);
         assert!(matches!(
             stores.verify_secret_delivery_authority_bundle_at_v1(OBSERVED_AT),
             Err(ProtectedLauncherCapabilityError::ReconciliationFailed)
         ));
 
         let (root, _store, bundle, _) = create_signed_authority_bundle_store_tree();
+        open_root_owned_test_stores(&root)
+            .verify_secret_delivery_authority_bundle_at_v1(bundle.issued_at_unix_seconds)
+            .expect("baseline signed bundle");
         let binding_path = root
             .path()
             .join("authority")
@@ -1784,14 +1794,7 @@ mod linux_tests {
         fs::write(&binding_path, b"{").expect("malformed bundle");
         fs::set_permissions(&binding_path, fs::Permissions::from_mode(0o400))
             .expect("protected mode");
-        let metadata = root.path().metadata().expect("root metadata");
-        let stores = ProtectedAuthorityStoresV1::open_beneath(
-            root.path(),
-            Path::new("authority"),
-            metadata.uid(),
-            metadata.gid(),
-        )
-        .expect("retained malformed stores");
+        let stores = open_root_owned_test_stores(&root);
         assert!(matches!(
             stores.verify_secret_delivery_authority_bundle_at_v1(bundle.issued_at_unix_seconds),
             Err(ProtectedLauncherCapabilityError::Unprotected)
@@ -1799,25 +1802,22 @@ mod linux_tests {
     }
 
     #[test]
+    #[ignore = "requires root-owned authority store descriptors"]
     fn authority_stores_are_opened_beneath_retained_descriptors() {
         let root = create_store_tree();
-        let metadata = root.path().metadata().expect("metadata");
-        let stores = ProtectedAuthorityStoresV1::open_beneath(
-            root.path(),
-            Path::new("authority"),
-            metadata.uid(),
-            metadata.gid(),
-        )
-        .expect("protected stores");
-        assert_eq!(stores.descriptors().len(), 2);
+        let stores = open_root_owned_test_stores(&root);
         stores.revalidate().expect("retained stores");
     }
 
     #[test]
+    #[ignore = "requires root-owned authority store descriptors"]
     fn authority_store_aliases_and_writable_directories_refuse() {
         let root = create_store_tree();
         let metadata = root.path().metadata().expect("metadata");
         let authority = root.path().join("authority");
+        open_root_owned_test_stores(&root)
+            .revalidate()
+            .expect("baseline stores");
         fs::remove_file(authority.join(SECRET_DELIVERY_BINDING_STORE)).expect("remove store");
         std::os::unix::fs::symlink(
             authority.join(SECRET_DELIVERY_VERIFIER_STORE),
@@ -1845,6 +1845,9 @@ mod linux_tests {
             fs::Permissions::from_mode(0o400),
         )
         .expect("store mode");
+        open_root_owned_test_stores(&root)
+            .revalidate()
+            .expect("restored baseline stores");
         fs::set_permissions(&authority, fs::Permissions::from_mode(0o720))
             .expect("writable authority");
         assert!(
@@ -1859,6 +1862,9 @@ mod linux_tests {
 
         fs::set_permissions(&authority, fs::Permissions::from_mode(0o700))
             .expect("restore authority mode");
+        open_root_owned_test_stores(&root)
+            .revalidate()
+            .expect("second restored baseline stores");
         fs::remove_file(authority.join(SECRET_DELIVERY_BINDING_STORE)).expect("remove store");
         fs::hard_link(
             authority.join(SECRET_DELIVERY_VERIFIER_STORE),
@@ -1903,16 +1909,18 @@ mod linux_tests {
             .is_err()
         );
 
-        let root = create_store_tree();
+        let directory = tempdir().expect("store directory");
+        let store_path = directory.path().join("verifiers-v1.json");
+        fs::write(&store_path, b"{\"verifiers\":[]}").expect("store bytes");
+        fs::set_permissions(&store_path, fs::Permissions::from_mode(0o600))
+            .expect("writable store mode");
         let store = fs::File::options()
             .read(true)
             .write(true)
-            .open(
-                root.path()
-                    .join("authority")
-                    .join(SECRET_DELIVERY_VERIFIER_STORE),
-            )
+            .open(&store_path)
             .expect("read-write store");
+        fs::set_permissions(&store_path, fs::Permissions::from_mode(0o400))
+            .expect("protected store mode");
         assert!(
             observe_store_descriptor_v1(
                 &store,
@@ -1928,9 +1936,13 @@ mod linux_tests {
     }
 
     #[test]
+    #[ignore = "requires root-owned authority store descriptors"]
     fn fifo_store_refuses_without_blocking() {
         let root = create_store_tree();
         let metadata = root.path().metadata().expect("metadata");
+        open_root_owned_test_stores(&root)
+            .revalidate()
+            .expect("baseline stores");
         let fifo = root
             .path()
             .join("authority")

@@ -28,6 +28,7 @@ const RECOVERY_TRIGGER_WORKFLOW: &str =
     include_str!("../.github/workflows/systemd-v3-independently-administered-recovery-trigger.yml");
 const SELECTED_EXECUTION_WORKFLOW: &str =
     include_str!("../.github/workflows/systemd-v3-execution-disabled.yml");
+const ROOT_BOUNDARY_WORKFLOW: &str = include_str!("../.github/workflows/root-boundary.yml");
 const CARGO_TOML: &str = include_str!("../Cargo.toml");
 const SYSTEMD_SERVICE_SOURCE: &str = include_str!("../src/systemd_service.rs");
 
@@ -96,6 +97,35 @@ fn selected_execution_pressure_workflow_uses_current_immutable_sources() {
         4,
         "every selected-execution gate must validate the Cargo-locked Protocol revision",
     );
+}
+
+#[test]
+fn root_boundary_workflow_retains_root_owned_store_fixture_coverage() {
+    assert!(ROOT_BOUNDARY_WORKFLOW.contains("Prove root-owned Authority store fixtures"));
+    assert!(!ROOT_BOUNDARY_WORKFLOW.contains(
+        "cargo test --locked --features secret-delivery-pressure,protected-attestor --lib protected_launcher_capability::linux_tests:: -- --ignored"
+    ));
+    assert!(ROOT_BOUNDARY_WORKFLOW.contains(
+        "cargo test --locked --features secret-delivery-pressure,protected-attestor --lib \"$test_name\" -- --ignored --exact"
+    ));
+
+    for test_name in [
+        "protected_launcher_capability::linux_tests::retained_authority_snapshot_v2_reconciles_exact_request_and_stores",
+        "protected_launcher_capability::linux_tests::retained_authority_bundle_verifies_signature_and_descriptor_bytes",
+        "protected_launcher_capability::linux_tests::retained_authority_bundle_refuses_structurally_valid_wrong_signature",
+        "protected_launcher_capability::linux_tests::retained_authority_bundle_refuses_weak_keys_and_protocol_substitutions",
+        "protected_launcher_capability::linux_tests::authority_stores_are_opened_beneath_retained_descriptors",
+        "protected_launcher_capability::linux_tests::authority_store_aliases_and_writable_directories_refuse",
+        "protected_launcher_capability::linux_tests::fifo_store_refuses_without_blocking",
+    ] {
+        assert!(
+            ROOT_BOUNDARY_WORKFLOW.contains(test_name),
+            "root-boundary workflow must prove {test_name}"
+        );
+    }
+    assert!(ROOT_BOUNDARY_WORKFLOW.contains(
+        "^test result: ok\\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;"
+    ));
 }
 
 #[test]
