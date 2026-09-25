@@ -1718,8 +1718,9 @@ fn create_root_directory(path: &Path, mode: u32) -> Result<(), String> {
                         || metadata.mode() & 0o022 != 0
                     {
                         return Err(format!(
-                            "protected directory chain is invalid at {}",
-                            observed.display()
+                            "protected directory chain is invalid at {} ({})",
+                            observed.display(),
+                            protected_path_metadata_summary(&metadata),
                         ));
                     }
                     if is_target {
@@ -1759,6 +1760,24 @@ fn create_root_directory(path: &Path, mode: u32) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn protected_path_metadata_summary(metadata: &fs::Metadata) -> String {
+    let kind = if metadata.file_type().is_symlink() {
+        "symlink"
+    } else if metadata.is_dir() {
+        "directory"
+    } else if metadata.is_file() {
+        "file"
+    } else {
+        "other"
+    };
+    format!(
+        "kind={kind}, uid={}, gid={}, mode={:o}",
+        metadata.uid(),
+        metadata.gid(),
+        metadata.mode() & 0o777,
+    )
 }
 
 fn catalog_namespace_directory(identity: &str) -> Result<PathBuf, String> {
@@ -2498,10 +2517,9 @@ fn verify_root_protected_chain(path: &Path) -> Result<(), String> {
         if metadata.file_type().is_symlink() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0
         {
             return Err(format!(
-                "protected path ownership chain is invalid at {} (uid={}, mode={:o})",
+                "protected path ownership chain is invalid at {} ({})",
                 observed.display(),
-                metadata.uid(),
-                metadata.mode() & 0o777,
+                protected_path_metadata_summary(&metadata),
             ));
         }
     }
@@ -2624,6 +2642,7 @@ mod tests {
         let writable_error = create_root_directory(&writable.join("child"), 0o755)
             .expect_err("writable parent must refuse");
         assert!(writable_error.contains(writable.to_string_lossy().as_ref()));
+        assert!(writable_error.contains("kind=directory, uid=0, gid=0, mode=775"));
         assert!(!writable.join("child").exists());
         assert_eq!(
             fs::symlink_metadata(&writable)
@@ -2646,6 +2665,7 @@ mod tests {
         let foreign_error = create_root_directory(&foreign.join("child"), 0o755)
             .expect_err("foreign parent must refuse");
         assert!(foreign_error.contains(foreign.to_string_lossy().as_ref()));
+        assert!(foreign_error.contains("kind=directory, uid=65534, gid=65534, mode=755"));
         assert!(!foreign.join("child").exists());
         assert_eq!(
             fs::symlink_metadata(&foreign)
@@ -2662,6 +2682,7 @@ mod tests {
         let alias_error = create_root_directory(&alias.join("child"), 0o755)
             .expect_err("aliased parent must refuse");
         assert!(alias_error.contains(alias.to_string_lossy().as_ref()));
+        assert!(alias_error.contains("kind=symlink"));
         assert!(!alias.join("child").exists());
         assert!(
             fs::symlink_metadata(&alias)
