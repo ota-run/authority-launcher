@@ -26,6 +26,9 @@ const RECOVERY_WORKFLOW: &str =
     include_str!("../.github/workflows/systemd-v3-independently-administered-recovery.yml");
 const RECOVERY_TRIGGER_WORKFLOW: &str =
     include_str!("../.github/workflows/systemd-v3-independently-administered-recovery-trigger.yml");
+const SELECTED_EXECUTION_WORKFLOW: &str =
+    include_str!("../.github/workflows/systemd-v3-execution-disabled.yml");
+const CARGO_TOML: &str = include_str!("../Cargo.toml");
 const SYSTEMD_SERVICE_SOURCE: &str = include_str!("../src/systemd_service.rs");
 
 #[test]
@@ -61,6 +64,38 @@ fn same_child_v2_reuses_the_prelude_authority_context() {
     );
     assert!(selected_boundary.contains("Some((derivation, observation, authority))"));
     assert!(selected_boundary.contains("let (prelude, mut observation, authority)"));
+}
+
+#[test]
+fn selected_execution_pressure_workflow_uses_current_immutable_sources() {
+    let protocol_pin = CARGO_TOML
+        .lines()
+        .find(|line| line.starts_with("ota-authority-protocol ="))
+        .and_then(|line| line.split("rev = \"").nth(1))
+        .and_then(|value| value.split('"').next())
+        .expect("protocol Cargo pin");
+
+    assert_eq!(
+        SELECTED_EXECUTION_WORKFLOW
+            .matches("EXPECTED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}")
+            .count(),
+        1,
+        "the V3 identity gate must bind Core identity to the contract-selected setup source",
+    );
+    assert_eq!(
+        SELECTED_EXECUTION_WORKFLOW
+            .matches("EXPECTED_CORE_REVISION: ${{ steps.ota.outputs.source-git-rev }}")
+            .count(),
+        3,
+        "V3 provisioning and production-attachment gates must bind Core identity to the contract-selected setup source",
+    );
+    assert_eq!(
+        SELECTED_EXECUTION_WORKFLOW
+            .matches(&format!("EXPECTED_PROTOCOL_REVISION: {protocol_pin}"))
+            .count(),
+        4,
+        "every selected-execution gate must validate the Cargo-locked Protocol revision",
+    );
 }
 
 #[test]

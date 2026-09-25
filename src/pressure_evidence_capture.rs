@@ -403,7 +403,9 @@ fn verify_directory(file: &File, uid: u32, gid: u32, mode: u32) -> Result<(), St
     if !metadata.is_dir()
         || metadata.uid() != uid
         || metadata.gid() != gid
-        || metadata.nlink() < 2
+        // Overlay-backed directories can validly report one link. Only an unlinked descriptor is
+        // unsafe because captured evidence would no longer have a reachable destination.
+        || metadata.nlink() == 0
         || metadata.mode() & 0o777 != mode
     {
         return Err(String::from(
@@ -838,6 +840,28 @@ mod tests {
         assert_eq!(reopened.ino(), metadata.ino(), "capture directory inode");
         assert_eq!(reopened.mode() & 0o777, 0o700, "capture directory mode");
         directory.sync_all().expect("capture directory sync");
+    }
+
+    #[test]
+    fn unlinked_capture_directory_is_refused() {
+        let directory = tempfile::tempdir().expect("capture directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+            .expect("protected capture directory mode");
+        let metadata = fs::metadata(directory.path()).expect("capture metadata");
+        let retained = File::from(
+            open_root(directory.path(), metadata.uid(), metadata.gid())
+                .expect("retained capture directory"),
+        );
+        verify_directory(&retained, metadata.uid(), metadata.gid(), 0o700)
+            .expect("linked capture directory");
+
+        fs::remove_dir(directory.path()).expect("unlink capture directory");
+        assert_eq!(
+            retained.metadata().expect("unlinked metadata").nlink(),
+            0,
+            "unlinked directory descriptor"
+        );
+        assert!(verify_directory(&retained, metadata.uid(), metadata.gid(), 0o700).is_err());
     }
 
     #[test]

@@ -58,7 +58,7 @@ jobs:
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/systemd-v3-evidence
           EXPECTED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
-          EXPECTED_PROTOCOL_REVISION: 04a199a1eddd72b5b61958e0fe7f2d4e662e05cf
+          EXPECTED_PROTOCOL_REVISION: e819f95890ea23ae2f336a59fb3ff62cfa858d8b
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR"
@@ -89,7 +89,7 @@ jobs:
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/systemd-v3-evidence
           EXPECTED_CORE_REVISION: ${{ steps.ota.outputs.source-git-rev }}
-          EXPECTED_PROTOCOL_REVISION: 04a199a1eddd72b5b61958e0fe7f2d4e662e05cf
+          EXPECTED_PROTOCOL_REVISION: e819f95890ea23ae2f336a59fb3ff62cfa858d8b
           PRESSURE_REPOSITORY: /srv/ota-v3-pressure
         run: |
           set -euo pipefail
@@ -1486,8 +1486,8 @@ jobs:
       - name: Build and verify immutable sources
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/production-attachment-evidence
-          EXPECTED_CORE_REVISION: d9d424168b1c1dad48351651c610789e54f74dcf
-          EXPECTED_PROTOCOL_REVISION: 04a199a1eddd72b5b61958e0fe7f2d4e662e05cf
+          EXPECTED_CORE_REVISION: ${{ steps.ota.outputs.source-git-rev }}
+          EXPECTED_PROTOCOL_REVISION: e819f95890ea23ae2f336a59fb3ff62cfa858d8b
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR"
@@ -1511,8 +1511,8 @@ jobs:
       - name: Provision production attachment boundary
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/production-attachment-evidence
-          EXPECTED_CORE_REVISION: d9d424168b1c1dad48351651c610789e54f74dcf
-          EXPECTED_PROTOCOL_REVISION: 04a199a1eddd72b5b61958e0fe7f2d4e662e05cf
+          EXPECTED_CORE_REVISION: ${{ steps.ota.outputs.source-git-rev }}
+          EXPECTED_PROTOCOL_REVISION: e819f95890ea23ae2f336a59fb3ff62cfa858d8b
           PRESSURE_REPOSITORY: /srv/ota-production-attachment
         run: |
           set -euo pipefail

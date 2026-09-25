@@ -1582,23 +1582,31 @@ pub(crate) mod tests {
         )
         .expect("replay store");
         let (startup, request) = exchange();
-        store
+        let reservation = store
             .reserve(&request, &startup)
             .expect("first reservation");
         assert!(matches!(
             store.reserve(&request, &startup),
             Err(ProtectedAuthoritySnapshotReplayError::ReplayDetected)
         ));
-        let mut sibling = request;
-        sibling.challenge.nonce_commitment = identity('8');
+        let mut sibling = request.clone();
+        let sibling_nonce = [8_u8; 32];
+        sibling.nonce = URL_SAFE_NO_PAD.encode(sibling_nonce);
+        sibling.challenge.nonce_commitment =
+            protected_authority_snapshot_nonce_commitment_v1(&sibling_nonce)
+                .expect("sibling nonce commitment");
         sibling.challenge.identity =
             protected_authority_snapshot_challenge_v1_identity(&sibling.challenge)
                 .expect("sibling challenge");
         sibling.identity =
             protected_authority_snapshot_request_v1_identity(&sibling).expect("sibling request");
+        let sibling_reservation = store
+            .reserve(&sibling, &startup)
+            .expect("distinct sibling reservation");
+        assert_ne!(reservation.record_name(), sibling_reservation.record_name());
         assert!(matches!(
             store.reserve(&sibling, &startup),
-            Err(ProtectedAuthoritySnapshotReplayError::Mismatch)
+            Err(ProtectedAuthoritySnapshotReplayError::ReplayDetected)
         ));
     }
 
@@ -1778,7 +1786,7 @@ pub(crate) mod tests {
             protocol_replay_fixture_v3();
         binding_response
             .binding
-            .transport_dependency_record_identity = identity('h');
+            .transport_dependency_record_identity = identity('b');
         binding_response.binding.identity =
             protected_launcher_secret_delivery_transaction_binding_v3_identity(
                 &binding_response.binding,
@@ -1796,9 +1804,13 @@ pub(crate) mod tests {
 
     #[test]
     fn snapshot_replay_v3_refusal_is_terminal() {
-        let (_, store, reservation, response, binding_request, binding_response) =
+        let (directory, store, reservation, response, binding_request, binding_response) =
             protocol_replay_fixture_v3();
         store.refuse(&reservation).expect("terminal V3 refusal");
+        assert_eq!(
+            read_record(directory.path(), &reservation).status,
+            SnapshotReplayStatusV1::Refused
+        );
         assert_eq!(
             store.consume_v3(&reservation, &response, &binding_request, &binding_response),
             Err(ProtectedAuthoritySnapshotReplayError::Mismatch)
