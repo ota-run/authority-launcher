@@ -1690,9 +1690,75 @@ fn secret_delivery_authority_records(
 }
 
 fn create_root_directory(path: &Path, mode: u32) -> Result<(), String> {
-    fs::create_dir_all(path).map_err(|_| String::from("protected directory creation failed"))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .map_err(|_| String::from("protected directory permissions failed"))
+    if !path.is_absolute() {
+        return Err(String::from("protected directory path must be absolute"));
+    }
+    if path.components().any(|component| {
+        !matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )
+    }) {
+        return Err(String::from("protected directory path must be canonical"));
+    }
+
+    let mut observed = PathBuf::from("/");
+    for component in path.components().filter_map(|component| match component {
+        std::path::Component::Normal(value) => Some(value),
+        _ => None,
+    }) {
+        observed.push(component);
+        let is_target = observed == path;
+        loop {
+            match fs::symlink_metadata(&observed) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink()
+                        || !metadata.is_dir()
+                        || metadata.uid() != 0
+                        || metadata.mode() & 0o022 != 0
+                    {
+                        return Err(format!(
+                            "protected directory chain is invalid at {}",
+                            observed.display()
+                        ));
+                    }
+                    if is_target {
+                        fs::set_permissions(&observed, fs::Permissions::from_mode(mode))
+                            .map_err(|_| String::from("protected directory permissions failed"))?;
+                    }
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match fs::create_dir(&observed) {
+                        Ok(()) => {
+                            let expected_mode = if is_target { mode } else { 0o755 };
+                            fs::set_permissions(
+                                &observed,
+                                fs::Permissions::from_mode(expected_mode),
+                            )
+                            .map_err(|_| String::from("protected directory permissions failed"))?;
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(_) => {
+                            return Err(String::from("protected directory creation failed"));
+                        }
+                    }
+                }
+                Err(_) => return Err(String::from("protected directory creation failed")),
+            }
+        }
+    }
+
+    verify_root_protected_chain(path)?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| String::from("protected directory metadata is unavailable"))?;
+    if metadata.mode() & 0o777 != mode {
+        return Err(String::from(
+            "protected directory permissions are not exact",
+        ));
+    }
+    Ok(())
 }
 
 fn catalog_namespace_directory(identity: &str) -> Result<PathBuf, String> {
@@ -2413,6 +2479,14 @@ fn verify_root_protected_chain(path: &Path) -> Result<(), String> {
     if !path.is_absolute() {
         return Err(String::from("protected path must be absolute"));
     }
+    if path.components().any(|component| {
+        !matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )
+    }) {
+        return Err(String::from("protected path must be canonical"));
+    }
     let mut observed = PathBuf::from("/");
     for component in path.components().filter_map(|component| match component {
         std::path::Component::Normal(value) => Some(value),
@@ -2423,7 +2497,12 @@ fn verify_root_protected_chain(path: &Path) -> Result<(), String> {
             .map_err(|_| String::from("protected path ownership chain is unavailable"))?;
         if metadata.file_type().is_symlink() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0
         {
-            return Err(String::from("protected path ownership chain is invalid"));
+            return Err(format!(
+                "protected path ownership chain is invalid at {} (uid={}, mode={:o})",
+                observed.display(),
+                metadata.uid(),
+                metadata.mode() & 0o777,
+            ));
         }
     }
     Ok(())
@@ -2460,6 +2539,7 @@ fn run_systemctl(arguments: &[&str]) -> Result<(), String> {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signature, Verifier};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     #[test]
@@ -2477,6 +2557,120 @@ mod tests {
         assert!(validate_protected_launcher_core_version("1.6.27").is_err());
         assert!(validate_protected_launcher_core_version("1.7.0").is_err());
         assert!(validate_protected_launcher_core_version("stable").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root-owned filesystem state"]
+    fn root_public_namespace_creation_honors_umask_and_refuses_takeover() {
+        const CHILD_ENV: &str = "OTA_ROOT_PUBLIC_NAMESPACE_UMASK_CHILD";
+        const TEST_NAME: &str = "pressure_provision::tests::root_public_namespace_creation_honors_umask_and_refuses_takeover";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--ignored", "--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("isolated umask test");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "isolated umask test failed: stdout={stdout:?}, stderr={stderr:?}"
+            );
+            let expected_test_line = format!("test {TEST_NAME} ... ok");
+            assert_eq!(
+                stdout.matches(&expected_test_line).count(),
+                1,
+                "isolated umask test did not execute exactly once: {stdout:?}"
+            );
+            assert_eq!(
+                stdout
+                    .lines()
+                    .filter(|line| {
+                        line.starts_with(
+                            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;",
+                        )
+                    })
+                    .count(),
+                1,
+                "isolated umask test did not report one passing test: {stdout:?}"
+            );
+            return;
+        }
+
+        assert_eq!(unsafe { libc::geteuid() }, 0, "root is required");
+        unsafe { libc::umask(0o002) };
+
+        let root = PathBuf::from("/root").join(format!(
+            "ota-authority-public-namespace-{}",
+            std::process::id()
+        ));
+        let ota_root = root.join("ota");
+        let namespace = ota_root.join("authority-launcher");
+        create_root_directory(&namespace, 0o755).expect("fresh public namespace");
+        for path in [&root, &ota_root, &namespace] {
+            let metadata = fs::symlink_metadata(path).expect("namespace metadata");
+            assert!(metadata.is_dir());
+            assert_eq!(metadata.uid(), 0);
+            assert_eq!(metadata.mode() & 0o777, 0o755);
+        }
+        verify_root_protected_chain(&namespace).expect("namespace chain");
+
+        let writable = root.join("writable");
+        fs::create_dir(&writable).expect("writable parent");
+        fs::set_permissions(&writable, fs::Permissions::from_mode(0o775))
+            .expect("writable parent mode");
+        let writable_error = create_root_directory(&writable.join("child"), 0o755)
+            .expect_err("writable parent must refuse");
+        assert!(writable_error.contains(writable.to_string_lossy().as_ref()));
+        assert!(!writable.join("child").exists());
+        assert_eq!(
+            fs::symlink_metadata(&writable)
+                .expect("writable parent metadata")
+                .mode()
+                & 0o777,
+            0o775,
+            "unsafe parent must not be normalized"
+        );
+
+        let foreign = root.join("foreign");
+        fs::create_dir(&foreign).expect("foreign parent");
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o755))
+            .expect("foreign parent mode");
+        let foreign_c = CString::new(foreign.as_os_str().as_bytes()).expect("foreign path");
+        assert_eq!(
+            unsafe { libc::chown(foreign_c.as_ptr(), 65_534, 65_534) },
+            0
+        );
+        let foreign_error = create_root_directory(&foreign.join("child"), 0o755)
+            .expect_err("foreign parent must refuse");
+        assert!(foreign_error.contains(foreign.to_string_lossy().as_ref()));
+        assert!(!foreign.join("child").exists());
+        assert_eq!(
+            fs::symlink_metadata(&foreign)
+                .expect("foreign parent metadata")
+                .uid(),
+            65_534,
+            "foreign parent must not be taken over"
+        );
+
+        let target = root.join("target");
+        create_root_directory(&target, 0o755).expect("symlink target");
+        let alias = root.join("alias");
+        symlink(&target, &alias).expect("namespace alias");
+        let alias_error = create_root_directory(&alias.join("child"), 0o755)
+            .expect_err("aliased parent must refuse");
+        assert!(alias_error.contains(alias.to_string_lossy().as_ref()));
+        assert!(!alias.join("child").exists());
+        assert!(
+            fs::symlink_metadata(&alias)
+                .expect("alias metadata")
+                .file_type()
+                .is_symlink()
+        );
+
+        fs::remove_dir_all(root).expect("remove namespace fixture");
     }
 
     #[test]

@@ -157,6 +157,22 @@ fn root_boundary_workflow_retains_root_owned_store_fixture_coverage() {
     assert!(ROOT_BOUNDARY_WORKFLOW.contains(
         "^test result: ok\\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;"
     ));
+    let public_namespace_step = ROOT_BOUNDARY_WORKFLOW
+        .split_once("      - name: Prove root-owned public namespace establishment")
+        .expect("root-boundary workflow must retain public namespace proof")
+        .1
+        .split_once("\n      - name:")
+        .expect("public namespace proof must remain a distinct workflow step")
+        .0;
+    assert!(public_namespace_step.contains("sudo env"));
+    let public_namespace_command = "cargo test --locked --bin ota-authority-launcher --features systemd-v3-pressure-provision,protected-attestor pressure_provision::tests::root_public_namespace_creation_honors_umask_and_refuses_takeover -- --ignored --exact";
+    assert_eq!(
+        public_namespace_step
+            .matches(public_namespace_command)
+            .count(),
+        1,
+        "root-boundary workflow must run the exact root namespace regression"
+    );
 }
 
 #[test]
