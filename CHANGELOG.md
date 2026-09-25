@@ -26,6 +26,16 @@
 
 ## Unreleased
 
+- Pin Authority Protocol `e819f95890ea23ae2f336a59fb3ff62cfa858d8b` and add the additive
+  raw-store V2 protected-authority snapshot and V4 transaction-binding route. V1 snapshots and
+  their V2/V3 routes remain immutable. The administrator-signed protected bundle retains the
+  complete bounded transport-dependency graph and record expectation; its payload limit rises from
+  32 KiB to 40 KiB while the canonical signed bundle remains within the existing 64 KiB protected
+  store limit. Launcher structurally verifies the retained signed bundle and relays and binds only
+  the record identity through V4, refusing V1/V2/V3 substitution or replay. This activates no
+  OIDC request, provider contact, materialization, injection, selected-work execution, positive
+  evidence, Step 8, or V12.2 capability.
+
 - Pin Authority Protocol `63a352f7a926a2fed0866db0de61749fa701df75` and add the additive
   snapshot-bound V3 transaction-binding relay. V2 remains unchanged. V3 binds one exact
   Core-derived transport-dependency record identity through the retained selected-child session,

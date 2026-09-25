@@ -89,12 +89,18 @@ so the boot descriptor is not inherited. No other service unit receives a wider 
 
 The pressure provisioner installs fixed root-owned `0400` empty verifier and binding snapshots
 beneath `/etc/ota/secret-delivery`. Launcher opens and retains them before selected-child creation,
-then revalidates their exact descriptors and signed bytes before private snapshot disclosure. A
+then revalidates their exact descriptors and signed bytes before private V1 snapshot disclosure. A
 separate root-owned replay directory at
 `/var/lib/ota/authority-launcher/authority-snapshot-replay` reserves before disclosure and is
-consumed only after exact V2 or additive V3 binding reconciliation. Ordinary non-secret completion does not
-require these stores. The empty structural snapshots grant no verifier or provider authority and
-prove no provider contact, materialization, or secret delivery.
+consumed only after exact V2 or additive V3 binding reconciliation for V1 snapshots. The additive
+raw-store V2 snapshot reserves the same way but is consumed only after exact V4 reconciliation.
+Launcher structurally and cryptographically verifies the retained raw signed stores, then privately
+relays them in the V2 snapshot. Core semantically verifies the complete bounded
+transport-dependency graph and record against its embedded expectation; only the subsequent V4
+binding exchange carries the record identity. V1/V2/V3 substitutes for that V2/V4 route refuse.
+Ordinary non-secret completion does not require these stores. The empty structural snapshots grant
+no verifier or provider authority and prove no provider contact, materialization, or secret
+delivery.
 
 The feature-gated `ota-authority-pressure-peer` binary is an exception for conformance testing
 only. It uses fixed public test keys and deterministic scenarios to exercise protocol v2 through a
@@ -316,17 +322,22 @@ beneath-only resolution; requires the authority directory to be private and both
 root-owned regular mode-`0400` files; retains exact bytes and descriptor identities; and can observe
 a retained live Unix-stream session descriptor and invocation cgroup before deriving a
 protocol-verified `ProtectedLauncherCapabilityV1`. After signed admission and lease consumption,
-the selected child may either use the immutable V1 binding exchange or request one private
+the selected child may either use the immutable V1 binding exchange, request one private V1
 protected-authority snapshot followed by one snapshot-bound V2 or additive V3 binding over that
-same inherited session. V3 carries one opaque Core-derived transport-dependency record identity;
-Launcher validates and relays that identity without interpreting a dependency graph or preparing
-transport. Launcher derives the capability from the exact retained child, scope, cgroup, session,
-stores, authority context, installation evidence, and replay state, then returns one
-Protocol-reconciled private binding plus its signed public projection. The private capability
-identity never enters the public projection. Duplicate, interleaved, reversed, or replayed exchange
-messages refuse. Non-secret execution still proceeds directly to its completion frame. This route
-does not request an OIDC token, contact Google, materialize or inject a secret, publish positive
-delivery evidence, or activate Step 8.
+same inherited session, or request one canonical raw-store V2 snapshot followed only by V4. V3
+carries one opaque Core-derived transport-dependency record identity. The V2 snapshot privately
+relays the descriptor-bound raw verifier and binding stores, including the administrator-signed
+bundle that retains the complete bounded transport-dependency graph and record expectation.
+Launcher structurally and cryptographically verifies those retained stores before relay; Core
+semantically verifies the complete graph and record against its embedded expectation. Only the
+subsequent V4 binding exchange carries and binds the record identity. Launcher does not interpret
+the graph or prepare transport. V1/V2/V3 substitutes for the V2/V4 route refuse. Launcher derives
+the capability from the exact retained child, scope, cgroup, session, stores, authority context,
+installation evidence, and replay state, then returns one Protocol-reconciled private binding plus
+its signed public projection. The private capability identity never enters the public projection.
+Duplicate, interleaved, reversed, or replayed exchange messages refuse. Non-secret execution still
+proceeds directly to its completion frame. This route does not request an OIDC token, contact
+Google, materialize or inject a secret, publish positive delivery evidence, or activate Step 8.
 
 The same protected observation route loads one administrator-installed
 `ProtectedLauncherAuthorityContextV1` whose file identity is a singular protected-installation

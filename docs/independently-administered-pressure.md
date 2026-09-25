@@ -118,7 +118,7 @@ This generic provisioning procedure is for the independently administered govern
 fixture. Do not use it for Ota Core's secret-delivery service-path custody gate: that gate must
 first queue the exact Core workflow run, record its run context, and then reprovision with both
 `--secret-delivery-pressure-builder-binary` and `--secret-delivery-pressure-request` from the
-[Core service-path runbook](https://github.com/ota-run/ota/blob/65cefc753dd762f34b5939d244316a1a9e829e79/docs/pressure/secret-delivery-service-path.md).
+[Core service-path runbook](https://github.com/ota-run/ota/blob/b9c5d0b65eaca9d15d975e5913ba16135337e6b7/docs/pressure/secret-delivery-service-path.md).
 Provisioning before the target job is queued cannot produce an accepting run-bound configuration.
 
 Run `systemctl daemon-reload`, confirm the runner remains stopped, then run provisioning as the
