@@ -97,7 +97,7 @@ updates disabled, and create the root-owned unit
 `ExecStart=/opt/ota-actions-runner/bin/Runner.Listener run --startuptype service`,
 `User=ota-authority-job`, and
 `Group=ota-authority-job`. Its `[Unit]` section must also contain the exact gate
-`ConditionPathExists=/usr/share/ota/authority-launcher/installation-evidence.json`. Put the
+`ConditionPathExists=/var/lib/ota/authority-launcher-public/installation-evidence.json`. Put the
 required hardening properties in the root-owned drop-in
 `/etc/systemd/system/ota-authority-pressure-runner.service.d/zzzz-ota-pressure-hardening.conf`.
 The service must carry `NoNewPrivileges=yes`, empty supplementary groups and capabilities, the
@@ -147,7 +147,7 @@ Provisioning writes the protected installation manifest under `/etc/ota` and a n
 evidence envelope at:
 
 ```text
-/usr/share/ota/authority-launcher/installation-evidence.json
+/var/lib/ota/authority-launcher-public/installation-evidence.json
 ```
 
 The public envelope contains those bounded artifact-derived source revisions plus protected paths
@@ -386,7 +386,7 @@ identity, the exact frozen invocation, one recovery-only client exchange, unchan
 truth, the expected cumulative execution/archive counts, zero invalid archives, no residual active
 or finalization records, no Ota transient scopes, and complete terminal cleanup. It publishes one
 create-new root-owned mode-`0644` record beneath the fixed
-`/usr/share/ota/authority-launcher/recovery-evidence` directory, then removes the pending private
+`/var/lib/ota/authority-launcher-public/recovery-evidence` directory, then removes the pending private
 controller state. Before acknowledging the recovered terminal to Launcher, the constrained client
 hands it to the root controller, which validates and fsyncs a `recovery_observed` state. A crash
 therefore leaves either Launcher’s replayable finalization journal or the exact controller-owned

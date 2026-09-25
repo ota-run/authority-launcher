@@ -40,7 +40,7 @@ jobs:
     env:
       AUTHORITY_ID: platform-release-authority
       CLIENT: /usr/lib/ota-authority/bin/ota-authority-systemd-client
-      INSTALLATION_EVIDENCE: /usr/share/ota/authority-launcher/installation-evidence.json
+      INSTALLATION_EVIDENCE: /var/lib/ota/authority-launcher-public/installation-evidence.json
       OTA: /usr/lib/ota-authority/bin/ota
       PRESSURE_REPOSITORY: /srv/ota-v3-pressure
     steps:
@@ -122,7 +122,7 @@ jobs:
               "/etc/ota/authority-attestor-verifiers.json",
               "/etc/ota/protected-launcher-authority-context-v1.json",
               "/etc/ota/authority-launcher-installation.json",
-              "/usr/share/ota/authority-launcher",
+              "/var/lib/ota/authority-launcher-public",
               "/etc/ota/crossing-brokers.json",
               "/var/lib/ota/authority-attestor-signing-key",
               "/var/lib/ota/authority-broker-signing-key",
@@ -224,7 +224,7 @@ jobs:
                   if line.strip().startswith("ConditionPathExists=")
               ]
           if runner_conditions != [
-              "ConditionPathExists=/usr/share/ota/authority-launcher/installation-evidence.json"
+              "ConditionPathExists=/var/lib/ota/authority-launcher-public/installation-evidence.json"
           ]:
               raise SystemExit("prepared runner publication gate is invalid")
 

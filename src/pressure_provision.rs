@@ -115,7 +115,7 @@ const ATTESTOR_CONFIG: &str = "/etc/ota/authority-attestor.json";
 const VERIFIER_SET: &str = "/etc/ota/authority-attestor-verifiers.json";
 const INSTALLATION_MANIFEST: &str = "/etc/ota/authority-launcher-installation.json";
 const SECRET_DELIVERY_PRESSURE_INSTALLATION_EVIDENCE: &str =
-    "/usr/share/ota/authority-launcher/secret-delivery-pressure-installation.json";
+    "/var/lib/ota/authority-launcher-public/secret-delivery-pressure-installation.json";
 const SECRET_DELIVERY_PRESSURE_INSTALLATION_IDENTITY_DOMAIN_V1: &[u8] =
     b"ota.authority-launcher.secret-delivery-pressure-installation.v1\0";
 const EMPTY_SECRET_DELIVERY_VERIFIER_SNAPSHOT: &[u8] = b"{\"schema_version\":1,\"verifiers\":[]}\n";
@@ -2559,6 +2559,8 @@ mod tests {
     use ed25519_dalek::{Signature, Verifier};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::process::CommandExt;
 
     #[test]
     fn pressure_source_revisions_are_exact_commit_identities() {
@@ -2620,20 +2622,86 @@ mod tests {
         assert_eq!(unsafe { libc::geteuid() }, 0, "root is required");
         unsafe { libc::umask(0o002) };
 
-        let root = PathBuf::from("/root").join(format!(
+        let fixture_parent = Path::new("/var/lib");
+        let fixture_parent_metadata =
+            fs::symlink_metadata(fixture_parent).expect("fixture parent metadata");
+        assert!(fixture_parent_metadata.is_dir());
+        assert_eq!(fixture_parent_metadata.uid(), 0);
+        assert_eq!(fixture_parent_metadata.mode() & 0o777, 0o755);
+        verify_root_protected_chain(fixture_parent).expect("fixture parent chain");
+
+        let root = fixture_parent.join(format!(
             "ota-authority-public-namespace-{}",
             std::process::id()
         ));
         let ota_root = root.join("ota");
-        let namespace = ota_root.join("authority-launcher");
-        create_root_directory(&namespace, 0o755).expect("fresh public namespace");
-        for path in [&root, &ota_root, &namespace] {
+        let private_namespace = ota_root.join("authority-launcher");
+        let public_namespace = ota_root.join("authority-launcher-public");
+        create_root_directory(&private_namespace, 0o700).expect("fresh private namespace");
+        create_root_directory(&public_namespace, 0o755).expect("fresh public namespace");
+        for path in [&root, &ota_root, &public_namespace] {
             let metadata = fs::symlink_metadata(path).expect("namespace metadata");
             assert!(metadata.is_dir());
             assert_eq!(metadata.uid(), 0);
             assert_eq!(metadata.mode() & 0o777, 0o755);
         }
-        verify_root_protected_chain(&namespace).expect("namespace chain");
+        let private_metadata = fs::symlink_metadata(&private_namespace).expect("private metadata");
+        assert!(private_metadata.is_dir());
+        assert_eq!(private_metadata.uid(), 0);
+        assert_eq!(private_metadata.mode() & 0o777, 0o700);
+        assert_eq!(private_namespace.parent(), public_namespace.parent());
+        verify_root_protected_chain(&public_namespace).expect("public namespace chain");
+
+        let public_record = public_namespace.join("installation-evidence.json");
+        let mut record = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&public_record)
+            .expect("public record");
+        record.write_all(b"{}\n").expect("public record contents");
+        record.sync_all().expect("public record sync");
+        drop(record);
+        let record_metadata = fs::symlink_metadata(&public_record).expect("public record metadata");
+        assert!(record_metadata.is_file());
+        assert_eq!(record_metadata.uid(), 0);
+        assert_eq!(record_metadata.mode() & 0o777, 0o644);
+
+        let check_as_job = |arguments: &[&str]| {
+            let mut command = Command::new("/usr/bin/test");
+            command.args(arguments);
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setgroups(0, std::ptr::null()) != 0
+                        || libc::setgid(65_534) != 0
+                        || libc::setuid(65_534) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command.status().expect("job-principal access check")
+        };
+        let public_record_path = public_record.to_str().expect("public record path");
+        let public_namespace_path = public_namespace.to_str().expect("public namespace path");
+        let private_namespace_path = private_namespace.to_str().expect("private namespace path");
+        assert!(
+            check_as_job(&["-r", public_record_path]).success(),
+            "job principal must read the public record"
+        );
+        assert!(
+            check_as_job(&["!", "-w", public_record_path]).success(),
+            "job principal must not write the public record"
+        );
+        assert!(
+            check_as_job(&["!", "-w", public_namespace_path]).success(),
+            "job principal must not write the public sibling"
+        );
+        assert!(
+            check_as_job(&["!", "-x", private_namespace_path]).success(),
+            "job principal must not traverse the private sibling"
+        );
 
         let writable = root.join("writable");
         fs::create_dir(&writable).expect("writable parent");

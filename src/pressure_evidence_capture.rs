@@ -19,7 +19,7 @@ pub(crate) const CAPTURE_CONFIG_PATH: &str = "/etc/ota/secret-delivery-pressure-
 pub(crate) const CAPTURE_SOURCE_ROOT: &str = "/var/lib/ota/authority-job-evidence";
 pub(crate) const CAPTURE_STORE_ROOT: &str = "/var/lib/ota/authority-launcher/hosted-evidence";
 pub(crate) const CAPTURE_PUBLIC_ROOT: &str =
-    "/usr/share/ota/authority-launcher/hosted-evidence-captures";
+    "/var/lib/ota/authority-launcher-public/hosted-evidence-captures";
 pub(crate) const CAPTURE_SERVICE: &str =
     "/etc/systemd/system/ota-authority-pressure-evidence-capture.service";
 pub(crate) const CAPTURE_PATH_UNIT: &str =

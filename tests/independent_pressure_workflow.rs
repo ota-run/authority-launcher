@@ -208,7 +208,8 @@ fn independent_pressure_workflow_retains_a_narrow_drift_guard() {
     assert!(!WORKFLOW.contains("pull_request:"));
     assert!(WORKFLOW.contains("ota-authority-independent"));
     assert!(WORKFLOW.contains("/usr/lib/ota-authority/bin/ota-authority-systemd-client"));
-    assert!(WORKFLOW.contains("/usr/share/ota/authority-launcher/installation-evidence.json"));
+    assert!(WORKFLOW.contains("/var/lib/ota/authority-launcher-public/installation-evidence.json"));
+    assert!(!WORKFLOW.contains("/usr/share/ota/authority-launcher"));
     assert!(WORKFLOW.contains("--source systemd_protected_launcher"));
     assert!(WORKFLOW.contains("/etc/systemd/system/ota-authority-pressure-runner.service"));
     assert!(WORKFLOW.contains("repository entry is writable or aliased"));

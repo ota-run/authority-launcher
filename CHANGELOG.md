@@ -26,6 +26,14 @@
 
 ## Unreleased
 
+- Move public, non-secret protected-launcher records from `/usr/share` to the root-created
+  `/var/lib/ota/authority-launcher-public` sibling. The root binds the capability-projection
+  verifier, installation evidence, pressure-installation evidence, hosted-evidence captures, and
+  recovery evidence while private Launcher state remains under the separate `0700`
+  `/var/lib/ota/authority-launcher` root. Existing `/usr/share` state is neither trusted nor used as
+  migration input; a fresh provision regenerates the protected installation and public evidence
+  identities. This changes no provider, OIDC, delivery, or selected-work authority.
+
 - Pin Authority Protocol `e819f95890ea23ae2f336a59fb3ff62cfa858d8b` and add the additive
   raw-store V2 protected-authority snapshot and V4 transaction-binding route. V1 snapshots and
   their V2/V3 routes remain immutable. The administrator-signed protected bundle retains the

@@ -51,7 +51,7 @@ mod linux {
 
     const STATE_ROOT: &str = "/var/lib/ota/authority-admin-pressure";
     const STATE_PATH: &str = "/var/lib/ota/authority-admin-pressure/pending.json";
-    const EVIDENCE_ROOT: &str = "/usr/share/ota/authority-launcher/recovery-evidence";
+    const EVIDENCE_ROOT: &str = "/var/lib/ota/authority-launcher-public/recovery-evidence";
     const RUNNER_SERVICE: &str = "ota-authority-pressure-runner.service";
     const OTA_BINARY: &str = "/usr/lib/ota-authority/bin/ota";
     const STATE_IDENTITY_DOMAIN: &[u8] = b"ota.authority-launcher.admin-recovery-state.v1\0";
@@ -1115,7 +1115,7 @@ mod linux {
 
     fn installation_evidence_reference() -> Result<InstallationEvidenceReference, String> {
         let value: serde_json::Value = read_protected_json(Path::new(
-            "/usr/share/ota/authority-launcher/installation-evidence.json",
+            "/var/lib/ota/authority-launcher-public/installation-evidence.json",
         ))?;
         let observed_identity = semantic_identity(INSTALLATION_EVIDENCE_IDENTITY_DOMAIN, &value)?;
         let field = |name: &str| {

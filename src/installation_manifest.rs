@@ -50,10 +50,10 @@ use crate::config::{
 pub(crate) const SYSTEMD_INSTALLATION_MANIFEST_PATH: &str =
     "/etc/ota/authority-launcher-installation.json";
 pub(crate) const CAPABILITY_PROJECTION_VERIFIER_PATH: &str =
-    "/usr/share/ota/authority-launcher/capability-projection-verifier-v1.json";
-pub(crate) const PUBLIC_INSTALLATION_EVIDENCE_ROOT: &str = "/usr/share/ota/authority-launcher";
+    "/var/lib/ota/authority-launcher-public/capability-projection-verifier-v1.json";
+pub(crate) const PUBLIC_INSTALLATION_EVIDENCE_ROOT: &str = "/var/lib/ota/authority-launcher-public";
 pub(crate) const PUBLIC_INSTALLATION_EVIDENCE_PATH: &str =
-    "/usr/share/ota/authority-launcher/installation-evidence.json";
+    "/var/lib/ota/authority-launcher-public/installation-evidence.json";
 pub(crate) const PROTECTED_LAUNCHER_AUTHORITY_CONTEXT_PATH: &str =
     "/etc/ota/protected-launcher-authority-context-v1.json";
 pub(crate) const CAPABILITY_OBSERVATION_REPLAY_DIRECTORY: &str =
