@@ -163,6 +163,8 @@ jobs:
             > "$EVIDENCE_DIR/installed-binaries.sha256"
           sudo cp /etc/ota/authority-launcher-installation.json \
             "$EVIDENCE_DIR/installation-manifest.json"
+          sudo cp /var/lib/ota/authority-launcher-public/installation-evidence.json \
+            "$EVIDENCE_DIR/public-installation-evidence.json"
           sudo cp /etc/ota/authority-attestor-verifiers.json \
             "$EVIDENCE_DIR/attestor-verifiers.json"
           sudo cp /etc/ota/crossing-brokers.json \
@@ -171,18 +173,21 @@ jobs:
             "$EVIDENCE_DIR/protected-history-binding.json"
           sudo chown "$(id -u):$(id -g)" \
             "$EVIDENCE_DIR/installation-manifest.json" \
+            "$EVIDENCE_DIR/public-installation-evidence.json" \
             "$EVIDENCE_DIR/attestor-verifiers.json" \
             "$EVIDENCE_DIR/broker-verifier-binding.json" \
             "$EVIDENCE_DIR/protected-history-binding.json"
           jq -e \
+            --slurpfile manifest "$EVIDENCE_DIR/installation-manifest.json" \
             --arg protocol "$EXPECTED_PROTOCOL_REVISION" \
             --arg core "$EXPECTED_CORE_REVISION" \
             --arg launcher "$(git rev-parse HEAD)" \
             '.schema_version == 1
              and .protocol_source_revision == $protocol
              and .core_source_revision == $core
-             and .launcher_source_revision == $launcher' \
-            "$EVIDENCE_DIR/installation-manifest.json"
+             and .launcher_source_revision == $launcher
+             and .installation_manifest == $manifest[0]' \
+            "$EVIDENCE_DIR/public-installation-evidence.json"
           jq -e \
             '.schema_version == 1
              and (.bindings | length) == 1
@@ -1575,6 +1580,8 @@ jobs:
             | tee "$EVIDENCE_DIR/provision.txt"
           sudo cp /etc/ota/authority-launcher-installation.json \
             "$EVIDENCE_DIR/installation-manifest.json"
+          sudo cp /var/lib/ota/authority-launcher-public/installation-evidence.json \
+            "$EVIDENCE_DIR/public-installation-evidence.json"
           sudo cp /etc/ota/authority-history.json \
             "$EVIDENCE_DIR/protected-history-binding.json"
           sudo cp /etc/ota/authority-attestor-verifiers.json \
@@ -1585,14 +1592,16 @@ jobs:
             "$EVIDENCE_DIR/launcher-binding.json"
           sudo chown "$(id -u):$(id -g)" "$EVIDENCE_DIR"/*.json
           jq -e \
+            --slurpfile manifest "$EVIDENCE_DIR/installation-manifest.json" \
             --arg protocol "$EXPECTED_PROTOCOL_REVISION" \
             --arg core "$EXPECTED_CORE_REVISION" \
             --arg launcher "$(git rev-parse HEAD)" \
             '.schema_version == 1
              and .protocol_source_revision == $protocol
              and .core_source_revision == $core
-             and .launcher_source_revision == $launcher' \
-            "$EVIDENCE_DIR/installation-manifest.json"
+             and .launcher_source_revision == $launcher
+             and .installation_manifest == $manifest[0]' \
+            "$EVIDENCE_DIR/public-installation-evidence.json"
           jq -e \
             '.schema_version == 1
              and .installed_client_path == "/usr/lib/ota-authority/bin/ota"

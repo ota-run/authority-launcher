@@ -128,6 +128,20 @@ fn selected_execution_pressure_workflow_uses_current_immutable_sources() {
         2,
         "both provisioned installation records must reconcile Launcher source identity",
     );
+    assert_eq!(
+        SELECTED_EXECUTION_WORKFLOW
+            .matches(".installation_manifest == $manifest[0]")
+            .count(),
+        2,
+        "both public records must bind the protected installation manifest",
+    );
+    assert_eq!(
+        SELECTED_EXECUTION_WORKFLOW
+            .matches("sudo cp /var/lib/ota/authority-launcher-public/installation-evidence.json")
+            .count(),
+        2,
+        "both provision steps must retain the public installation record",
+    );
 }
 
 #[test]

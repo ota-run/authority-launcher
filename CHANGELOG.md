@@ -26,6 +26,10 @@
 
 ## Unreleased
 
+- Verify V3 pressure installation source revisions from the public installation evidence and
+  require its embedded manifest to equal the protected installation manifest. Both hosted jobs
+  previously queried fields absent from the private manifest after successful provisioning.
+
 - Move public, non-secret protected-launcher records from `/usr/share` to the root-created
   `/var/lib/ota/authority-launcher-public` sibling. The root binds the capability-projection
   verifier, installation evidence, pressure-installation evidence, hosted-evidence captures, and
