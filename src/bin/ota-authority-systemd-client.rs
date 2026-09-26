@@ -106,3 +106,70 @@ fn main() -> std::process::ExitCode {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_flags_remain_before_the_ota_argument_delimiter() {
+        let cli = Cli::try_parse_from([
+            "ota-authority-systemd-client",
+            "--authority-id",
+            "release",
+            "--repository",
+            "/srv/ota-pressure",
+            "--json",
+            "--",
+            "run",
+            "governed",
+            "--grant",
+            "release",
+        ])
+        .expect("client-owned JSON flag parses before the delimiter");
+
+        assert!(cli.json);
+        assert_eq!(cli.ota_arguments, ["run", "governed", "--grant", "release"]);
+    }
+
+    #[cfg(feature = "systemd-admin-recovery-pressure")]
+    #[test]
+    fn recovery_flag_remains_client_owned_before_the_ota_argument_delimiter() {
+        let cli = Cli::try_parse_from([
+            "ota-authority-systemd-client",
+            "--authority-id",
+            "release",
+            "--repository",
+            "/srv/ota-pressure",
+            "--json",
+            "--administrator-controlled-recovery",
+            "--",
+            "run",
+            "governed",
+        ])
+        .expect("client-owned recovery flag parses before the delimiter");
+
+        assert!(cli.json);
+        assert!(cli.administrator_controlled_recovery);
+        assert_eq!(cli.ota_arguments, ["run", "governed"]);
+    }
+
+    #[test]
+    fn forwarded_json_flag_does_not_enable_client_json_mode() {
+        let cli = Cli::try_parse_from([
+            "ota-authority-systemd-client",
+            "--authority-id",
+            "release",
+            "--repository",
+            "/srv/ota-pressure",
+            "--",
+            "--json",
+            "run",
+            "governed",
+        ])
+        .expect("forwarded flags remain parseable as Ota arguments");
+
+        assert!(!cli.json);
+        assert_eq!(cli.ota_arguments, ["--json", "run", "governed"]);
+    }
+}

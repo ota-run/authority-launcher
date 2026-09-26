@@ -31,6 +31,7 @@
 
 use std::cell::RefCell;
 use std::env;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -38,6 +39,10 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(feature = "protected-attestor")]
+use crate::protected_authority_snapshot::{
+    ProtectedAuthoritySnapshotReplayStoreV1, ProtectedAuthoritySnapshotReservationV2,
+};
 #[cfg(test)]
 use ota_authority_launcher::linux_observations::LinuxObservationError;
 use ota_authority_launcher::linux_observations::{
@@ -69,9 +74,16 @@ use ota_authority_protocol::{
     launcher_finalization_signing_request_v1_identity, launcher_invocation_request_identity,
     launcher_terminal_persistence_v1_identity, launcher_working_directory_identity,
     systemd_job_principal_profile_identity, systemd_job_principal_profile_v2,
-    systemd_launcher_profile_identity, systemd_launcher_profile_v3,
+    systemd_launcher_profile_identity, systemd_launcher_profile_v4,
     systemd_protected_launcher_instance_v3_foundation_identity,
     validate_launcher_invocation_request_v1, validate_launcher_terminal_frame_v1,
+};
+#[cfg(feature = "protected-attestor")]
+use ota_authority_protocol::{
+    ProtectedAuthoritySnapshotRequestV2, ProtectedAuthoritySnapshotResponseV2,
+    ProtectedLauncherCapabilityObservationProbeRequestV1,
+    ProtectedLauncherCapabilityObservationResponseV1,
+    protected_launcher_capability_observation_probe_request_v1_identity,
 };
 use thiserror::Error;
 
@@ -97,6 +109,8 @@ use crate::systemd_scope::{ScopeBoundary, SystemdScopeError, SystemdScopeManager
 use crate::target_directory::{TargetDirectoryError, open_repository_directory};
 
 const SYSTEMD_LISTEN_FD: RawFd = 3;
+const LAUNCHER_LISTENER_FD_NAME: &str = "ota-launcher-listener";
+const BOOT_ID_FD_NAME: &str = "ota-boot-id";
 const ACTIVE_SLOT_DIRECTORY: &str = "/var/lib/ota/authority-launcher/active";
 const FINALIZATION_DIRECTORY: &str = "/var/lib/ota/authority-launcher/finalization";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -166,6 +180,12 @@ pub(crate) enum SystemdServiceError {
     BrokerProxyUnavailable,
     #[error("the protected launcher installation identity is unavailable or mismatched")]
     InstallationIdentityUnavailable,
+    #[error("the protected launcher retained authority context is unavailable or mismatched")]
+    RetainedAuthorityContextUnavailable,
+    #[error(
+        "the protected launcher capability-observation replay store is unavailable or mismatched"
+    )]
+    CapabilityObservationReplayUnavailable,
     #[error("the protected launcher effective runtime profile is unavailable or mismatched")]
     RuntimeProfileUnavailable,
     #[error("the systemd launcher protocol bridge refused before authorization")]
@@ -185,6 +205,26 @@ struct SelectedBoundary {
     scope: ota_authority_protocol::LauncherSystemdScopeV1,
     active_slot: ActiveSlot,
     consumption: LeaseConsumptionRelayEvidenceV1,
+    startup_continuation: ota_authority_protocol::LauncherStartupContinuationV1,
+    principal_mapping: ota_authority_protocol::LauncherPrincipalMappingV1,
+    process_posture: ota_authority_protocol::OtaProcessPostureV1,
+}
+
+#[cfg_attr(not(feature = "protected-attestor"), allow(dead_code))]
+struct SelectedBoundaryExecutionContext<'a> {
+    config: &'a SystemdLauncherServiceConfigV1,
+    installation: &'a ProtectedInstallationManifestV1,
+    launcher_executable: &'a Path,
+    boot_file: &'a File,
+    peer: &'a ObservedSessionPeer,
+    mapping: &'a crate::config::SystemdPrincipalMappingV1,
+    launcher_request: &'a LauncherInvocationRequestV1,
+    #[cfg(feature = "protected-attestor")]
+    protected_authority_stores:
+        Option<crate::protected_launcher_capability::ProtectedAuthorityStoresV1>,
+    #[cfg(feature = "protected-attestor")]
+    authority_snapshot_replay:
+        Option<crate::protected_authority_snapshot::ProtectedAuthoritySnapshotReplayStoreV1>,
 }
 
 enum BoundaryAdmission {
@@ -198,6 +238,8 @@ enum BoundaryAdmission {
 
 enum InitialClientRequest {
     Invocation(LauncherInvocationRequestV1),
+    #[cfg(feature = "protected-attestor")]
+    CapabilityObservation(Box<ProtectedLauncherCapabilityObservationProbeRequestV1>),
     FinalizationArchive(LauncherFinalizationArchiveRequestV1),
     FinalizationRecovery(LauncherFinalizationRecoveryRequestV1),
 }
@@ -213,8 +255,9 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
         .map_err(|_| SystemdServiceError::InstallationIdentityUnavailable)?;
     let installation = load_protected_installation_manifest(config, &launcher_executable)
         .map_err(|_| SystemdServiceError::InstallationIdentityUnavailable)?;
-    let listener =
-        inherited_systemd_listener(config.socket_path.as_path(), config.socket_group_gid)?;
+    let inherited =
+        inherited_systemd_descriptors(config.socket_path.as_path(), config.socket_group_gid)?;
+    let listener = inherited.listener;
     reconcile_active_slots(
         Path::new(ACTIVE_SLOT_DIRECTORY),
         0,
@@ -234,6 +277,25 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
     let peer =
         observe_connected_peer(&stream).map_err(|_| SystemdServiceError::PeerPostureUnavailable)?;
     let initial_request = receive_initial_request(&mut stream, config.maximum_request_bytes)?;
+    #[cfg(feature = "protected-attestor")]
+    if let InitialClientRequest::CapabilityObservation(request) = initial_request {
+        let mapping = select_mapping(config, &request.invocation, &peer)?;
+        reconcile_connected_peer(&peer, mapping.job_peer.uid, mapping.job_peer.gid)
+            .map_err(|_| SystemdServiceError::PeerPostureUnavailable)?;
+        verify_peer_process_status(&peer)
+            .map_err(|_| SystemdServiceError::PeerPostureUnavailable)?;
+        return serve_capability_observation(
+            config,
+            &installation,
+            &loaded.ota_binary,
+            &launcher_executable,
+            &inherited.boot_file,
+            &mut stream,
+            &peer,
+            mapping,
+            *request,
+        );
+    }
     if let InitialClientRequest::FinalizationRecovery(request) = &initial_request {
         let mapping = select_mapping_for_authority(config, request.authority_id.as_str(), &peer)?;
         reconcile_connected_peer(&peer, mapping.job_peer.uid, mapping.job_peer.gid)
@@ -312,6 +374,15 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
         }
     };
 
+    // Secret authority is retained before child creation. Missing protected state must not block
+    // ordinary non-secret execution, but any later snapshot request refuses fail closed.
+    #[cfg(feature = "protected-attestor")]
+    let protected_authority_stores =
+        crate::protected_launcher_capability::ProtectedAuthorityStoresV1::open().ok();
+    #[cfg(feature = "protected-attestor")]
+    let authority_snapshot_replay =
+        crate::protected_authority_snapshot::ProtectedAuthoritySnapshotReplayStoreV1::open().ok();
+
     let child_boundary = prepare_disabled_child_boundary(
         config,
         &installation,
@@ -354,8 +425,19 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
             Err(SystemdServiceError::AuthorizationDecisionRefused)
         }
         Ok(BoundaryAdmission::Selected(boundary)) => execute_selected_boundary(
-            config,
-            &installation,
+            SelectedBoundaryExecutionContext {
+                config,
+                installation: &installation,
+                launcher_executable: &launcher_executable,
+                boot_file: &inherited.boot_file,
+                peer: &peer,
+                mapping,
+                launcher_request: &request,
+                #[cfg(feature = "protected-attestor")]
+                protected_authority_stores,
+                #[cfg(feature = "protected-attestor")]
+                authority_snapshot_replay,
+            },
             &mut stream,
             invocation_id.as_str(),
             &repository,
@@ -403,25 +485,819 @@ pub(crate) fn serve_once() -> Result<u8, SystemdServiceError> {
     }
 }
 
-fn execute_selected_boundary(
+#[cfg(feature = "protected-attestor")]
+#[allow(clippy::too_many_arguments)]
+fn serve_capability_observation(
     config: &SystemdLauncherServiceConfigV1,
     installation: &ProtectedInstallationManifestV1,
+    ota_binary: &std::fs::File,
+    launcher_executable: &Path,
+    boot_file: &File,
+    stream: &mut UnixStream,
+    peer: &ObservedSessionPeer,
+    mapping: &crate::config::SystemdPrincipalMappingV1,
+    request: ProtectedLauncherCapabilityObservationProbeRequestV1,
+) -> Result<u8, SystemdServiceError> {
+    validate_requested_command(&request.invocation)?;
+    let repository = open_repository_directory(
+        config,
+        &mapping.execution,
+        request.invocation.repository_path.as_str(),
+    )
+    .map_err(map_target_directory_error)?;
+    let authority = crate::installation_manifest::load_protected_launcher_authority_context(
+        config,
+        launcher_executable,
+    )
+    .map_err(report_authority_context_load_failure)?;
+    let authority =
+        crate::protected_launcher_capability::RetainedProtectedLauncherAuthorityContextV1::acquire(
+            authority,
+            boot_file
+                .try_clone()
+                .map_err(|_| SystemdServiceError::RetainedAuthorityContextUnavailable)?,
+        )
+        .map_err(|_| SystemdServiceError::RetainedAuthorityContextUnavailable)?;
+    let replay =
+        crate::protected_capability_observation::ProtectedCapabilityObservationReplayStoreV1::open(
+        )
+        .map_err(|_| SystemdServiceError::CapabilityObservationReplayUnavailable)?;
+    let response = RefCell::new(None::<ProtectedLauncherCapabilityObservationResponseV1>);
+    let invocation_id = fresh_invocation_id()?;
+    let scope_manager = SystemdScopeManager::connect().map_err(map_systemd_scope_error)?;
+    let boundary = prepare_disabled_child_boundary_with_scope(
+        config,
+        ota_binary,
+        &repository,
+        mapping,
+        &request.invocation,
+        invocation_id.as_str(),
+        Path::new(ACTIVE_SLOT_DIRECTORY),
+        0,
+        Path::new("/"),
+        &scope_manager,
+        |child, principal_mapping, scope, _active_slot| {
+            let posture = child
+                .resume_and_receive_process_posture(
+                    principal_mapping.identity.as_str(),
+                    Duration::from_secs(config.maximum_startup_seconds),
+                )
+                .map_err(map_prepared_child_error)?;
+            let runtime_identity = verify_systemd_runtime(config, installation, scope)
+                .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            let child_record = child.record.clone();
+            let mut evidence =
+                crate::closed_profile_observations::collect_live_closed_profile_evidence(
+                    config,
+                    installation,
+                    mapping,
+                    stream,
+                    peer,
+                    &child_record,
+                    scope,
+                    &posture,
+                    runtime_identity.as_str(),
+                )
+                .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            let launcher_instance = collect_launcher_instance(
+                config,
+                principal_mapping,
+                &child_record,
+                scope,
+                &posture,
+                &mut evidence,
+            )?;
+            let stores = crate::protected_launcher_capability::ProtectedAuthorityStoresV1::open()
+                .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            let cgroup =
+                crate::protected_launcher_capability::RetainedInvocationCgroupV1::open(scope)
+                    .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            let session = stream
+                .try_clone()
+                .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            let mut observation =
+                crate::protected_launcher_capability::RetainedProtectedLauncherObservationV1::observe(
+                    stores, cgroup, session,
+                )
+                .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            let launcher_profile_identity =
+                systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
+                    .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            let launcher_executable_identity = installation
+                .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
+                .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            let context =
+                crate::protected_launcher_capability::ProtectedLauncherCapabilityContextV1 {
+                    request: &request.invocation,
+                    child: &child_record,
+                    scope,
+                    principal_mapping,
+                    process_posture: &posture,
+                    launcher_instance: &launcher_instance,
+                    launcher_executable_identity,
+                    launcher_configuration_identity: config.identity.as_str(),
+                    launcher_service_binding_identity: config.service_unit_identity.as_str(),
+                    launcher_profile_identity: launcher_profile_identity.as_str(),
+                    service_uid: unsafe { libc::geteuid() },
+                    service_gid: unsafe { libc::getegid() },
+                    authority: &authority,
+                };
+            let projection =
+                crate::protected_capability_observation::derive_and_sign_capability_observation_v1(
+                    &replay,
+                    &request.observation,
+                    &context,
+                    &mut observation,
+                )
+                .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+            response.replace(Some(projection));
+            Ok((AuthorizationDecision::Denied, None, None, None))
+        },
+    )?;
+    if !matches!(boundary, BoundaryAdmission::Refused { .. }) {
+        return Err(SystemdServiceError::RuntimeProfileUnavailable);
+    }
+    let response = response
+        .into_inner()
+        .ok_or(SystemdServiceError::RuntimeProfileUnavailable)?;
+    let payload = serde_jcs::to_vec(&response).map_err(|_| SystemdServiceError::InvalidRequest)?;
+    let frame = encode_frame(&payload).map_err(|_| SystemdServiceError::InvalidRequest)?;
+    stream
+        .write_all(&frame)
+        .map_err(|_| SystemdServiceError::InvalidRequest)?;
+    Ok(0)
+}
+
+fn report_authority_context_load_failure(
+    error: crate::installation_manifest::ProtectedLauncherAuthorityContextLoadError,
+) -> SystemdServiceError {
+    eprintln!("{}", authority_context_load_failure_message(error.stage()));
+    SystemdServiceError::InstallationIdentityUnavailable
+}
+
+fn authority_context_load_failure_message(stage: &str) -> String {
+    format!(
+        "ota-authority-launcher: protected authority context load failure stage={}",
+        stage
+    )
+}
+
+#[cfg(not(feature = "protected-attestor"))]
+fn refuse_secret_delivery_binding_without_protected_attestor() -> Result<
+    ota_authority_protocol::ProtectedLauncherSecretDeliveryTransactionBindingResponseV1,
+    PreparedChildError,
+> {
+    Err(PreparedChildError::AuthorizationAdmissionMismatch)
+}
+
+#[cfg(feature = "protected-attestor")]
+fn refuse_unconsumed_snapshot_v2(
+    exchange: &RefCell<
+        Option<(
+            ProtectedAuthoritySnapshotReservationV2,
+            ProtectedAuthoritySnapshotRequestV2,
+            ProtectedAuthoritySnapshotResponseV2,
+        )>,
+    >,
+    replay: Option<&ProtectedAuthoritySnapshotReplayStoreV1>,
+) {
+    if let Some((reservation, _, _)) = exchange.borrow_mut().take()
+        && let Some(replay) = replay
+    {
+        let _ = replay.refuse(&reservation);
+    }
+}
+
+#[cfg_attr(not(feature = "protected-attestor"), allow(unused_variables))]
+fn execute_selected_boundary(
+    context: SelectedBoundaryExecutionContext<'_>,
     stream: &mut UnixStream,
     invocation_id: &str,
     repository: &crate::target_directory::OpenedRepositoryDirectory,
     mut boundary: SelectedBoundary,
 ) -> Result<u8, SystemdServiceError> {
-    let completion =
-        boundary
-            .child
-            .relay_selected_execution(stream, &boundary.consumption, |completion| {
+    let child_record = boundary.child.record.clone();
+    let scope = boundary.scope.clone();
+    let startup_continuation = boundary.startup_continuation.clone();
+    let principal_mapping = boundary.principal_mapping.clone();
+    let process_posture = boundary.process_posture.clone();
+    #[cfg(feature = "protected-attestor")]
+    let snapshot_exchange = RefCell::new(None);
+    #[cfg(feature = "protected-attestor")]
+    let snapshot_v2_exchange = RefCell::new(None);
+    #[cfg(feature = "protected-attestor")]
+    let same_child_prelude = RefCell::new(None);
+    let completion = boundary.child.relay_selected_execution_with_secret_binding(
+        stream,
+        &boundary.consumption,
+        |request, selected_session| {
+            #[cfg(not(feature = "protected-attestor"))]
+            {
+                let _ = (request, selected_session);
+                Err(PreparedChildError::AuthorizationAdmissionMismatch)
+            }
+            #[cfg(feature = "protected-attestor")]
+            {
+                let stores = context
+                    .protected_authority_stores
+                    .as_ref()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let authority =
+                    crate::installation_manifest::load_protected_launcher_authority_context(
+                        context.config,
+                        context.launcher_executable,
+                    )
+                    .map_err(|error| {
+                        report_authority_context_load_failure(error);
+                        PreparedChildError::AuthorizationAdmissionMismatch
+                    })?;
+                let authority = crate::protected_launcher_capability::RetainedProtectedLauncherAuthorityContextV1::acquire(
+                    authority,
+                    context.boot_file
+                        .try_clone()
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?,
+                )
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let runtime_identity =
+                    verify_systemd_runtime(context.config, context.installation, &scope)
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let mut evidence =
+                    crate::closed_profile_observations::collect_live_closed_profile_evidence(
+                        context.config,
+                        context.installation,
+                        context.mapping,
+                        stream,
+                        context.peer,
+                        &child_record,
+                        &scope,
+                        &process_posture,
+                        runtime_identity.as_str(),
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let launcher_instance = collect_launcher_instance(
+                    context.config,
+                    &principal_mapping,
+                    &child_record,
+                    &scope,
+                    &process_posture,
+                    &mut evidence,
+                )
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let cgroup =
+                    crate::protected_launcher_capability::RetainedInvocationCgroupV1::open(&scope)
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let mut observation = crate::protected_launcher_capability::RetainedProtectedLauncherObservationV1::observe(
+                    stores
+                        .try_clone()
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?,
+                    cgroup,
+                    selected_session
+                        .try_clone()
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?,
+                )
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let launcher_profile_identity =
+                    systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let launcher_executable_identity = context
+                    .installation
+                    .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let capability_context =
+                    crate::protected_launcher_capability::ProtectedLauncherCapabilityContextV1 {
+                        request: context.launcher_request,
+                        child: &child_record,
+                        scope: &scope,
+                        principal_mapping: &principal_mapping,
+                        process_posture: &process_posture,
+                        launcher_instance: &launcher_instance,
+                        launcher_executable_identity,
+                        launcher_configuration_identity: context.config.identity.as_str(),
+                        launcher_service_binding_identity: context.config.service_unit_identity.as_str(),
+                        launcher_profile_identity: launcher_profile_identity.as_str(),
+                        service_uid: unsafe { libc::geteuid() },
+                        service_gid: unsafe { libc::getegid() },
+                        authority: &authority,
+                    };
+                let replay = crate::protected_capability_observation::ProtectedCapabilityObservationReplayStoreV1::open()
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let installation_evidence_identity =
+                    crate::installation_manifest::load_public_installation_evidence_identity(
+                        context.installation,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let derivation = crate::protected_capability_observation::derive_same_child_capability_prelude_v1(
+                    &replay,
+                    request,
+                    &startup_continuation,
+                    installation_evidence_identity.as_str(),
+                    &capability_context,
+                    &mut observation,
+                )
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let response = derivation.response.clone();
+                let prelude = derivation.prelude.clone();
+                // The capability identity binds the acquisition nonce. Retain the exact authority
+                // context so V2 rederives the same-child capability instead of creating a new one.
+                *same_child_prelude.borrow_mut() = Some((derivation, observation, authority));
+                Ok((response, prelude))
+            }
+        },
+        |request, _| {
+            #[cfg(not(feature = "protected-attestor"))]
+            {
+                let _ = request;
+                Err(PreparedChildError::AuthorizationAdmissionMismatch)
+            }
+            #[cfg(feature = "protected-attestor")]
+            {
+                let stores = context
+                    .protected_authority_stores
+                    .as_ref()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let replay = context
+                    .authority_snapshot_replay
+                    .as_ref()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let reservation = replay
+                    .reserve(request, &startup_continuation)
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let response = match stores
+                    .respond_to_authority_snapshot_v1(request, &startup_continuation)
+                {
+                    Ok(response) => response,
+                    Err(_) => {
+                        let _ = replay.refuse(&reservation);
+                        return Err(PreparedChildError::AuthorizationAdmissionMismatch);
+                    }
+                };
+                *snapshot_exchange.borrow_mut() =
+                    Some((reservation, request.clone(), response.clone()));
+                Ok(response)
+            }
+        },
+        |request, _| {
+            #[cfg(not(feature = "protected-attestor"))]
+            {
+                let _ = request;
+                Err(PreparedChildError::AuthorizationAdmissionMismatch)
+            }
+            #[cfg(feature = "protected-attestor")]
+            {
+                let stores = context
+                    .protected_authority_stores
+                    .as_ref()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let replay = context
+                    .authority_snapshot_replay
+                    .as_ref()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let reservation = replay
+                    .reserve_v2(request, &startup_continuation)
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let response = match stores
+                    .respond_to_authority_snapshot_v2(request, &startup_continuation)
+                {
+                    Ok(response) => response,
+                    Err(_) => {
+                        let _ = replay.refuse(&reservation);
+                        return Err(PreparedChildError::AuthorizationAdmissionMismatch);
+                    }
+                };
+                *snapshot_v2_exchange.borrow_mut() =
+                    Some((reservation, request.clone(), response.clone()));
+                Ok(response)
+            }
+        },
+        |request, selected_session| {
+            #[cfg(not(feature = "protected-attestor"))]
+            {
+                let _ = (request, selected_session);
+                refuse_secret_delivery_binding_without_protected_attestor()
+            }
+            #[cfg(feature = "protected-attestor")]
+            {
+                let authority =
+                    crate::installation_manifest::load_protected_launcher_authority_context(
+                        context.config,
+                        context.launcher_executable,
+                    )
+                    .map_err(|error| {
+                        report_authority_context_load_failure(error);
+                        PreparedChildError::AuthorizationAdmissionMismatch
+                    })?;
+                let authority = crate::protected_launcher_capability::RetainedProtectedLauncherAuthorityContextV1::acquire(
+                    authority,
+                    context.boot_file
+                        .try_clone()
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?,
+                )
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let runtime_identity =
+                    verify_systemd_runtime(context.config, context.installation, &scope)
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let mut evidence =
+                    crate::closed_profile_observations::collect_live_closed_profile_evidence(
+                    context.config,
+                    context.installation,
+                    context.mapping,
+                    stream,
+                    context.peer,
+                    &child_record,
+                    &scope,
+                    &process_posture,
+                    runtime_identity.as_str(),
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let launcher_instance = collect_launcher_instance(
+                    context.config,
+                    &principal_mapping,
+                    &child_record,
+                    &scope,
+                    &process_posture,
+                    &mut evidence,
+                )
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let stores = context
+                    .protected_authority_stores
+                    .as_ref()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let cgroup =
+                    crate::protected_launcher_capability::RetainedInvocationCgroupV1::open(&scope)
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let mut observation = crate::protected_launcher_capability::RetainedProtectedLauncherObservationV1::observe(
+                    stores
+                        .try_clone()
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?,
+                    cgroup,
+                    selected_session
+                        .try_clone()
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?,
+                )
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let launcher_profile_identity =
+                    systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let launcher_executable_identity = context
+                    .installation
+                    .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let capability_context =
+                crate::protected_launcher_capability::ProtectedLauncherCapabilityContextV1 {
+                    request: context.launcher_request,
+                    child: &child_record,
+                    scope: &scope,
+                    principal_mapping: &principal_mapping,
+                    process_posture: &process_posture,
+                    launcher_instance: &launcher_instance,
+                    launcher_executable_identity,
+                    launcher_configuration_identity: context.config.identity.as_str(),
+                    launcher_service_binding_identity: context.config.service_unit_identity.as_str(),
+                    launcher_profile_identity: launcher_profile_identity.as_str(),
+                    service_uid: unsafe { libc::geteuid() },
+                    service_gid: unsafe { libc::getegid() },
+                    authority: &authority,
+                };
+                let replay = crate::protected_capability_observation::ProtectedCapabilityObservationReplayStoreV1::open()
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let installation_evidence_identity =
+                    crate::installation_manifest::load_public_installation_evidence_identity(
+                        context.installation,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                crate::protected_capability_observation::derive_secret_delivery_transaction_binding_v1(
+                    &replay,
+                    request,
+                    &startup_continuation,
+                    installation_evidence_identity.as_str(),
+                    &capability_context,
+                    &mut observation,
+                )
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)
+            }
+        },
+        |request, _selected_session| {
+            #[cfg(not(feature = "protected-attestor"))]
+            {
+                let _ = (request, _selected_session);
+                Err(PreparedChildError::AuthorizationAdmissionMismatch)
+            }
+            #[cfg(feature = "protected-attestor")]
+            {
+                let replay = context
+                    .authority_snapshot_replay
+                    .as_ref()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let (reservation, snapshot_request, snapshot_response) = snapshot_exchange
+                    .borrow_mut()
+                    .take()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let result = (|| {
+                    let runtime_identity =
+                        verify_systemd_runtime(context.config, context.installation, &scope)
+                            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let mut evidence =
+                        crate::closed_profile_observations::collect_live_closed_profile_evidence(
+                            context.config,
+                            context.installation,
+                            context.mapping,
+                            stream,
+                            context.peer,
+                            &child_record,
+                            &scope,
+                            &process_posture,
+                            runtime_identity.as_str(),
+                        )
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let launcher_instance = collect_launcher_instance(
+                        context.config,
+                        &principal_mapping,
+                        &child_record,
+                        &scope,
+                        &process_posture,
+                        &mut evidence,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let (prelude, mut observation, authority) = same_child_prelude
+                        .borrow_mut()
+                        .take()
+                        .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let launcher_profile_identity =
+                        systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
+                            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let launcher_executable_identity = context
+                        .installation
+                        .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let capability_context =
+                        crate::protected_launcher_capability::ProtectedLauncherCapabilityContextV1 {
+                            request: context.launcher_request,
+                            child: &child_record,
+                            scope: &scope,
+                            principal_mapping: &principal_mapping,
+                            process_posture: &process_posture,
+                            launcher_instance: &launcher_instance,
+                            launcher_executable_identity,
+                            launcher_configuration_identity: context.config.identity.as_str(),
+                            launcher_service_binding_identity: context
+                                .config
+                                .service_unit_identity
+                                .as_str(),
+                            launcher_profile_identity: launcher_profile_identity.as_str(),
+                            service_uid: unsafe { libc::geteuid() },
+                            service_gid: unsafe { libc::getegid() },
+                            authority: &authority,
+                        };
+                    let installation_evidence_identity =
+                        crate::installation_manifest::load_public_installation_evidence_identity(
+                            context.installation,
+                        )
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let response = crate::protected_capability_observation::derive_secret_delivery_transaction_binding_v2(
+                        request,
+                        &snapshot_request,
+                        &snapshot_response,
+                        &startup_continuation,
+                        installation_evidence_identity.as_str(),
+                        &prelude,
+                        &capability_context,
+                        &mut observation,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    replay.consume(
+                        &reservation,
+                        &snapshot_response,
+                        request,
+                        &response,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    Ok(response)
+                })();
+                if result.is_err() {
+                    let _ = replay.refuse(&reservation);
+                }
+                result
+            }
+        },
+        |request, _selected_session| {
+            #[cfg(not(feature = "protected-attestor"))]
+            {
+                let _ = (request, _selected_session);
+                Err(PreparedChildError::AuthorizationAdmissionMismatch)
+            }
+            #[cfg(feature = "protected-attestor")]
+            {
+                let replay = context
+                    .authority_snapshot_replay
+                    .as_ref()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let (reservation, snapshot_request, snapshot_response) = snapshot_exchange
+                    .borrow_mut()
+                    .take()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let result = (|| {
+                    let runtime_identity =
+                        verify_systemd_runtime(context.config, context.installation, &scope)
+                            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let mut evidence =
+                        crate::closed_profile_observations::collect_live_closed_profile_evidence(
+                            context.config,
+                            context.installation,
+                            context.mapping,
+                            stream,
+                            context.peer,
+                            &child_record,
+                            &scope,
+                            &process_posture,
+                            runtime_identity.as_str(),
+                        )
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let launcher_instance = collect_launcher_instance(
+                        context.config,
+                        &principal_mapping,
+                        &child_record,
+                        &scope,
+                        &process_posture,
+                        &mut evidence,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let (prelude, mut observation, authority) = same_child_prelude
+                        .borrow_mut()
+                        .take()
+                        .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let launcher_profile_identity =
+                        systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
+                            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let launcher_executable_identity = context
+                        .installation
+                        .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let capability_context =
+                        crate::protected_launcher_capability::ProtectedLauncherCapabilityContextV1 {
+                            request: context.launcher_request,
+                            child: &child_record,
+                            scope: &scope,
+                            principal_mapping: &principal_mapping,
+                            process_posture: &process_posture,
+                            launcher_instance: &launcher_instance,
+                            launcher_executable_identity,
+                            launcher_configuration_identity: context.config.identity.as_str(),
+                            launcher_service_binding_identity: context
+                                .config
+                                .service_unit_identity
+                                .as_str(),
+                            launcher_profile_identity: launcher_profile_identity.as_str(),
+                            service_uid: unsafe { libc::geteuid() },
+                            service_gid: unsafe { libc::getegid() },
+                            authority: &authority,
+                        };
+                    let installation_evidence_identity =
+                        crate::installation_manifest::load_public_installation_evidence_identity(
+                            context.installation,
+                        )
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let response = crate::protected_capability_observation::derive_secret_delivery_transaction_binding_v3(
+                        request,
+                        &snapshot_request,
+                        &snapshot_response,
+                        &startup_continuation,
+                        installation_evidence_identity.as_str(),
+                        &prelude,
+                        &capability_context,
+                        &mut observation,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    replay.consume_v3(
+                        &reservation,
+                        &snapshot_response,
+                        request,
+                        &response,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    Ok(response)
+                })();
+                if result.is_err() {
+                    let _ = replay.refuse(&reservation);
+                }
+                result
+            }
+        },
+        |request, _selected_session| {
+            #[cfg(not(feature = "protected-attestor"))]
+            {
+                let _ = (request, _selected_session);
+                Err(PreparedChildError::AuthorizationAdmissionMismatch)
+            }
+            #[cfg(feature = "protected-attestor")]
+            {
+                let replay = context
+                    .authority_snapshot_replay
+                    .as_ref()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let (reservation, snapshot_request, snapshot_response) = snapshot_v2_exchange
+                    .borrow_mut()
+                    .take()
+                    .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                let result = (|| {
+                    let runtime_identity =
+                        verify_systemd_runtime(context.config, context.installation, &scope)
+                            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let mut evidence =
+                        crate::closed_profile_observations::collect_live_closed_profile_evidence(
+                            context.config,
+                            context.installation,
+                            context.mapping,
+                            stream,
+                            context.peer,
+                            &child_record,
+                            &scope,
+                            &process_posture,
+                            runtime_identity.as_str(),
+                        )
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let launcher_instance = collect_launcher_instance(
+                        context.config,
+                        &principal_mapping,
+                        &child_record,
+                        &scope,
+                        &process_posture,
+                        &mut evidence,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let (prelude, mut observation, authority) = same_child_prelude
+                        .borrow_mut()
+                        .take()
+                        .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let launcher_profile_identity =
+                        systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
+                            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let launcher_executable_identity = context
+                        .installation
+                        .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let capability_context =
+                        crate::protected_launcher_capability::ProtectedLauncherCapabilityContextV1 {
+                            request: context.launcher_request,
+                            child: &child_record,
+                            scope: &scope,
+                            principal_mapping: &principal_mapping,
+                            process_posture: &process_posture,
+                            launcher_instance: &launcher_instance,
+                            launcher_executable_identity,
+                            launcher_configuration_identity: context.config.identity.as_str(),
+                            launcher_service_binding_identity: context.config.service_unit_identity.as_str(),
+                            launcher_profile_identity: launcher_profile_identity.as_str(),
+                            service_uid: unsafe { libc::geteuid() },
+                            service_gid: unsafe { libc::getegid() },
+                            authority: &authority,
+                        };
+                    let installation_evidence_identity =
+                        crate::installation_manifest::load_public_installation_evidence_identity(
+                            context.installation,
+                        )
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    let response = crate::protected_capability_observation::derive_secret_delivery_transaction_binding_v4(
+                        request,
+                        &snapshot_request,
+                        &snapshot_response,
+                        &startup_continuation,
+                        installation_evidence_identity.as_str(),
+                        &prelude,
+                        &capability_context,
+                        &mut observation,
+                    )
+                    .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    replay.consume_v4(&reservation, &snapshot_response, request, &response)
+                        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                    Ok(response)
+                })();
+                if result.is_err() {
+                    let _ = replay.refuse(&reservation);
+                }
+                result
+            }
+        },
+        |completion| {
                 boundary
                     .active_slot
                     .record_execution_completion(completion)
                     .map_err(|_| PreparedChildError::ExecutionCompletionPersistenceFailed)?;
                 pressure_exit_after_execution_completion_recorded()
                     .map_err(|_| PreparedChildError::ExecutionCompletionPersistenceFailed)
-            });
+        },
+    );
+    #[cfg(feature = "protected-attestor")]
+    if completion.is_err()
+        && let Some((reservation, _, _)) = snapshot_exchange.borrow_mut().take()
+        && let Some(replay) = context.authority_snapshot_replay.as_ref()
+    {
+        let _ = replay.refuse(&reservation);
+    }
+    #[cfg(feature = "protected-attestor")]
+    refuse_unconsumed_snapshot_v2(
+        &snapshot_v2_exchange,
+        context.authority_snapshot_replay.as_ref(),
+    );
     let (completion, observed_exit_code) = match completion {
         Ok(completion) => completion,
         Err(error) => {
@@ -430,7 +1306,7 @@ fn execute_selected_boundary(
                 prepared_child_error_reason(&error)
             );
             return fail_selected_boundary(
-                config,
+                context.config,
                 stream,
                 invocation_id,
                 boundary,
@@ -440,7 +1316,7 @@ fn execute_selected_boundary(
     };
     if completion.receipt_archive_identity.is_none() {
         return fail_selected_boundary(
-            config,
+            context.config,
             stream,
             invocation_id,
             boundary,
@@ -453,12 +1329,12 @@ fn execute_selected_boundary(
         .stop_and_confirm_empty(
             &boundary.scope,
             &boundary.child.record,
-            Duration::from_secs(config.maximum_terminal_wait_seconds),
+            Duration::from_secs(context.config.maximum_terminal_wait_seconds),
         )
         .is_err()
     {
         return fail_selected_boundary(
-            config,
+            context.config,
             stream,
             invocation_id,
             boundary,
@@ -467,7 +1343,7 @@ fn execute_selected_boundary(
     }
     if boundary.active_slot.execution_completion() != Some(&completion) {
         return fail_selected_boundary(
-            config,
+            context.config,
             stream,
             invocation_id,
             boundary,
@@ -488,8 +1364,8 @@ fn execute_selected_boundary(
         .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
     pressure_exit_after_finalization_intent_recorded()?;
     let signed_finalization = sign_execution_finalization(
-        config,
-        installation,
+        context.config,
+        context.installation,
         &finalization_journal.journal().finalization,
     )?;
     finalization_journal
@@ -580,13 +1456,25 @@ fn retain_finalization_intent(
 
 fn prepared_child_error_reason(error: &PreparedChildError) -> &'static str {
     match error {
+        PreparedChildError::InvalidInputs => "child_inputs_invalid",
+        PreparedChildError::ForkFailed => "child_create_failed",
+        PreparedChildError::StopFailed => "child_stop_failed",
+        PreparedChildError::ExitedBeforeStop => "child_exited_before_stop",
+        PreparedChildError::IdentityUnavailable => "child_identity_unavailable",
+        PreparedChildError::ResumeFailed => "child_resume_failed",
+        PreparedChildError::PostureUnavailable => "child_posture_unavailable",
+        PreparedChildError::PostureMismatch => "child_posture_mismatch",
+        PreparedChildError::AttestationBridgeUnavailable => "attestation_bridge_unavailable",
+        PreparedChildError::AuthorizationAdmissionMismatch => "authorization_admission_mismatch",
+        PreparedChildError::AuthorizationDecisionBridgeUnavailable => {
+            "authorization_decision_bridge_unavailable"
+        }
         PreparedChildError::ExecutionCompletionUnavailable => "completion_unavailable",
         PreparedChildError::ExecutionCompletionIdentityMismatch => "completion_identity_mismatch",
         PreparedChildError::ExecutionCompletionPersistenceFailed => "completion_persistence_failed",
         PreparedChildError::ExecutionCompletionExitMismatch => "completion_exit_mismatch",
         PreparedChildError::OutputBridgeUnavailable => "output_bridge_unavailable",
         PreparedChildError::CleanupFailed => "child_reap_failed",
-        _ => "child_boundary_failed",
     }
 }
 
@@ -670,7 +1558,7 @@ fn prepare_disabled_child_boundary(
                 )
                 .map_err(|error| pressure_prepared_child_failure("process_posture", error))?;
             let child_record = child.record.clone();
-            let (authorization, request_identity) = child
+            let (authorization, request_identity, startup_continuation) = child
                 .continue_to_v3_authorization_request(
                     &posture,
                     Duration::from_secs(config.maximum_startup_seconds),
@@ -752,7 +1640,12 @@ fn prepare_disabled_child_boundary(
             if lease_consumption.is_some() != active_slot.borrow().has_lease_consumption() {
                 return Err(SystemdServiceError::AuthorizationDecisionRefused);
             }
-            Ok((decision, lease_consumption))
+            Ok((
+                decision,
+                lease_consumption,
+                Some(startup_continuation),
+                Some(posture),
+            ))
         },
     )
 }
@@ -794,7 +1687,7 @@ fn produce_attestation(
     let producer = ota_authority_launcher::attestation_client::load_producer_binding()
         .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
     let launcher_profile_identity =
-        systemd_launcher_profile_identity(&systemd_launcher_profile_v3())
+        systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
             .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
     let launcher_executable_identity = installation
         .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
@@ -808,27 +1701,8 @@ fn produce_attestation(
         return Err(SystemdServiceError::RuntimeProfileUnavailable);
     }
 
-    let job_profile_identity =
-        systemd_job_principal_profile_identity(&systemd_job_principal_profile_v2())
-            .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
-    let mut instance = SystemdProtectedLauncherInstanceEvidenceV1 {
-        schema_version: 1,
-        identity: String::new(),
-        adapter: SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1.into(),
-        principal_mapping: principal_mapping.clone(),
-        process_posture: posture.clone(),
-        systemd_launcher_profile_identity: launcher_profile_identity.clone(),
-        systemd_job_principal_profile_identity: job_profile_identity,
-        launcher_session_binding_identity: config.identity.clone(),
-        systemd_invocation_identity: scope.identity.clone(),
-        working_directory_identity: child.working_directory_identity.clone(),
-        child_process_identity: child.identity.clone(),
-    };
-    instance.identity = systemd_protected_launcher_instance_v3_foundation_identity(&instance)
-        .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
     let complete =
-        ota_authority_launcher::observation_collector::collect_closed_profile(instance, evidence)
-            .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+        collect_launcher_instance(config, principal_mapping, child, scope, posture, evidence)?;
     let claims = LauncherAttestationClaimsV3 {
         message_kind: ATTESTATION_RESPONSE.into(),
         attestation_protocol_version: SYSTEMD_PROTECTED_LAUNCHER_ATTESTATION_PROTOCOL_V3.into(),
@@ -868,6 +1742,40 @@ fn produce_attestation(
         ota_authority_launcher::attestation_client::request_attestation(&producer, &request)
             .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
     Ok(response.attestation)
+}
+
+fn collect_launcher_instance(
+    config: &SystemdLauncherServiceConfigV1,
+    principal_mapping: &ota_authority_protocol::LauncherPrincipalMappingV1,
+    child: &ota_authority_protocol::LauncherChildProcessV1,
+    scope: &ota_authority_protocol::LauncherSystemdScopeV1,
+    posture: &ota_authority_protocol::OtaProcessPostureV1,
+    evidence: &mut crate::closed_profile_observations::LiveClosedProfileEvidence,
+) -> Result<ota_authority_protocol::SystemdProtectedLauncherInstanceEvidenceV2, SystemdServiceError>
+{
+    let launcher_profile_identity =
+        systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
+            .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    let job_profile_identity =
+        systemd_job_principal_profile_identity(&systemd_job_principal_profile_v2())
+            .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    let mut instance = SystemdProtectedLauncherInstanceEvidenceV1 {
+        schema_version: 1,
+        identity: String::new(),
+        adapter: SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1.into(),
+        principal_mapping: principal_mapping.clone(),
+        process_posture: posture.clone(),
+        systemd_launcher_profile_identity: launcher_profile_identity,
+        systemd_job_principal_profile_identity: job_profile_identity,
+        launcher_session_binding_identity: config.identity.clone(),
+        systemd_invocation_identity: scope.identity.clone(),
+        working_directory_identity: child.working_directory_identity.clone(),
+        child_process_identity: child.identity.clone(),
+    };
+    instance.identity = systemd_protected_launcher_instance_v3_foundation_identity(&instance)
+        .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
+    ota_authority_launcher::observation_collector::collect_closed_profile(instance, evidence)
+        .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)
 }
 
 struct ProtectedBrokerProxy {
@@ -962,6 +1870,8 @@ where
         (
             AuthorizationDecision,
             Option<LeaseConsumptionRelayEvidenceV1>,
+            Option<ota_authority_protocol::LauncherStartupContinuationV1>,
+            Option<ota_authority_protocol::OtaProcessPostureV1>,
         ),
         SystemdServiceError,
     >,
@@ -1069,7 +1979,13 @@ where
     let posture_result = posture_gate(&mut child, &principal_mapping, &scope, &mut active_slot);
     let retain_for_recovery = posture_result.is_err() && active_slot.has_lease_consumption_intent();
     let consumed = active_slot.has_lease_consumption();
-    if let Ok((AuthorizationDecision::Allowed, Some(consumption))) = &posture_result {
+    if let Ok((
+        AuthorizationDecision::Allowed,
+        Some(consumption),
+        Some(startup_continuation),
+        Some(process_posture),
+    )) = &posture_result
+    {
         if !consumed {
             return Err(SystemdServiceError::AuthorizationDecisionRefused);
         }
@@ -1078,6 +1994,9 @@ where
             scope,
             active_slot,
             consumption: consumption.clone(),
+            startup_continuation: startup_continuation.clone(),
+            principal_mapping,
+            process_posture: process_posture.clone(),
         })));
     }
     let child_record = child.record.clone();
@@ -1096,7 +2015,7 @@ where
             .finalize()
             .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
     }
-    let (decision, _) = posture_result?;
+    let (decision, _, _, _) = posture_result?;
     Ok(BoundaryAdmission::Refused {
         child: child_record,
         decision,
@@ -1435,21 +2354,65 @@ fn map_target_directory_error(error: TargetDirectoryError) -> SystemdServiceErro
     }
 }
 
-fn inherited_systemd_listener(
-    expected_path: &Path,
-    expected_group_gid: u32,
-) -> Result<UnixListener, SystemdServiceError> {
-    let expected_pid = unsafe { libc::getpid() }.to_string();
-    if env::var("LISTEN_PID").ok().as_deref() != Some(expected_pid.as_str())
-        || env::var("LISTEN_FDS").ok().as_deref() != Some("1")
+struct InheritedSystemdDescriptors {
+    listener: UnixListener,
+    boot_file: File,
+}
+
+fn inherited_systemd_descriptor_roles(
+    listen_fds: &str,
+    listen_fd_names: &str,
+) -> Result<(RawFd, RawFd), SystemdServiceError> {
+    if listen_fds != "2" {
+        return Err(SystemdServiceError::ListenerUnavailable);
+    }
+    let names = listen_fd_names.split(':').collect::<Vec<_>>();
+    if names.len() != 2
+        || names.iter().any(|name| name.is_empty())
+        || names
+            .iter()
+            .filter(|name| **name == LAUNCHER_LISTENER_FD_NAME)
+            .count()
+            != 1
+        || names
+            .iter()
+            .filter(|name| **name == BOOT_ID_FD_NAME)
+            .count()
+            != 1
     {
         return Err(SystemdServiceError::ListenerUnavailable);
     }
-    set_cloexec(SYSTEMD_LISTEN_FD)?;
-    verify_listener_socket(SYSTEMD_LISTEN_FD)?;
+    let descriptor_for = |role: &str| {
+        names
+            .iter()
+            .position(|name| *name == role)
+            .map(|index| SYSTEMD_LISTEN_FD + index as RawFd)
+            .ok_or(SystemdServiceError::ListenerUnavailable)
+    };
+    Ok((
+        descriptor_for(LAUNCHER_LISTENER_FD_NAME)?,
+        descriptor_for(BOOT_ID_FD_NAME)?,
+    ))
+}
+
+fn inherited_systemd_descriptors(
+    expected_path: &Path,
+    expected_group_gid: u32,
+) -> Result<InheritedSystemdDescriptors, SystemdServiceError> {
+    let expected_pid = unsafe { libc::getpid() }.to_string();
+    if env::var("LISTEN_PID").ok().as_deref() != Some(expected_pid.as_str()) {
+        return Err(SystemdServiceError::ListenerUnavailable);
+    }
+    let listen_fds =
+        env::var("LISTEN_FDS").map_err(|_| SystemdServiceError::ListenerUnavailable)?;
+    let names = env::var("LISTEN_FDNAMES").map_err(|_| SystemdServiceError::ListenerUnavailable)?;
+    let (listener_fd, boot_fd) = inherited_systemd_descriptor_roles(&listen_fds, &names)?;
+    set_cloexec(listener_fd)?;
+    set_cloexec(boot_fd)?;
+    verify_listener_socket(listener_fd)?;
     // SAFETY: the descriptor was verified as a listening AF_UNIX stream and ownership transfers
     // once to the returned listener.
-    let listener = unsafe { UnixListener::from_raw_fd(SYSTEMD_LISTEN_FD) };
+    let listener = unsafe { UnixListener::from_raw_fd(listener_fd) };
     if listener
         .local_addr()
         .ok()
@@ -1459,7 +2422,11 @@ fn inherited_systemd_listener(
         return Err(SystemdServiceError::ListenerUnavailable);
     }
     verify_listener_path(&listener, expected_path, expected_group_gid)?;
-    Ok(listener)
+    let boot_file = unsafe { File::from_raw_fd(boot_fd) };
+    Ok(InheritedSystemdDescriptors {
+        listener,
+        boot_file,
+    })
 }
 
 fn verify_listener_path(
@@ -1524,6 +2491,20 @@ fn receive_initial_request(
             validate_launcher_invocation_request_v1(&request)
                 .map_err(|_| SystemdServiceError::InvalidRequest)?;
             Ok(InitialClientRequest::Invocation(request))
+        }
+        #[cfg(feature = "protected-attestor")]
+        Some(ota_authority_protocol::PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_PROBE_REQUEST) => {
+            let request: ProtectedLauncherCapabilityObservationProbeRequestV1 =
+                serde_json::from_value(value).map_err(|_| SystemdServiceError::InvalidRequest)?;
+            if protected_launcher_capability_observation_probe_request_v1_identity(&request)
+                .map_err(|_| SystemdServiceError::InvalidRequest)?
+                != request.identity
+            {
+                return Err(SystemdServiceError::InvalidRequest);
+            }
+            Ok(InitialClientRequest::CapabilityObservation(Box::new(
+                request,
+            )))
         }
         Some(ota_authority_protocol::LAUNCHER_FINALIZATION_ARCHIVE_REQUEST) => {
             let request: LauncherFinalizationArchiveRequestV1 =
@@ -1618,7 +2599,7 @@ fn sign_execution_finalization(
     let producer = ota_authority_launcher::attestation_client::load_producer_binding()
         .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
     let launcher_profile_identity =
-        systemd_launcher_profile_identity(&systemd_launcher_profile_v3())
+        systemd_launcher_profile_identity(&systemd_launcher_profile_v4())
             .map_err(|_| SystemdServiceError::RuntimeProfileUnavailable)?;
     let launcher_executable_identity = installation
         .singular_identity(ProtectedInstallationRoleV1::LauncherExecutable)
@@ -2103,8 +3084,76 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "protected-attestor")]
+    use crate::protected_authority_snapshot::SnapshotReservation;
+
     fn test_identity(character: char) -> String {
         format!("sha256:{}", character.to_string().repeat(64))
+    }
+
+    #[test]
+    fn authority_context_failure_message_is_stage_only() {
+        assert_eq!(
+            authority_context_load_failure_message("semantic_binding"),
+            "ota-authority-launcher: protected authority context load failure stage=semantic_binding"
+        );
+    }
+
+    #[cfg(feature = "protected-attestor")]
+    #[test]
+    fn unconsumed_v2_snapshot_is_terminally_refused_after_relay() {
+        let (directory, store, reservation, request, response) =
+            crate::protected_authority_snapshot::tests::service_cleanup_fixture_v2();
+        let record_name = reservation.record_name().to_owned();
+        let exchange = RefCell::new(Some((reservation, request, response)));
+
+        // A valid failed pre-binding completion returns Ok from the relay; cleanup is unconditional.
+        refuse_unconsumed_snapshot_v2(&exchange, Some(&store));
+
+        assert!(exchange.borrow().is_none());
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(directory.path().join(record_name)).expect("durable replay record"),
+        )
+        .expect("replay record JSON");
+        assert_eq!(record["status"], "refused");
+    }
+
+    #[cfg(not(feature = "protected-attestor"))]
+    #[test]
+    fn secret_delivery_binding_refuses_without_protected_attestor() {
+        assert_eq!(
+            refuse_secret_delivery_binding_without_protected_attestor(),
+            Err(PreparedChildError::AuthorizationAdmissionMismatch)
+        );
+    }
+
+    #[test]
+    fn inherited_descriptor_roles_are_exact_and_order_independent() {
+        assert_eq!(
+            inherited_systemd_descriptor_roles("2", "ota-launcher-listener:ota-boot-id")
+                .expect("canonical descriptor order"),
+            (3, 4)
+        );
+        assert_eq!(
+            inherited_systemd_descriptor_roles("2", "ota-boot-id:ota-launcher-listener")
+                .expect("reversed descriptor order"),
+            (4, 3)
+        );
+
+        for (count, names) in [
+            ("1", "ota-launcher-listener"),
+            ("3", "ota-launcher-listener:ota-boot-id:extra"),
+            ("2", "ota-launcher-listener"),
+            ("2", "ota-launcher-listener:"),
+            ("2", "ota-launcher-listener:ota-launcher-listener"),
+            ("2", "ota-boot-id:ota-boot-id"),
+            ("2", "ota-launcher-listener:substituted-boot-id"),
+        ] {
+            assert!(
+                inherited_systemd_descriptor_roles(count, names).is_err(),
+                "descriptor set {count} {names} must refuse"
+            );
+        }
     }
 
     fn record_allowed_consumption_intent(active_slot: &mut ActiveSlot) {
@@ -2565,6 +3614,95 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "protected-attestor")]
+    #[test]
+    fn capability_observation_probe_dispatch_requires_exact_bound_identity() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use ota_authority_protocol::{
+            PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_CHALLENGE,
+            PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_PROBE_REQUEST,
+            PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_REQUEST,
+            ProtectedLauncherCapabilityObservationChallengeV1,
+            ProtectedLauncherCapabilityObservationProbeRequestV1,
+            ProtectedLauncherCapabilityObservationRequestV1,
+            protected_launcher_capability_observation_challenge_v1_identity,
+            protected_launcher_capability_observation_nonce_commitment_v1,
+            protected_launcher_capability_observation_probe_request_v1_identity,
+            protected_launcher_capability_observation_request_v1_identity,
+        };
+
+        let invocation = LauncherInvocationRequestV1 {
+            message_kind: ota_authority_protocol::LAUNCHER_INVOCATION_REQUEST.into(),
+            protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
+            authority_id: "secret-delivery".into(),
+            ota_arguments: vec!["run".into(), "governed".into()],
+            repository_path: "/srv/repositories/project".into(),
+        };
+        let nonce = [7_u8; 32];
+        let mut challenge = ProtectedLauncherCapabilityObservationChallengeV1 {
+            schema_version: 1,
+            message_kind: PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_CHALLENGE.into(),
+            identity: String::new(),
+            workflow_run_id: "34356604479".into(),
+            workflow_run_attempt: "1".into(),
+            workflow_reference: "ota-run/ota/.github/workflows/secret-delivery-oidc-endpoint-evidence.yml@refs/heads/1.6.28-implementation".into(),
+            nonce_commitment: protected_launcher_capability_observation_nonce_commitment_v1(&nonce)
+                .expect("nonce commitment"),
+            issued_at_unix_seconds: 1_788_800_000,
+            expires_at_unix_seconds: 1_788_800_300,
+        };
+        challenge.identity =
+            protected_launcher_capability_observation_challenge_v1_identity(&challenge)
+                .expect("challenge identity");
+        let mut observation = ProtectedLauncherCapabilityObservationRequestV1 {
+            schema_version: 1,
+            message_kind: PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_REQUEST.into(),
+            identity: String::new(),
+            challenge,
+            nonce: URL_SAFE_NO_PAD.encode(nonce),
+            runner_version: "2.337.0".into(),
+            expected_launcher_request_identity: launcher_invocation_request_identity(&invocation)
+                .expect("invocation identity"),
+        };
+        observation.identity =
+            protected_launcher_capability_observation_request_v1_identity(&observation)
+                .expect("observation identity");
+        let mut probe = ProtectedLauncherCapabilityObservationProbeRequestV1 {
+            schema_version: 1,
+            message_kind: PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_PROBE_REQUEST.into(),
+            identity: String::new(),
+            invocation,
+            observation,
+        };
+        probe.identity =
+            protected_launcher_capability_observation_probe_request_v1_identity(&probe)
+                .expect("probe identity");
+
+        let receive = |value: &ProtectedLauncherCapabilityObservationProbeRequestV1| {
+            let (mut service, mut client) = UnixStream::pair().expect("socket pair");
+            let bytes = serde_jcs::to_vec(value).expect("probe bytes");
+            client
+                .write_all(&encode_frame(&bytes).expect("probe frame"))
+                .expect("write probe");
+            receive_initial_request(&mut service, MAX_FRAME_BYTES)
+        };
+        assert!(matches!(
+            receive(&probe),
+            Ok(InitialClientRequest::CapabilityObservation(value)) if *value == probe
+        ));
+
+        let mut substituted = probe;
+        substituted.observation.runner_version = "2.338.0".into();
+        substituted.observation.identity =
+            protected_launcher_capability_observation_request_v1_identity(&substituted.observation)
+                .expect("substituted observation identity");
+        assert!(matches!(
+            receive(&substituted),
+            Err(SystemdServiceError::InvalidRequest)
+        ));
+    }
+
     #[test]
     fn bridge_errors_remain_pre_authorization_protocol_refusals_after_cleanup() {
         assert!(matches!(
@@ -2575,6 +3713,69 @@ mod tests {
             map_prepared_child_error(PreparedChildError::AuthorizationAdmissionMismatch),
             SystemdServiceError::PreAuthorizationProtocolRefused
         ));
+    }
+
+    #[test]
+    fn prepared_child_diagnostics_distinguish_fail_closed_boundaries() {
+        let cases = [
+            (PreparedChildError::InvalidInputs, "child_inputs_invalid"),
+            (PreparedChildError::ForkFailed, "child_create_failed"),
+            (PreparedChildError::StopFailed, "child_stop_failed"),
+            (
+                PreparedChildError::ExitedBeforeStop,
+                "child_exited_before_stop",
+            ),
+            (
+                PreparedChildError::IdentityUnavailable,
+                "child_identity_unavailable",
+            ),
+            (PreparedChildError::CleanupFailed, "child_reap_failed"),
+            (PreparedChildError::ResumeFailed, "child_resume_failed"),
+            (
+                PreparedChildError::PostureUnavailable,
+                "child_posture_unavailable",
+            ),
+            (
+                PreparedChildError::PostureMismatch,
+                "child_posture_mismatch",
+            ),
+            (
+                PreparedChildError::AttestationBridgeUnavailable,
+                "attestation_bridge_unavailable",
+            ),
+            (
+                PreparedChildError::AuthorizationAdmissionMismatch,
+                "authorization_admission_mismatch",
+            ),
+            (
+                PreparedChildError::AuthorizationDecisionBridgeUnavailable,
+                "authorization_decision_bridge_unavailable",
+            ),
+            (
+                PreparedChildError::ExecutionCompletionUnavailable,
+                "completion_unavailable",
+            ),
+            (
+                PreparedChildError::ExecutionCompletionIdentityMismatch,
+                "completion_identity_mismatch",
+            ),
+            (
+                PreparedChildError::ExecutionCompletionPersistenceFailed,
+                "completion_persistence_failed",
+            ),
+            (
+                PreparedChildError::ExecutionCompletionExitMismatch,
+                "completion_exit_mismatch",
+            ),
+            (
+                PreparedChildError::OutputBridgeUnavailable,
+                "output_bridge_unavailable",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(prepared_child_error_reason(&error), expected);
+        }
     }
 
     #[test]
@@ -2701,7 +3902,7 @@ mod tests {
                         && journal.get("stage").and_then(serde_json::Value::as_str)
                             == Some("scope_attached"),
                 );
-                Ok((AuthorizationDecision::Allowed, None))
+                Ok((AuthorizationDecision::Allowed, None, None, None))
             },
         )
         .expect("prepare and clean child boundary");
@@ -2795,7 +3996,7 @@ mod tests {
                 temporary.path(),
                 &UncertainScopeBoundary,
                 |_child, _principal_mapping, _scope, _active_slot| {
-                    Ok((AuthorizationDecision::Allowed, None))
+                    Ok((AuthorizationDecision::Allowed, None, None, None))
                 },
             ),
             Err(SystemdServiceError::ScopeCleanupFailed)

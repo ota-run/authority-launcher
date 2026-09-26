@@ -49,12 +49,14 @@ jobs:
           test "$(uname -m)" = x86_64
           test "$(ps -p 1 -o comm=)" = systemd
           grep -Fxq '0::/system.slice/ota-authority-pressure-runner.service' /proc/self/cgroup
+          "$CLIENT" --help | grep -F -- '--administrator-controlled-recovery' >/dev/null
 
           result="$RUNNER_TEMP/administrator-recovery-trigger.json"
           set +e
-          "$CLIENT" --json --administrator-controlled-recovery \
+          "$CLIENT" \
             --authority-id "$AUTHORITY_ID" \
-            --repository "$PRESSURE_REPOSITORY" -- \
+            --repository "$PRESSURE_REPOSITORY" \
+            --json --administrator-controlled-recovery -- \
             run governed --grant "$AUTHORITY_ID" --receipt >"$result"
           status=$?
           set -e

@@ -33,7 +33,10 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::config::SystemdLauncherServiceConfigV1;
-use crate::installation_manifest::{ProtectedInstallationManifestV1, ProtectedInstallationRoleV1};
+use crate::installation_manifest::{
+    AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY, CAPABILITY_OBSERVATION_REPLAY_DIRECTORY,
+    ProtectedInstallationManifestV1, ProtectedInstallationRoleV1,
+};
 
 const LAUNCHER_SERVICE_UNIT: &str = "ota-authority-launcher.service";
 const LAUNCHER_SOCKET_UNIT: &str = "ota-authority-launcher.socket";
@@ -100,6 +103,7 @@ pub(crate) fn verify_systemd_runtime(
             "ProtectControlGroups",
             "ProtectProc",
             "ProcSubset",
+            "OpenFile",
             "RestrictNamespaces",
             "SystemCallArchitectures",
             "CapabilityBoundingSet",
@@ -128,6 +132,7 @@ pub(crate) fn verify_systemd_runtime(
             "SocketMode",
             "RemoveOnStop",
             "Triggers",
+            "FileDescriptorName",
         ],
     )?;
     verify_socket_properties(config, installation, &socket)?;
@@ -251,7 +256,9 @@ fn verify_service_properties(
         ("UMask", "0077"),
         ("RuntimeDirectory", "ota/authority-launcher"),
         ("RuntimeDirectoryMode", "0700"),
-        ("NoNewPrivileges", "yes"),
+        // The root Launcher must inspect sudo policy. Selected and runner
+        // principals independently require and revalidate NoNewPrivileges=yes.
+        ("NoNewPrivileges", "no"),
         ("RestrictSUIDSGID", "no"),
         ("LockPersonality", "yes"),
         ("MemoryDenyWriteExecute", "no"),
@@ -267,6 +274,10 @@ fn verify_service_properties(
         ("ProtectControlGroups", "yes"),
         ("ProtectProc", "invisible"),
         ("ProcSubset", "pid"),
+        (
+            "OpenFile",
+            "/proc/sys/kernel/random/boot_id:ota-boot-id:read-only",
+        ),
         ("RestrictNamespaces", "yes"),
         ("SystemCallArchitectures", "native"),
         ("AmbientCapabilities", "cap_setuid"),
@@ -309,21 +320,11 @@ fn verify_service_properties(
         "RestrictAddressFamilies",
         &["AF_INET", "AF_INET6", "AF_UNIX"],
     )?;
-    let mut writable = vec![
-        Path::new("/run/ota/authority-launcher"),
-        Path::new("/var/lib/ota/authority-launcher"),
-    ];
-    if installation
+    let include_history = installation
         .optional_singular_path(ProtectedInstallationRoleV1::HistoryBinding)
         .map_err(|_| SystemdRuntimeObservationError::Mismatch)?
-        .is_some()
-    {
-        writable.extend([
-            Path::new(crate::protected_history::HISTORY_BLOB_ROOT),
-            Path::new(crate::protected_history::HISTORY_CATALOG_ROOT),
-        ]);
-    }
-    writable.extend(config.allowed_repository_roots.iter().map(PathBuf::as_path));
+        .is_some();
+    let writable = launcher_writable_paths(&config.allowed_repository_roots, include_history);
     require_path_set(values, "ReadWritePaths", writable)?;
     let mut read_only = vec![Path::new("/etc/ota")];
     read_only.extend(installation.files.iter().map(|entry| entry.path.as_path()));
@@ -332,6 +333,26 @@ fn verify_service_properties(
     read_only.push(Path::new(SYSTEMD_ATTESTOR_SOCKET_PATH_V1));
     require_path_set(values, "ReadOnlyPaths", read_only)?;
     Ok(())
+}
+
+fn launcher_writable_paths(
+    allowed_repository_roots: &[PathBuf],
+    include_history: bool,
+) -> Vec<&Path> {
+    let mut writable = vec![
+        Path::new("/run/ota/authority-launcher"),
+        Path::new("/var/lib/ota/authority-launcher"),
+        Path::new(CAPABILITY_OBSERVATION_REPLAY_DIRECTORY),
+        Path::new(AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY),
+    ];
+    if include_history {
+        writable.extend([
+            Path::new(crate::protected_history::HISTORY_BLOB_ROOT),
+            Path::new(crate::protected_history::HISTORY_CATALOG_ROOT),
+        ]);
+    }
+    writable.extend(allowed_repository_roots.iter().map(PathBuf::as_path));
+    writable
 }
 
 fn verify_socket_properties(
@@ -347,6 +368,7 @@ fn verify_socket_properties(
         ("SocketMode", "0660"),
         ("RemoveOnStop", "yes"),
         ("Triggers", LAUNCHER_SERVICE_UNIT),
+        ("FileDescriptorName", "ota-launcher-listener"),
     ] {
         require(values, name, expected)?;
     }
@@ -501,6 +523,7 @@ mod tests {
             ("SocketMode".into(), "0660".into()),
             ("RemoveOnStop".into(), "yes".into()),
             ("Triggers".into(), LAUNCHER_SERVICE_UNIT.into()),
+            ("FileDescriptorName".into(), "ota-launcher-listener".into()),
         ]);
         for (name, expected) in [
             ("Id", LAUNCHER_SOCKET_UNIT),
@@ -510,11 +533,15 @@ mod tests {
             ("SocketMode", "0660"),
             ("RemoveOnStop", "yes"),
             ("Triggers", LAUNCHER_SERVICE_UNIT),
+            ("FileDescriptorName", "ota-launcher-listener"),
         ] {
             require(&values, name, expected).expect("matching socket property");
         }
         values.insert("Triggers".into(), "other.service".into());
         assert!(require(&values, "Triggers", LAUNCHER_SERVICE_UNIT).is_err());
+        values.insert("Triggers".into(), LAUNCHER_SERVICE_UNIT.into());
+        values.insert("FileDescriptorName".into(), "substituted".into());
+        assert!(require(&values, "FileDescriptorName", "ota-launcher-listener").is_err());
     }
 
     #[test]
@@ -542,6 +569,21 @@ mod tests {
                 &["cap_kill", "cap_setuid", "cap_sys_ptrace"],
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn launcher_runtime_writable_paths_include_distinct_replay_stores() {
+        let repositories = vec![PathBuf::from("/srv/repository")];
+        assert_eq!(
+            launcher_writable_paths(&repositories, false),
+            vec![
+                Path::new("/run/ota/authority-launcher"),
+                Path::new("/var/lib/ota/authority-launcher"),
+                Path::new(CAPABILITY_OBSERVATION_REPLAY_DIRECTORY),
+                Path::new(AUTHORITY_SNAPSHOT_REPLAY_DIRECTORY),
+                Path::new("/srv/repository"),
+            ]
         );
     }
 }

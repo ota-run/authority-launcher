@@ -26,6 +26,171 @@ const RECOVERY_WORKFLOW: &str =
     include_str!("../.github/workflows/systemd-v3-independently-administered-recovery.yml");
 const RECOVERY_TRIGGER_WORKFLOW: &str =
     include_str!("../.github/workflows/systemd-v3-independently-administered-recovery-trigger.yml");
+const SELECTED_EXECUTION_WORKFLOW: &str =
+    include_str!("../.github/workflows/systemd-v3-execution-disabled.yml");
+const ROOT_BOUNDARY_WORKFLOW: &str = include_str!("../.github/workflows/root-boundary.yml");
+const CARGO_TOML: &str = include_str!("../Cargo.toml");
+const SYSTEMD_SERVICE_SOURCE: &str = include_str!("../src/systemd_service.rs");
+
+#[test]
+fn same_child_bindings_use_canonical_public_installation_evidence() {
+    assert_eq!(
+        SYSTEMD_SERVICE_SOURCE
+            .matches("load_public_installation_evidence_identity(")
+            .count(),
+        5,
+        "prelude, V1, V2, V3, and V4 must each reload canonical public installation evidence",
+    );
+    assert!(
+        !SYSTEMD_SERVICE_SOURCE.contains("context.installation.identity.as_str(),"),
+        "the protected manifest identity is not the public installation-evidence identity",
+    );
+}
+
+#[test]
+fn same_child_v2_reuses_the_prelude_authority_context() {
+    let selected_boundary = SYSTEMD_SERVICE_SOURCE
+        .split_once("fn execute_selected_boundary(")
+        .expect("selected boundary function")
+        .1
+        .split_once("\nfn ")
+        .expect("next function boundary")
+        .0;
+    assert_eq!(
+        selected_boundary
+            .matches("RetainedProtectedLauncherAuthorityContextV1::acquire(")
+            .count(),
+        2,
+        "only the prelude and legacy V1 path may acquire authority; V2 must reuse the prelude context",
+    );
+    assert!(selected_boundary.contains("Some((derivation, observation, authority))"));
+    assert!(selected_boundary.contains("let (prelude, mut observation, authority)"));
+}
+
+#[test]
+fn selected_execution_pressure_workflow_uses_current_immutable_sources() {
+    let protocol_pin = CARGO_TOML
+        .lines()
+        .find(|line| line.starts_with("ota-authority-protocol ="))
+        .and_then(|line| line.split("rev = \"").nth(1))
+        .and_then(|value| value.split('"').next())
+        .expect("protocol Cargo pin");
+
+    assert_eq!(
+        SELECTED_EXECUTION_WORKFLOW
+            .matches("EXPECTED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}")
+            .count(),
+        1,
+        "the V3 identity gate must bind Core identity to the contract-selected setup source",
+    );
+    assert_eq!(
+        SELECTED_EXECUTION_WORKFLOW
+            .matches("EXPECTED_CORE_REVISION: ${{ steps.ota.outputs.source-git-rev }}")
+            .count(),
+        3,
+        "V3 provisioning and production-attachment gates must bind Core identity to the contract-selected setup source",
+    );
+    assert_eq!(
+        SELECTED_EXECUTION_WORKFLOW
+            .matches(&format!("EXPECTED_PROTOCOL_REVISION: {protocol_pin}"))
+            .count(),
+        4,
+        "every selected-execution gate must validate the Cargo-locked Protocol revision",
+    );
+    for unsupported_provision_argument in [
+        "--protocol-source-revision",
+        "--core-source-revision",
+        "--launcher-source-revision",
+    ] {
+        assert!(
+            !SELECTED_EXECUTION_WORKFLOW.contains(unsupported_provision_argument),
+            "the provisioner must derive source identity from its protected builds, not accept {unsupported_provision_argument}",
+        );
+    }
+    assert_eq!(
+        SELECTED_EXECUTION_WORKFLOW
+            .matches(".protocol_source_revision == $protocol")
+            .count(),
+        2,
+        "both provisioned installation records must reconcile Protocol source identity",
+    );
+    assert_eq!(
+        SELECTED_EXECUTION_WORKFLOW
+            .matches(".core_source_revision == $core")
+            .count(),
+        2,
+        "both provisioned installation records must reconcile Core source identity",
+    );
+    assert_eq!(
+        SELECTED_EXECUTION_WORKFLOW
+            .matches(".launcher_source_revision == $launcher")
+            .count(),
+        2,
+        "both provisioned installation records must reconcile Launcher source identity",
+    );
+    assert_eq!(
+        SELECTED_EXECUTION_WORKFLOW
+            .matches(".installation_manifest == $manifest[0]")
+            .count(),
+        2,
+        "both public records must bind the protected installation manifest",
+    );
+    assert_eq!(
+        SELECTED_EXECUTION_WORKFLOW
+            .matches("sudo cp /var/lib/ota/authority-launcher-public/installation-evidence.json")
+            .count(),
+        2,
+        "both provision steps must retain the public installation record",
+    );
+}
+
+#[test]
+fn root_boundary_workflow_retains_root_owned_store_fixture_coverage() {
+    assert!(ROOT_BOUNDARY_WORKFLOW.contains("Prove root-owned Authority store fixtures"));
+    assert!(!ROOT_BOUNDARY_WORKFLOW.contains(
+        "cargo test --locked --features secret-delivery-pressure,protected-attestor --lib protected_launcher_capability::linux_tests:: -- --ignored"
+    ));
+    assert!(ROOT_BOUNDARY_WORKFLOW.contains(
+        "cargo test --locked --features secret-delivery-pressure,protected-attestor --lib \"$test_name\" -- --ignored --exact"
+    ));
+
+    for test_name in [
+        "protected_launcher_capability::linux_tests::retained_authority_snapshot_v2_reconciles_exact_request_and_stores",
+        "protected_launcher_capability::linux_tests::retained_authority_bundle_verifies_signature_and_descriptor_bytes",
+        "protected_launcher_capability::linux_tests::retained_authority_bundle_refuses_structurally_valid_wrong_signature",
+        "protected_launcher_capability::linux_tests::retained_authority_bundle_refuses_weak_keys_and_protocol_substitutions",
+        "protected_launcher_capability::linux_tests::authority_stores_are_opened_beneath_retained_descriptors",
+        "protected_launcher_capability::linux_tests::authority_store_aliases_and_writable_directories_refuse",
+        "protected_launcher_capability::linux_tests::fifo_store_refuses_without_blocking",
+    ] {
+        assert!(
+            ROOT_BOUNDARY_WORKFLOW.contains(test_name),
+            "root-boundary workflow must prove {test_name}"
+        );
+    }
+    assert!(ROOT_BOUNDARY_WORKFLOW.contains(
+        "^test result: ok\\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;"
+    ));
+    let public_namespace_step = ROOT_BOUNDARY_WORKFLOW
+        .split_once("      - name: Prove root-owned public namespace establishment")
+        .expect("root-boundary workflow must retain public namespace proof")
+        .1
+        .split_once("\n      - name:")
+        .expect("public namespace proof must remain a distinct workflow step")
+        .0;
+    assert!(public_namespace_step.contains("sudo env"));
+    let public_namespace_command = "cargo test --locked --bin ota-authority-launcher --features systemd-v3-pressure-provision,protected-attestor pressure_provision::tests::root_public_namespace_creation_honors_umask_and_refuses_takeover -- --ignored --exact";
+    assert_eq!(
+        public_namespace_step
+            .matches(public_namespace_command)
+            .count(),
+        1,
+        "root-boundary workflow must run the exact root namespace regression"
+    );
+    assert!(public_namespace_step.contains(
+        "^test result: ok\\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;"
+    ));
+}
 
 #[test]
 fn independent_pressure_workflow_retains_a_narrow_drift_guard() {
@@ -57,7 +222,8 @@ fn independent_pressure_workflow_retains_a_narrow_drift_guard() {
     assert!(!WORKFLOW.contains("pull_request:"));
     assert!(WORKFLOW.contains("ota-authority-independent"));
     assert!(WORKFLOW.contains("/usr/lib/ota-authority/bin/ota-authority-systemd-client"));
-    assert!(WORKFLOW.contains("/usr/share/ota/authority-launcher/installation-evidence.json"));
+    assert!(WORKFLOW.contains("/var/lib/ota/authority-launcher-public/installation-evidence.json"));
+    assert!(!WORKFLOW.contains("/usr/share/ota/authority-launcher"));
     assert!(WORKFLOW.contains("--source systemd_protected_launcher"));
     assert!(WORKFLOW.contains("/etc/systemd/system/ota-authority-pressure-runner.service"));
     assert!(WORKFLOW.contains("repository entry is writable or aliased"));
@@ -68,11 +234,30 @@ fn independent_pressure_workflow_retains_a_narrow_drift_guard() {
     assert!(WORKFLOW.contains("inactive_or_not_found_before_mutation"));
     assert!(WORKFLOW.contains("no_loaded_systemd_socket_unit_owns_managed_path_before_mutation"));
     assert!(WORKFLOW.contains("expected_authority_state_paths"));
+    assert!(WORKFLOW.contains("\"/var/lib/ota/authority-launcher/capability-observation-replay\""));
+    assert!(WORKFLOW.contains("\"/var/lib/ota/authority-launcher/authority-snapshot-replay\""));
+    assert!(WORKFLOW.contains(
+        "\"/var/lib/ota/authority-launcher/capability-observation-replay\",\n              \"/var/lib/ota/authority-launcher/authority-snapshot-replay\",\n              \"/etc/ota/secret-delivery\",\n              \"/run/ota/authority-launcher\""
+    ));
     assert!(WORKFLOW.contains("/run/ota/authority-history.sock"));
     assert!(WORKFLOW.contains("prepared runner publication gate is invalid"));
     assert!(WORKFLOW.contains("core_source_revision == $commit"));
     assert!(!WORKFLOW.contains("core_source_revision | startswith"));
     assert!(WORKFLOW.contains("job-principal process escaped protected runner cgroup"));
+    assert!(WORKFLOW.contains(concat!(
+        "--repository \"$PRESSURE_REPOSITORY\" \\\n",
+        "            --json -- run governed --grant \"$AUTHORITY_ID\" --receipt"
+    )));
+    assert!(
+        !WORKFLOW.contains("-- --json run governed"),
+        "the client JSON flag must remain before its delimiter"
+    );
+    assert!(
+        !WORKFLOW.contains("cat \"$PRESSURE_REPOSITORY/selected-work-executed\""),
+        "the job principal must not read execution-principal output directly"
+    );
+    assert!(WORKFLOW.contains("--slurpfile client \"$EVIDENCE_DIR/production-client.json\""));
+    assert!(WORKFLOW.contains(".archives[0].archive_identity == $receipt_archive_identity"));
 }
 
 #[test]
@@ -142,7 +327,19 @@ fn independent_recovery_trigger_is_runner_owned_and_non_administrative() {
     assert!(!RECOVERY_TRIGGER_WORKFLOW.contains("pull_request:"));
     assert!(RECOVERY_TRIGGER_WORKFLOW.contains("ota-authority-independent"));
     assert!(RECOVERY_TRIGGER_WORKFLOW.contains("ota-authority-systemd-client"));
-    assert!(RECOVERY_TRIGGER_WORKFLOW.contains("--administrator-controlled-recovery"));
+    assert!(RECOVERY_TRIGGER_WORKFLOW.contains(concat!(
+        "--repository \"$PRESSURE_REPOSITORY\" \\\n",
+        "            --json --administrator-controlled-recovery -- \\\n",
+        "            run governed --grant \"$AUTHORITY_ID\" --receipt"
+    )));
+    assert!(
+        !RECOVERY_TRIGGER_WORKFLOW.contains("-- --json"),
+        "the client JSON flag must remain before its delimiter"
+    );
+    assert!(
+        !RECOVERY_TRIGGER_WORKFLOW.contains("-- --administrator-controlled-recovery"),
+        "the recovery policy must remain client-owned before its delimiter"
+    );
     assert!(RECOVERY_TRIGGER_WORKFLOW.contains("output_incomplete"));
     assert!(RECOVERY_TRIGGER_WORKFLOW.contains("launcher_service_unavailable"));
     assert!(

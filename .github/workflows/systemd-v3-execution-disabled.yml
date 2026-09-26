@@ -58,7 +58,7 @@ jobs:
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/systemd-v3-evidence
           EXPECTED_OTA_REVISION: ${{ steps.ota.outputs.source-git-rev }}
-          EXPECTED_PROTOCOL_REVISION: 04a199a1eddd72b5b61958e0fe7f2d4e662e05cf
+          EXPECTED_PROTOCOL_REVISION: e819f95890ea23ae2f336a59fb3ff62cfa858d8b
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR"
@@ -89,7 +89,7 @@ jobs:
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/systemd-v3-evidence
           EXPECTED_CORE_REVISION: ${{ steps.ota.outputs.source-git-rev }}
-          EXPECTED_PROTOCOL_REVISION: 04a199a1eddd72b5b61958e0fe7f2d4e662e05cf
+          EXPECTED_PROTOCOL_REVISION: e819f95890ea23ae2f336a59fb3ff62cfa858d8b
           PRESSURE_REPOSITORY: /srv/ota-v3-pressure
         run: |
           set -euo pipefail
@@ -151,9 +151,6 @@ jobs:
             --broker-decision-binary /usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer \
             --ota-binary /usr/lib/ota-authority/bin/ota \
             --pressure-client-binary /usr/lib/ota-authority/bin/ota-authority-systemd-pressure-client \
-            --protocol-source-revision "$EXPECTED_PROTOCOL_REVISION" \
-            --core-source-revision "$EXPECTED_CORE_REVISION" \
-            --launcher-source-revision "$(git rev-parse HEAD)" \
             | tee "$EVIDENCE_DIR/provision.txt"
 
           sha256sum \
@@ -166,6 +163,8 @@ jobs:
             > "$EVIDENCE_DIR/installed-binaries.sha256"
           sudo cp /etc/ota/authority-launcher-installation.json \
             "$EVIDENCE_DIR/installation-manifest.json"
+          sudo cp /var/lib/ota/authority-launcher-public/installation-evidence.json \
+            "$EVIDENCE_DIR/public-installation-evidence.json"
           sudo cp /etc/ota/authority-attestor-verifiers.json \
             "$EVIDENCE_DIR/attestor-verifiers.json"
           sudo cp /etc/ota/crossing-brokers.json \
@@ -174,9 +173,21 @@ jobs:
             "$EVIDENCE_DIR/protected-history-binding.json"
           sudo chown "$(id -u):$(id -g)" \
             "$EVIDENCE_DIR/installation-manifest.json" \
+            "$EVIDENCE_DIR/public-installation-evidence.json" \
             "$EVIDENCE_DIR/attestor-verifiers.json" \
             "$EVIDENCE_DIR/broker-verifier-binding.json" \
             "$EVIDENCE_DIR/protected-history-binding.json"
+          jq -e \
+            --slurpfile manifest "$EVIDENCE_DIR/installation-manifest.json" \
+            --arg protocol "$EXPECTED_PROTOCOL_REVISION" \
+            --arg core "$EXPECTED_CORE_REVISION" \
+            --arg launcher "$(git rev-parse HEAD)" \
+            '.schema_version == 1
+             and .protocol_source_revision == $protocol
+             and .core_source_revision == $core
+             and .launcher_source_revision == $launcher
+             and .installation_manifest == $manifest[0]' \
+            "$EVIDENCE_DIR/public-installation-evidence.json"
           jq -e \
             '.schema_version == 1
              and (.bindings | length) == 1
@@ -1486,8 +1497,8 @@ jobs:
       - name: Build and verify immutable sources
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/production-attachment-evidence
-          EXPECTED_CORE_REVISION: d9d424168b1c1dad48351651c610789e54f74dcf
-          EXPECTED_PROTOCOL_REVISION: 04a199a1eddd72b5b61958e0fe7f2d4e662e05cf
+          EXPECTED_CORE_REVISION: ${{ steps.ota.outputs.source-git-rev }}
+          EXPECTED_PROTOCOL_REVISION: e819f95890ea23ae2f336a59fb3ff62cfa858d8b
         run: |
           set -euo pipefail
           mkdir -p "$EVIDENCE_DIR"
@@ -1511,8 +1522,8 @@ jobs:
       - name: Provision production attachment boundary
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/production-attachment-evidence
-          EXPECTED_CORE_REVISION: d9d424168b1c1dad48351651c610789e54f74dcf
-          EXPECTED_PROTOCOL_REVISION: 04a199a1eddd72b5b61958e0fe7f2d4e662e05cf
+          EXPECTED_CORE_REVISION: ${{ steps.ota.outputs.source-git-rev }}
+          EXPECTED_PROTOCOL_REVISION: e819f95890ea23ae2f336a59fb3ff62cfa858d8b
           PRESSURE_REPOSITORY: /srv/ota-production-attachment
         run: |
           set -euo pipefail
@@ -1565,13 +1576,12 @@ jobs:
             --broker-decision-binary /usr/lib/ota-authority/bin/ota-authority-systemd-decision-peer \
             --ota-binary /usr/lib/ota-authority/bin/ota \
             --pressure-client-binary /usr/lib/ota-authority/bin/ota-authority-systemd-client \
-            --protocol-source-revision "$EXPECTED_PROTOCOL_REVISION" \
-            --core-source-revision "$EXPECTED_CORE_REVISION" \
-            --launcher-source-revision "$(git rev-parse HEAD)" \
             --production-client \
             | tee "$EVIDENCE_DIR/provision.txt"
           sudo cp /etc/ota/authority-launcher-installation.json \
             "$EVIDENCE_DIR/installation-manifest.json"
+          sudo cp /var/lib/ota/authority-launcher-public/installation-evidence.json \
+            "$EVIDENCE_DIR/public-installation-evidence.json"
           sudo cp /etc/ota/authority-history.json \
             "$EVIDENCE_DIR/protected-history-binding.json"
           sudo cp /etc/ota/authority-attestor-verifiers.json \
@@ -1581,6 +1591,17 @@ jobs:
           sudo cp /etc/ota/authority-launcher-systemd.json \
             "$EVIDENCE_DIR/launcher-binding.json"
           sudo chown "$(id -u):$(id -g)" "$EVIDENCE_DIR"/*.json
+          jq -e \
+            --slurpfile manifest "$EVIDENCE_DIR/installation-manifest.json" \
+            --arg protocol "$EXPECTED_PROTOCOL_REVISION" \
+            --arg core "$EXPECTED_CORE_REVISION" \
+            --arg launcher "$(git rev-parse HEAD)" \
+            '.schema_version == 1
+             and .protocol_source_revision == $protocol
+             and .core_source_revision == $core
+             and .launcher_source_revision == $launcher
+             and .installation_manifest == $manifest[0]' \
+            "$EVIDENCE_DIR/public-installation-evidence.json"
           jq -e \
             '.schema_version == 1
              and .installed_client_path == "/usr/lib/ota-authority/bin/ota"

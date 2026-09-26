@@ -36,8 +36,11 @@ use ota_authority_protocol::{
     LauncherAttestationSigningRequestV1, LauncherAttestationSigningResponseV1,
     LauncherFinalizationArchiveSidecarV1, LauncherFinalizationArchiveSigningRequestV1,
     LauncherFinalizationArchiveSigningResponseV1, LauncherFinalizationSigningRequestV1,
-    LauncherFinalizationSigningResponseV1, domain_separated, launcher_attestation_claims_v3,
-    launcher_attestation_claims_v3_identity, launcher_attestation_producer_binding_v1_identity,
+    LauncherFinalizationSigningResponseV1, ProtectedLauncherCapabilityObservationSigningRequestV1,
+    ProtectedLauncherCapabilityObservationSigningResponseV1,
+    ProtectedLauncherCapabilityProjectionVerifierV1, domain_separated,
+    launcher_attestation_claims_v3, launcher_attestation_claims_v3_identity,
+    launcher_attestation_producer_binding_v1_identity,
     launcher_attestation_signing_response_v1_identity,
     launcher_execution_finalization_signature_bytes_v1,
     launcher_finalization_archive_sidecar_v1_identity,
@@ -45,12 +48,16 @@ use ota_authority_protocol::{
     launcher_finalization_archive_signing_request_v1_identity,
     launcher_finalization_archive_signing_response_v1_identity,
     launcher_finalization_signing_request_v1_identity,
-    launcher_finalization_signing_response_v1_identity, sha256_identity,
+    launcher_finalization_signing_response_v1_identity,
+    protected_launcher_capability_observation_signature_message_v1,
+    protected_launcher_capability_projection_key_identity_v1,
+    reconcile_protected_launcher_capability_observation_signing_response_v1, sha256_identity,
     signed_launcher_execution_finalization_v1_identity,
     signed_launcher_finalization_archive_v1_identity,
     validate_launcher_attestation_producer_binding_v1,
     validate_launcher_attestation_signing_request_v1,
     validate_launcher_attestation_signing_response_v1,
+    validate_protected_launcher_capability_projection_verifier_v1,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -139,6 +146,88 @@ pub fn request_attestation(
         return Err(AttestationClientError::TransportUnavailable);
     }
     Ok(response)
+}
+
+pub(crate) fn request_capability_observation_signature(
+    binding: &LauncherAttestationProducerBindingV1,
+    verifier: &ProtectedLauncherCapabilityProjectionVerifierV1,
+    request: &ProtectedLauncherCapabilityObservationSigningRequestV1,
+) -> Result<ProtectedLauncherCapabilityObservationSigningResponseV1, AttestationClientError> {
+    validate_protected_launcher_capability_projection_verifier_v1(verifier)
+        .map_err(|_| AttestationClientError::InvalidResponse)?;
+    if request.producer_binding_identity != binding.identity
+        || request.verifier_identity != verifier.identity
+        || verifier.public_key != binding.signing_public_key
+        || protected_launcher_capability_projection_key_identity_v1(&verifier.public_key)
+            .map_err(|_| AttestationClientError::InvalidResponse)?
+            != verifier.key_identity
+    {
+        return Err(AttestationClientError::InvalidResponse);
+    }
+    let connection = pressure_client_stage("capability_connect", connect_seqpacket(binding))?;
+    let request_bytes =
+        serde_jcs::to_vec(request).map_err(|_| AttestationClientError::InvalidResponse)?;
+    pressure_client_stage(
+        "capability_request_packet",
+        send_packet(&connection, &request_bytes),
+    )?;
+    let response_bytes = pressure_client_stage(
+        "capability_response_packet",
+        receive_packet(&connection, binding.maximum_request_bytes),
+    )?;
+    let producer = pressure_client_stage("capability_producer", observe_producer(binding))?;
+    pressure_client_stage(
+        "capability_producer_before_verify",
+        revalidate_producer(&producer, binding),
+    )?;
+    pressure_client_stage(
+        "capability_queued_response",
+        reject_queued_packet(&connection),
+    )?;
+    let response: ProtectedLauncherCapabilityObservationSigningResponseV1 =
+        serde_json::from_slice(&response_bytes)
+            .map_err(|_| AttestationClientError::InvalidResponse)?;
+    if serde_jcs::to_vec(&response).map_err(|_| AttestationClientError::InvalidResponse)?
+        != response_bytes
+    {
+        return Err(AttestationClientError::InvalidResponse);
+    }
+    verify_capability_observation_signature_response(verifier, request, &response)?;
+    pressure_client_stage(
+        "capability_producer_after_verify",
+        revalidate_producer(&producer, binding),
+    )?;
+    Ok(response)
+}
+
+pub(crate) fn verify_capability_observation_signature_response(
+    verifier: &ProtectedLauncherCapabilityProjectionVerifierV1,
+    request: &ProtectedLauncherCapabilityObservationSigningRequestV1,
+    response: &ProtectedLauncherCapabilityObservationSigningResponseV1,
+) -> Result<(), AttestationClientError> {
+    reconcile_protected_launcher_capability_observation_signing_response_v1(request, response)
+        .map_err(|_| AttestationClientError::InvalidResponse)?;
+    if response.projection.payload.signing_key_identity != verifier.key_identity {
+        return Err(AttestationClientError::InvalidResponse);
+    }
+    let signature = URL_SAFE_NO_PAD
+        .decode(&response.projection.signature)
+        .ok()
+        .and_then(|bytes| Signature::from_slice(&bytes).ok())
+        .ok_or(AttestationClientError::InvalidResponse)?;
+    let message = protected_launcher_capability_observation_signature_message_v1(
+        &response.projection.projection_identity,
+    )
+    .map_err(|_| AttestationClientError::InvalidResponse)?;
+    let public_key = URL_SAFE_NO_PAD
+        .decode(&verifier.public_key)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .and_then(|bytes| VerifyingKey::from_bytes(&bytes).ok())
+        .ok_or(AttestationClientError::InvalidResponse)?;
+    public_key
+        .verify(&message, &signature)
+        .map_err(|_| AttestationClientError::InvalidResponse)
 }
 
 pub fn request_finalization(

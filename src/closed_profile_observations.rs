@@ -44,7 +44,10 @@ use crate::config::{
     RunAs, SystemdJobPrincipalClosedProfileV1, SystemdLauncherServiceConfigV1,
     SystemdPrincipalMappingV1,
 };
-use crate::installation_manifest::{ProtectedInstallationManifestV1, ProtectedInstallationRoleV1};
+use crate::installation_manifest::{
+    ProtectedInstallationManifestV1, ProtectedInstallationRoleV1,
+    resolve_optional_protected_executable_alias,
+};
 use crate::systemd_runtime_observations::{show_properties, value};
 use ota_authority_launcher::linux_observations::{
     ObservedSessionPeer, revalidate_connected_peer, verify_peer_process_status,
@@ -548,16 +551,31 @@ fn verify_sudo_policy(
     installation: &ProtectedInstallationManifestV1,
     mapping: &SystemdPrincipalMappingV1,
 ) -> Result<String, ClosedProfileObservationError> {
+    verify_sudo_policy_at(
+        installation,
+        mapping,
+        Path::new(CANONICAL_SUDO_PATH),
+        0,
+        Path::new("/"),
+    )
+}
+
+fn verify_sudo_policy_at(
+    installation: &ProtectedInstallationManifestV1,
+    mapping: &SystemdPrincipalMappingV1,
+    alias: &Path,
+    expected_owner_uid: u32,
+    trusted_root: &Path,
+) -> Result<String, ClosedProfileObservationError> {
     let configured = installation
         .optional_singular_path(ProtectedInstallationRoleV1::SudoExecutable)
         .map_err(|_| ClosedProfileObservationError::Mismatch)?;
-    let canonical = Path::new(CANONICAL_SUDO_PATH);
-    let exists = canonical
-        .try_exists()
-        .map_err(|_| ClosedProfileObservationError::Unavailable)?;
-    match (configured, exists) {
-        (None, false) => identity("sudo-absent", &CANONICAL_SUDO_PATH),
-        (Some(path), true) if path == canonical => {
+    let observed =
+        resolve_optional_protected_executable_alias(alias, expected_owner_uid, trusted_root)
+            .map_err(|_| ClosedProfileObservationError::Mismatch)?;
+    match (configured, observed.as_deref()) {
+        (None, None) => identity("sudo-absent", &alias),
+        (Some(path), Some(observed)) if path == observed => {
             let mut outcomes = Vec::new();
             for uid in [mapping.job_peer.uid, mapping.execution.uid] {
                 let (name, _, _) = passwd_entry(uid)?;
@@ -1315,7 +1333,7 @@ fn job_key(requirement: SystemdJobPrincipalRequirement) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::os::unix::process::ExitStatusExt;
 
     use tempfile::tempdir;
@@ -1406,6 +1424,52 @@ mod tests {
         let mut wrong_user = denied;
         wrong_user.stdout = b"User other is not allowed to run sudo on runner.\n".to_vec();
         assert!(!sudo_listing_denies_user(&wrong_user, "ota-job"));
+    }
+
+    #[test]
+    fn sudo_policy_reconciles_an_alias_to_its_protected_target() {
+        use crate::installation_manifest::ProtectedInstallationFileV1;
+
+        let root = tempdir().expect("temporary protected root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755))
+            .expect("protected root permissions");
+        let target = root.path().join("sudo-target");
+        fs::write(
+            &target,
+            b"#!/bin/sh\nprintf 'User %s is not allowed to run sudo on test.\\n' \"$4\"\n",
+        )
+        .expect("sudo fixture");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
+            .expect("sudo fixture permissions");
+        let alias = root.path().join("sudo");
+        symlink(&target, &alias).expect("sudo alias");
+        let mut installation = ProtectedInstallationManifestV1 {
+            schema_version: 1,
+            identity: String::new(),
+            launcher_configuration_identity: String::new(),
+            launcher_profile_identity: String::new(),
+            job_principal_profile_identity: String::new(),
+            files: vec![ProtectedInstallationFileV1 {
+                role: ProtectedInstallationRoleV1::SudoExecutable,
+                path: target.clone(),
+                identity: String::new(),
+            }],
+        };
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        let mapping = SystemdPrincipalMappingV1 {
+            authority_id: String::from("test"),
+            job_peer: crate::config::SessionPeer { uid, gid },
+            execution: RunAs { uid, gid },
+            closed_profile: None,
+        };
+
+        assert!(verify_sudo_policy_at(&installation, &mapping, &alias, uid, root.path()).is_ok());
+        installation.files[0].path = alias.clone();
+        assert_eq!(
+            verify_sudo_policy_at(&installation, &mapping, &alias, uid, root.path()),
+            Err(ClosedProfileObservationError::Mismatch)
+        );
     }
 
     #[test]

@@ -74,6 +74,227 @@ jobs:
             CARGO_TARGET_DIR="$ROOT_TEST_TARGET" \
             cargo test unix::tests::root_launch_drops_uid_gid_and_supplementary_groups -- --exact
 
+      - name: Prove retained protected Launcher authority installation
+        env:
+          AUTHORITY_CONTEXT_TEST_TARGET: ${{ runner.temp }}/protected-launcher-authority-context-target
+          AUTHORITY_CONTEXT_TEST_OUTPUT: ${{ runner.temp }}/protected-launcher-authority-context-test.txt
+        run: |
+          set -euo pipefail
+          cargo_bin_dir=$(dirname "$(command -v cargo)")
+          observed_rustup_home=$(rustup show home)
+          test_status=0
+          sudo env \
+            PATH="$cargo_bin_dir:/usr/bin:/bin" \
+            RUSTUP_HOME="$observed_rustup_home" \
+            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            CARGO_TARGET_DIR="$AUTHORITY_CONTEXT_TEST_TARGET" \
+            /bin/bash -c \
+              'cargo test --locked --all-features --lib installation_manifest::tests::manifest_binds_every_required_protected_file_and_refuses_substitution -- --exact > "$1" 2>&1' \
+              _ "$AUTHORITY_CONTEXT_TEST_OUTPUT" || test_status=$?
+          cat "$AUTHORITY_CONTEXT_TEST_OUTPUT"
+          test "$test_status" -eq 0
+          test "$(grep -Fxc \
+            'test installation_manifest::tests::manifest_binds_every_required_protected_file_and_refuses_substitution ... ok' \
+            "$AUTHORITY_CONTEXT_TEST_OUTPUT")" -eq 1
+          test "$(grep -Ec \
+            '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' \
+            "$AUTHORITY_CONTEXT_TEST_OUTPUT")" -eq 1
+
+      - name: Prove root-owned Authority store fixtures
+        env:
+          ROOT_OWNED_STORE_TEST_TARGET: ${{ runner.temp }}/root-owned-authority-store-target
+          ROOT_OWNED_STORE_TEST_OUTPUT: ${{ runner.temp }}/root-owned-authority-store-test.txt
+        run: |
+          set -euo pipefail
+          cargo_bin_dir=$(dirname "$(command -v cargo)")
+          observed_rustup_home=$(rustup show home)
+          test_status=0
+          sudo env \
+            PATH="$cargo_bin_dir:/usr/bin:/bin" \
+            RUSTUP_HOME="$observed_rustup_home" \
+            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            CARGO_TARGET_DIR="$ROOT_OWNED_STORE_TEST_TARGET" \
+            /bin/bash -c \
+              'set -euo pipefail
+               : > "$1"
+               for test_name in \
+                 protected_launcher_capability::linux_tests::retained_authority_snapshot_v2_reconciles_exact_request_and_stores \
+                 protected_launcher_capability::linux_tests::retained_authority_bundle_verifies_signature_and_descriptor_bytes \
+                 protected_launcher_capability::linux_tests::retained_authority_bundle_refuses_structurally_valid_wrong_signature \
+                 protected_launcher_capability::linux_tests::retained_authority_bundle_refuses_weak_keys_and_protocol_substitutions \
+                 protected_launcher_capability::linux_tests::authority_stores_are_opened_beneath_retained_descriptors \
+                 protected_launcher_capability::linux_tests::authority_store_aliases_and_writable_directories_refuse \
+                 protected_launcher_capability::linux_tests::fifo_store_refuses_without_blocking
+               do
+                 cargo test --locked --features secret-delivery-pressure,protected-attestor --lib "$test_name" -- --ignored --exact >> "$1" 2>&1
+               done' \
+              _ "$ROOT_OWNED_STORE_TEST_OUTPUT" || test_status=$?
+          cat "$ROOT_OWNED_STORE_TEST_OUTPUT"
+          test "$test_status" -eq 0
+          for test_name in \
+            protected_launcher_capability::linux_tests::retained_authority_snapshot_v2_reconciles_exact_request_and_stores \
+            protected_launcher_capability::linux_tests::retained_authority_bundle_verifies_signature_and_descriptor_bytes \
+            protected_launcher_capability::linux_tests::retained_authority_bundle_refuses_structurally_valid_wrong_signature \
+            protected_launcher_capability::linux_tests::retained_authority_bundle_refuses_weak_keys_and_protocol_substitutions \
+            protected_launcher_capability::linux_tests::authority_stores_are_opened_beneath_retained_descriptors \
+            protected_launcher_capability::linux_tests::authority_store_aliases_and_writable_directories_refuse \
+            protected_launcher_capability::linux_tests::fifo_store_refuses_without_blocking
+          do
+            test "$(grep -Fxc \
+              "test $test_name ... ok" \
+              "$ROOT_OWNED_STORE_TEST_OUTPUT")" -eq 1
+          done
+          test "$(grep -Ec \
+            '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' \
+            "$ROOT_OWNED_STORE_TEST_OUTPUT")" -eq 7
+
+      - name: Prove root-owned public namespace establishment
+        env:
+          PUBLIC_NAMESPACE_TEST_TARGET: ${{ runner.temp }}/public-namespace-target
+          PUBLIC_NAMESPACE_TEST_OUTPUT: ${{ runner.temp }}/public-namespace-test.txt
+        run: |
+          set -euo pipefail
+          cargo_bin_dir=$(dirname "$(command -v cargo)")
+          observed_rustup_home=$(rustup show home)
+          test_status=0
+          sudo env \
+            PATH="$cargo_bin_dir:/usr/bin:/bin" \
+            RUSTUP_HOME="$observed_rustup_home" \
+            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            CARGO_TARGET_DIR="$PUBLIC_NAMESPACE_TEST_TARGET" \
+            /bin/bash -c \
+              'cargo test --locked --bin ota-authority-launcher --features systemd-v3-pressure-provision,protected-attestor pressure_provision::tests::root_public_namespace_creation_honors_umask_and_refuses_takeover -- --ignored --exact > "$1" 2>&1' \
+              _ "$PUBLIC_NAMESPACE_TEST_OUTPUT" || test_status=$?
+          cat "$PUBLIC_NAMESPACE_TEST_OUTPUT"
+          test "$test_status" -eq 0
+          test "$(grep -Fxc \
+            'test pressure_provision::tests::root_public_namespace_creation_honors_umask_and_refuses_takeover ... ok' \
+            "$PUBLIC_NAMESPACE_TEST_OUTPUT")" -eq 1
+          test "$(grep -Ec \
+            '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' \
+            "$PUBLIC_NAMESPACE_TEST_OUTPUT")" -eq 1
+
+      - name: Prove retained protected-launcher capability derivation
+        env:
+          CAPABILITY_TEST_TARGET: ${{ runner.temp }}/protected-launcher-capability-target
+          CAPABILITY_TEST_OUTPUT: ${{ runner.temp }}/protected-launcher-capability-test.txt
+        run: |
+          set -euo pipefail
+          verifier_source=$(mktemp)
+          binding_source=$(mktemp)
+          cleanup() {
+            rm -f "$verifier_source" "$binding_source"
+            sudo rm -f \
+              /etc/ota/secret-delivery/verifiers-v1.json \
+              /etc/ota/secret-delivery/bindings-v1.json
+            sudo rmdir /etc/ota/secret-delivery 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          printf '%s\n' '{"schema_version":1,"verifiers":[]}' > "$verifier_source"
+          printf '%s\n' '{"schema_version":1,"bindings":[]}' > "$binding_source"
+          sudo install -d -o root -g root -m 0700 /etc/ota/secret-delivery
+          sudo install -o root -g root -m 0400 \
+            "$verifier_source" /etc/ota/secret-delivery/verifiers-v1.json
+          sudo install -o root -g root -m 0400 \
+            "$binding_source" /etc/ota/secret-delivery/bindings-v1.json
+          cargo_bin_dir=$(dirname "$(command -v cargo)")
+          observed_rustup_home=$(rustup show home)
+          capability_test_status=0
+          sudo systemd-run --quiet --scope \
+            --slice=ota-authority-invocations.slice \
+            --unit=ota-authority-invocation-0123456789abcdef.scope \
+            env \
+              PATH="$cargo_bin_dir:/usr/bin:/bin" \
+              RUSTUP_HOME="$observed_rustup_home" \
+              CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+              CARGO_TARGET_DIR="$CAPABILITY_TEST_TARGET" \
+              /bin/bash -c \
+                'cargo test --locked --features secret-delivery-pressure,protected-attestor --lib protected_launcher_capability::privileged_linux_tests::retained_observation_derives_and_rejects_live_substitution -- --exact --ignored > "$1" 2>&1' \
+                _ "$CAPABILITY_TEST_OUTPUT" || capability_test_status=$?
+          cat "$CAPABILITY_TEST_OUTPUT"
+          test "$capability_test_status" -eq 0
+          test "$(grep -Fxc \
+            'test protected_launcher_capability::privileged_linux_tests::retained_observation_derives_and_rejects_live_substitution ... ok' \
+            "$CAPABILITY_TEST_OUTPUT")" -eq 1
+          test "$(grep -Ec \
+            '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' \
+            "$CAPABILITY_TEST_OUTPUT")" -eq 1
+          test "$(stat -c '%U:%G:%a' /etc/ota/secret-delivery)" = "root:root:700"
+          test "$(sudo stat -c '%U:%G:%a' /etc/ota/secret-delivery/verifiers-v1.json)" = "root:root:400"
+          test "$(sudo stat -c '%U:%G:%a' /etc/ota/secret-delivery/bindings-v1.json)" = "root:root:400"
+
+      - name: Prove production replay store across protected state mount
+        env:
+          REPLAY_TEST_TARGET: ${{ runner.temp }}/protected-launcher-replay-target
+        run: |
+          set -euo pipefail
+          replay_root=/var/lib/ota/authority-launcher
+          replay_directory="$replay_root/capability-observation-replay"
+          snapshot_replay_directory="$replay_root/authority-snapshot-replay"
+          replay_test_output="${{ runner.temp }}/protected-launcher-replay-test.txt"
+          snapshot_replay_test_output="${{ runner.temp }}/protected-authority-snapshot-replay-test.txt"
+          replay_test_metadata="${{ runner.temp }}/protected-launcher-replay-test-build.jsonl"
+          cleanup() {
+            sudo rm -rf "$replay_root"
+          }
+          trap cleanup EXIT
+          sudo install -d -o root -g root -m 0700 "$replay_directory"
+          sudo install -d -o root -g root -m 0700 "$snapshot_replay_directory"
+          mkdir -p "$REPLAY_TEST_TARGET"
+          CARGO_TARGET_DIR="$REPLAY_TEST_TARGET" cargo test \
+            --locked \
+            --features protected-attestor \
+            --lib \
+            --no-run \
+            --message-format=json > "$replay_test_metadata"
+          replay_test_binary=$(jq -sr '
+            [ .[] |
+              select(
+                .reason == "compiler-artifact" and
+                .target.name == "ota_authority_launcher" and
+                .profile.test == true and
+                .executable != null
+              ) |
+              .executable
+            ] |
+            if length == 1 then .[0] else error("expected one replay test binary") end
+          ' "$replay_test_metadata")
+          test -x "$replay_test_binary"
+          set +e
+          sudo systemd-run --quiet --wait --pipe --collect \
+            --unit=ota-authority-replay-store-test.service \
+            --property=ProtectSystem=strict \
+            --property="ReadWritePaths=$replay_root" \
+            /bin/bash -c \
+              'mountpoint -q /var/lib/ota/authority-launcher && exec "$1" protected_capability_observation::tests::production_replay_store_opens_the_verified_protected_path --exact --ignored' \
+              _ "$replay_test_binary" 2>&1 | tee "$replay_test_output"
+          replay_test_status=${PIPESTATUS[0]}
+          set -e
+          test "$replay_test_status" -eq 0
+          test "$(grep -Fxc \
+            'test protected_capability_observation::tests::production_replay_store_opens_the_verified_protected_path ... ok' \
+            "$replay_test_output")" -eq 1
+          test "$(grep -Ec \
+            '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' \
+            "$replay_test_output")" -eq 1
+          set +e
+          sudo systemd-run --quiet --wait --pipe --collect \
+            --unit=ota-authority-snapshot-replay-store-test.service \
+            --property=ProtectSystem=strict \
+            --property="ReadWritePaths=$replay_root" \
+            /bin/bash -c \
+              'mountpoint -q /var/lib/ota/authority-launcher && exec "$1" protected_authority_snapshot::tests::production_snapshot_replay_store_opens_the_verified_protected_path --exact --ignored' \
+              _ "$replay_test_binary" 2>&1 | tee "$snapshot_replay_test_output"
+          snapshot_replay_test_status=${PIPESTATUS[0]}
+          set -e
+          test "$snapshot_replay_test_status" -eq 0
+          test "$(grep -Fxc \
+            'test protected_authority_snapshot::tests::production_snapshot_replay_store_opens_the_verified_protected_path ... ok' \
+            "$snapshot_replay_test_output")" -eq 1
+          test "$(grep -Ec \
+            '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' \
+            "$snapshot_replay_test_output")" -eq 1
+
       - name: Build pressure-only signed peer
         run: cargo build --features pressure-peer --bins
 
@@ -93,6 +314,8 @@ jobs:
           sudo install -d -o root -g root -m 0755 /usr/lib/ota-authority/bin /usr/lib/ota-authority/pressure-bin
           sudo install -d -o root -g root -m 0755 /etc/ota /var/lib/ota
           sudo install -o root -g root -m 0755 "$(command -v ota)" /usr/lib/ota-authority/bin/ota-pressure-core
+          pressure_core_sha256=$(sudo sha256sum /usr/lib/ota-authority/bin/ota-pressure-core | awk '{print $1}')
+          printf 'PRESSURE_CORE_SHA256=%s\n' "$pressure_core_sha256" >> "$GITHUB_ENV"
           sudo install -o root -g root -m 0755 target/debug/ota-authority-launcher /usr/lib/ota-authority/bin/ota-authority-launcher
           sudo install -o root -g root -m 0700 target/debug/ota-authority-pressure-peer /usr/lib/ota-authority/bin/ota-authority-pressure-peer
           pressure_docker=$(mktemp)
@@ -203,7 +426,8 @@ jobs:
               test -f "$repo/broker-executed"
               (
                 cd "$repo"
-                ota receipt --history --json
+                sudo -u ota-pressure \
+                  /usr/lib/ota-authority/bin/ota-pressure-core receipt --history --json
               ) > "$EVIDENCE_DIR/live.receipt-history.json"
               jq -e '.summary.archive_count == 1 and .summary.invalid_archive_count == 0' \
                 "$EVIDENCE_DIR/live.receipt-history.json"
@@ -211,7 +435,7 @@ jobs:
               if [[ "$archive_path" != /* ]]; then
                 archive_path="$repo/$archive_path"
               fi
-              jq -e '
+              sudo jq -e '
                 .receipt.crossing.authority.authority_carrier == "authority_broker" and
                 .receipt.crossing.authority.authority_separation_posture == "protected_launcher_attested_one_use" and
                 .receipt.crossing.authority.archive_evidence.admission.binding_snapshot.schema_version == 2 and
@@ -238,7 +462,8 @@ jobs:
                 .receipt.crossing.id == .receipt.crossing.authority.transaction.transaction_id and
                 .receipt.crossing.authority.transaction.identity == .receipt.crossing.authority.archive_evidence.transaction.identity
               ' "$archive_path"
-              cp "$archive_path" "$EVIDENCE_DIR/live.receipt-archive.json"
+              sudo cp "$archive_path" "$EVIDENCE_DIR/live.receipt-archive.json"
+              sudo chown "$(id -u):$(id -g)" "$EVIDENCE_DIR/live.receipt-archive.json"
             else
               if (
                 cd "$repo"
@@ -300,7 +525,7 @@ jobs:
                 insufficient-pre-wait-freshness)
                   test ! -e "$repo/.ota"
                   grep -q 'crossing_broker_admission_refused' "$output"
-                  grep -q 'pressure-peer-scenario: insufficient-pre-wait-freshness required-seconds=32 attestation-seconds=31 authorization-request=false' "$output"
+                  grep -q 'pressure-peer-scenario: insufficient-pre-wait-freshness required-seconds=40 attestation-seconds=39 authorization-request=false' "$output"
                   ;;
                 pending-ambiguous)
                   test ! -e "$repo/.ota"
@@ -365,17 +590,21 @@ jobs:
           test "$(wc -c < "$recovery_repo/broker-executed")" -eq 1
           grep -q 'pressure-peer-scenario: recovered-consumed-status' "$recovery_second"
           grep -q 'pressure-peer-scenario: recovery-consumed-then-fresh-consumed' "$recovery_second"
-          jq -s -e '
+          recovery_state_dir="$recovery_repo/.ota/state/crossings"
+          test "$(sudo find "$recovery_state_dir" -mindepth 2 -maxdepth 2 -type f -name '*.json' -print | wc -l)" -ge 1
+          sudo find "$recovery_state_dir" -mindepth 2 -maxdepth 2 -type f -name '*.json' \
+            -exec jq -s -e '
             map(select(
               .state == "incomplete" and
               .receipt_status == "broker_consumption_recovered_without_execution" and
               .broker_consumption.consume_response.payload.state == "consumed" and
               .broker_consumption_recovery.status.payload.status.state == "consumed"
             )) | length == 1
-          ' "$recovery_repo"/.ota/state/crossings/*/*.json
+          ' {} +
           (
             cd "$recovery_repo"
-            ota receipt --history --json
+            sudo -u ota-pressure \
+              /usr/lib/ota-authority/bin/ota-pressure-core receipt --history --json
           ) > "$EVIDENCE_DIR/consume-recovery.receipt-history.json"
           jq -e '.summary.archive_count == 1 and .summary.invalid_archive_count == 0' \
             "$EVIDENCE_DIR/consume-recovery.receipt-history.json"
@@ -456,7 +685,8 @@ jobs:
           test "$(grep -c '^audit$' "$catch_all_repo/broker-executed")" -eq 2
           (
             cd "$catch_all_repo"
-            ota receipt --history --json
+            sudo -u ota-pressure \
+              /usr/lib/ota-authority/bin/ota-pressure-core receipt --history --json
           ) > "$EVIDENCE_DIR/catch-all.receipt-history.json"
           jq -e '.summary.archive_count == 2 and .summary.invalid_archive_count == 0' \
             "$EVIDENCE_DIR/catch-all.receipt-history.json"
@@ -466,7 +696,7 @@ jobs:
             if [[ "$archive_path" != /* ]]; then
               archive_path="$catch_all_repo/$archive_path"
             fi
-            jq -e '
+            sudo jq -e '
               .receipt.crossing.authority.authority_carrier == "authority_broker" and
               .receipt.crossing.authority.authority_separation_posture == "protected_launcher_attested_one_use" and
               .receipt.crossing.authority.archive_evidence.admission.binding_snapshot.schema_version == 2 and
@@ -476,20 +706,25 @@ jobs:
               (.receipt.crossing.authority.archive_evidence.admission.semantic_scope.breadth.effect_categories | index("repo_write") != null) and
               (.receipt.crossing.authority.archive_evidence.admission.semantic_scope.breadth.effect_categories | index("network") != null)
             ' "$archive_path"
-            jq -r '.receipt.crossing.authority.broker.work_unit_identity' "$archive_path" \
-              >> "$EVIDENCE_DIR/catch-all.work-units"
-            cp "$archive_path" "$EVIDENCE_DIR/catch-all.receipt-archive-$archive_index.json"
+            sudo jq -r '.receipt.crossing.authority.broker.work_unit_identity' "$archive_path" \
+              | tee -a "$EVIDENCE_DIR/catch-all.work-units" >/dev/null
+            sudo cp "$archive_path" "$EVIDENCE_DIR/catch-all.receipt-archive-$archive_index.json"
+            sudo chown "$(id -u):$(id -g)" \
+              "$EVIDENCE_DIR/catch-all.receipt-archive-$archive_index.json"
             archive_index=$((archive_index + 1))
           done < <(jq -r '.archives[].archive_path' "$EVIDENCE_DIR/catch-all.receipt-history.json")
           test "$archive_index" -eq 2
           test "$(sort -u "$EVIDENCE_DIR/catch-all.work-units" | wc -l)" -eq 2
 
-          ota --version --json > "$EVIDENCE_DIR/ota-version.json"
-          observed_commit=$(jq -er '.commit' "$EVIDENCE_DIR/ota-version.json")
-          jq -e '.source_build == true and .dirty == false' \
-            "$EVIDENCE_DIR/ota-version.json"
-          test -n "$EXPECTED_OTA_REVISION"
-          test "${EXPECTED_OTA_REVISION#"$observed_commit"}" != "$EXPECTED_OTA_REVISION"
+          test -n "$PRESSURE_CORE_SHA256"
+          printf '%s\n' "$PRESSURE_CORE_SHA256" > "$EVIDENCE_DIR/ota-pressure-core.sha256"
+          observed_pressure_core_sha256=$(sudo sha256sum /usr/lib/ota-authority/bin/ota-pressure-core | awk '{print $1}')
+          printf 'expected=%s\nobserved=%s\n' \
+            "$PRESSURE_CORE_SHA256" "$observed_pressure_core_sha256" \
+            > "$EVIDENCE_DIR/ota-pressure-core-integrity.txt"
+          sudo stat -c '%U:%G:%a:%s' /usr/lib/ota-authority/bin/ota-pressure-core \
+            | tee -a "$EVIDENCE_DIR/ota-pressure-core-integrity.txt" >/dev/null
+          test "$observed_pressure_core_sha256" = "$PRESSURE_CORE_SHA256"
 
       - name: Exercise proof-wide broker authority
         env:

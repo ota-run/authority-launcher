@@ -26,6 +26,126 @@
 
 ## Unreleased
 
+- Verify V3 pressure installation source revisions from the public installation evidence and
+  require its embedded manifest to equal the protected installation manifest. Both hosted jobs
+  previously queried fields absent from the private manifest after successful provisioning.
+
+- Move public, non-secret protected-launcher records from `/usr/share` to the root-created
+  `/var/lib/ota/authority-launcher-public` sibling. The root binds the capability-projection
+  verifier, installation evidence, pressure-installation evidence, hosted-evidence captures, and
+  recovery evidence while private Launcher state remains under the separate `0700`
+  `/var/lib/ota/authority-launcher` root. Existing `/usr/share` state is neither trusted nor used as
+  migration input; a fresh provision regenerates the protected installation and public evidence
+  identities. This changes no provider, OIDC, delivery, or selected-work authority.
+
+- Pin Authority Protocol `e819f95890ea23ae2f336a59fb3ff62cfa858d8b` and add the additive
+  raw-store V2 protected-authority snapshot and V4 transaction-binding route. V1 snapshots and
+  their V2/V3 routes remain immutable. The administrator-signed protected bundle retains the
+  complete bounded transport-dependency graph and record expectation; its payload limit rises from
+  32 KiB to 40 KiB while the canonical signed bundle remains within the existing 64 KiB protected
+  store limit. Launcher structurally verifies the retained signed bundle and relays and binds only
+  the record identity through V4, refusing V1/V2/V3 substitution or replay. This activates no
+  OIDC request, provider contact, materialization, injection, selected-work execution, positive
+  evidence, Step 8, or V12.2 capability.
+
+- Pin Authority Protocol `63a352f7a926a2fed0866db0de61749fa701df75` and add the additive
+  snapshot-bound V3 transaction-binding relay. V2 remains unchanged. V3 binds one exact
+  Core-derived transport-dependency record identity through the retained selected-child session,
+  same-child prelude, protected snapshot, capability derivation, and replay consumption. Launcher
+  neither parses dependency graphs nor prepares, opens, or dispatches transport. This activates no
+  OIDC request, provider contact, materialization, injection, execution release, positive evidence,
+  Step 8, or V12.2 capability.
+
+- Add the provider-free protected-authority snapshot bridge for the selected child. Launcher opens
+  and retains the exact protected stores before child creation, revalidates their descriptors and
+  signed bytes before returning one private snapshot, and permits only the ordered snapshot then
+  V2 transaction-binding exchange. A distinct descriptor-retained root-owned replay store reserves
+  before snapshot disclosure and is consumed only after exact V2 reconciliation; failed exchanges
+  remain reserved. Ordinary non-secret completion remains compatible when protected stores are
+  unavailable. This activates no OIDC request, provider contact, materialization, injection,
+  positive evidence, Step 8, or V12.2 capability. Exact Linux/X64 service-path execution and Core
+  consumption remain required before provider contact.
+
+- Pin Authority Protocol `5b416637c763f835050f65660766efa2b432f4af` and add the
+  same-execution secret-delivery transaction-binding route. After exact signed admission and lease
+  consumption, one typed request on the selected child's inherited Launcher session is reconciled
+  against the retained startup continuation. Launcher reuses the exact child, scope, cgroup,
+  session, protected stores, authority context, installation evidence, replay state, and separate
+  Attestor to derive one private binding and signed public projection before returning control to
+  Core. Builds without `protected-attestor` refuse the typed request, and ordinary non-secret
+  completion remains unchanged. This activates no OIDC request, provider contact, materialization,
+  injection, positive delivery evidence, Step 8, or V12.2 capability; Core-side consumption and an
+  immutable Linux/X64 transaction run remain required.
+
+- Pin Authority Protocol `af543445446790b01529b6150f8219b3dec351f7` and implement the
+  `ota.authority-launcher.systemd/v4` protected boot-observation profile. The Launcher keeps
+  `ProtectProc=invisible` and `ProcSubset=pid`; systemd 253 or newer opens the canonical boot ID
+  read-only with `OpenFile=` and passes it beside the socket-activated listener under two exact
+  descriptor names. Launcher reconciles the complete named descriptor set, retains and reobserves
+  the procfs boot file, and excludes it from the selected child's exact descriptor table. V3
+  remains historical and is not reinterpreted. This activates no OIDC request, provider contact,
+  materialization, secret delivery, Step 8, or V12.2 capability. Immutable Linux/X64 execution is
+  still required.
+
+- Reconcile optional `sudo` installation aliases to one protected canonical executable across
+  pressure provisioning, the installation manifest, generated systemd read-only paths, and live
+  closed-profile observation. Hosted run
+  [34348643156](https://github.com/ota-run/authority-launcher/actions/runs/34348643156)
+  exposed the mismatch on Ubuntu 26: provisioning retained `/usr/bin/sudo` while runtime correctly
+  refused that symlink before authority execution. The failed run is not governed-invocation
+  evidence.
+- Keep `NoNewPrivileges=no` only on the already-root protected Launcher so its live closed-profile
+  observer can query the canonical sudo policy on Ubuntu's `sudo-rs`. The independently controlled
+  runner and selected execution process still require and revalidate `NoNewPrivileges=1`, empty
+  capabilities, and their exact principal boundaries. This is a pressure-boundary repair and does
+  not activate provider contact or secret delivery. A fresh immutable reprovision and hosted run
+  [34356604479](https://github.com/ota-run/authority-launcher/actions/runs/34356604479)
+  completed at exact Launcher `22f17eff3e005bb4544d583d0743721835539d0a`.
+
+- Add the protected
+  Launcher authority-context foundation. Root provisioning writes one closed administrator and
+  installed implementation-subject record, binds it as a singular protected installation role,
+  and reconciles its exact Launcher/Ota artifacts and build identities before use. The
+  crate-private capability constructor now accepts that retained context, a Launcher-generated
+  256-bit invocation nonce, and a retained, immediately reobserved boot ID instead of four
+  caller-supplied identity strings. The feature-gated production
+  observation route now accepts only the closed invocation-bound Protocol probe on the existing
+  protected socket, derives and signs one public projection from the retained stopped child,
+  cgroup, session, authority, and store observations, then confirms child and scope cleanup without
+  entering broker authorization or selected execution. The pressure provisioner now installs fixed
+  root-owned empty verifier and binding snapshots for exact descriptor and byte observation; they
+  grant no authority and prove no provider contact, materialization, or delivery. Hosted Linux/X64
+  execution remains required. Pre-scope observation refusal now distinguishes retained authority
+  context failure from replay-store failure instead of collapsing both into runtime-profile drift.
+- Retain the Linux
+  protected-attestor foundation for protected-launcher capability observation. The launcher can
+  retain the two fixed root-owned authority stores through descriptor-relative `openat2`
+  resolution, observe a retained live Unix-stream descriptor and exact invocation cgroup, and
+  revalidate retained store bytes and descriptor metadata immediately before capability derivation.
+  A fixed root-owned replay store reserves a fresh Protocol challenge before derivation and records
+  its consumed protected capability and public projection identities only after the separately
+  protected Attestor signs and Launcher reconciles the exact Protocol request and response. Raw
+  descriptor records, store bytes, and capability identity are not
+  caller-supplied inputs or public projection fields. No default launcher flow, Core consumer,
+  provider contact, or secret delivery is activated by this foundation.
+  Immutable Linux/x64 PID 1
+  [run 34241049867](https://github.com/ota-run/authority-launcher/actions/runs/34241049867),
+  job `102111003771`, binds Launcher `8ca4763c1e5c6ef5ac06c2be5b778c49344c5030`, Protocol
+  `e0af492ba8a6fbe01e805c79762909c9cda28198`, and Core
+  `f921209561b26f38cdb74c5f20f71e0b6734ae0d`. It reconciles the fixed replay path across the
+  fresh managed-state inventory and effective systemd runtime while one bounded governed
+  invocation completes with terminal cleanup and one valid protected receipt archive. This is not
+  capability-observation routing, provider-contact, OIDC, materialization, or delivery evidence.
+
+- Repair production capability-observation replay-store acquisition under the launcher's systemd
+  filesystem hardening and distribution-specific mount layouts. The opener permits mount
+  transitions only while walking the fixed absolute replay path, refuses aliases and symlinks,
+  verifies every component as root-owned and non-writable by group or world, requires the final
+  directory to be `root:root 0700`, then restores no-mount-crossing descriptor-relative resolution
+  for every replay record operation. A privileged Linux workflow regression requires the launcher
+  state root to be a real mount and exercises reservation and consumption through the production
+  path. This does not prove provider contact, OIDC, materialization, or secret delivery.
+
 - Reconcile the README with the completed bounded systemd carrier: remove stale preview/candidate
   wording, distinguish pressure-proven source from separately packaged release artifacts, and keep
   provider attestation as optional stronger hardening rather than an implied carrier property. The

@@ -39,8 +39,8 @@ jobs:
     timeout-minutes: 15
     env:
       CONTROLLER: /usr/lib/ota-authority/bin/ota-authority-systemd-recovery-controller
-      EVIDENCE_ROOT: /usr/share/ota/authority-launcher/recovery-evidence
-      INSTALLATION_EVIDENCE: /usr/share/ota/authority-launcher/installation-evidence.json
+      EVIDENCE_ROOT: /var/lib/ota/authority-launcher-public/recovery-evidence
+      INSTALLATION_EVIDENCE: /var/lib/ota/authority-launcher-public/installation-evidence.json
       OTA: /usr/lib/ota-authority/bin/ota
       PRESSURE_REPOSITORY: /srv/ota-v3-pressure
       WORKFLOW_REVISION: ${{ github.sha }}

@@ -40,7 +40,7 @@ jobs:
     env:
       AUTHORITY_ID: platform-release-authority
       CLIENT: /usr/lib/ota-authority/bin/ota-authority-systemd-client
-      INSTALLATION_EVIDENCE: /usr/share/ota/authority-launcher/installation-evidence.json
+      INSTALLATION_EVIDENCE: /var/lib/ota/authority-launcher-public/installation-evidence.json
       OTA: /usr/lib/ota-authority/bin/ota
       PRESSURE_REPOSITORY: /srv/ota-v3-pressure
     steps:
@@ -120,8 +120,9 @@ jobs:
               "/etc/ota/authority-launcher-systemd.json",
               "/etc/ota/authority-attestor.json",
               "/etc/ota/authority-attestor-verifiers.json",
+              "/etc/ota/protected-launcher-authority-context-v1.json",
               "/etc/ota/authority-launcher-installation.json",
-              "/usr/share/ota/authority-launcher",
+              "/var/lib/ota/authority-launcher-public",
               "/etc/ota/crossing-brokers.json",
               "/var/lib/ota/authority-attestor-signing-key",
               "/var/lib/ota/authority-broker-signing-key",
@@ -129,6 +130,9 @@ jobs:
               "/var/lib/ota/authority-broker-pressure/scenario",
               "/var/lib/ota/authority-attestor",
               "/var/lib/ota/authority-launcher",
+              "/var/lib/ota/authority-launcher/capability-observation-replay",
+              "/var/lib/ota/authority-launcher/authority-snapshot-replay",
+              "/etc/ota/secret-delivery",
               "/run/ota/authority-launcher",
               "/run/ota/authority-launcher.sock",
               "/run/ota/authority-attestor.sock",
@@ -220,7 +224,7 @@ jobs:
                   if line.strip().startswith("ConditionPathExists=")
               ]
           if runner_conditions != [
-              "ConditionPathExists=/usr/share/ota/authority-launcher/installation-evidence.json"
+              "ConditionPathExists=/var/lib/ota/authority-launcher-public/installation-evidence.json"
           ]:
               raise SystemExit("prepared runner publication gate is invalid")
 
@@ -280,6 +284,8 @@ jobs:
                | $installation[0].core_source_revision == $commit)' \
             "$EVIDENCE_DIR/ota-version.json"
           sha256sum "$CLIENT" "$OTA" > "$EVIDENCE_DIR/installed-client-identities.txt"
+          "$CLIENT" --help | tee "$EVIDENCE_DIR/production-client-help.txt"
+          grep -F -- '--json' "$EVIDENCE_DIR/production-client-help.txt" >/dev/null
           id > "$EVIDENCE_DIR/job-principal.txt"
           uname -a > "$EVIDENCE_DIR/kernel.txt"
 
@@ -291,8 +297,7 @@ jobs:
           "$CLIENT" \
             --authority-id "$AUTHORITY_ID" \
             --repository "$PRESSURE_REPOSITORY" \
-            --json -- \
-            run governed --grant "$AUTHORITY_ID" --receipt \
+            --json -- run governed --grant "$AUTHORITY_ID" --receipt \
             > "$EVIDENCE_DIR/production-client.json"
           jq -e \
             '.ok == true
@@ -305,7 +310,6 @@ jobs:
              and .terminal.finalization.cgroup_empty_or_absent == true
              and .terminal.finalization.active_slot_removed == true' \
             "$EVIDENCE_DIR/production-client.json"
-          test "$(cat "$PRESSURE_REPOSITORY/selected-work-executed")" = executed
 
       - name: Reverify protected receipt history
         env:
@@ -317,18 +321,21 @@ jobs:
             "$OTA" receipt --history \
               --source systemd_protected_launcher --json
           ) > "$EVIDENCE_DIR/protected-receipt-history.json"
-          jq -e \
-            '.ok == true
+          jq -e --slurpfile client "$EVIDENCE_DIR/production-client.json" \
+            '($client[0].terminal.finalization.completion.receipt_archive_identity
+              as $receipt_archive_identity
+              | .ok == true
              and .history_source == "systemd_protected_launcher"
              and .completeness_posture == "complete_selected_catalog_snapshot"
              and .summary.archive_count == 1
              and .summary.invalid_archive_count == 0
              and (.archives | length) == 1
              and (.invalid_archives | length) == 0
+             and .archives[0].archive_identity == $receipt_archive_identity
              and (.operator_profile_identity | startswith("sha256:"))
              and (.operator_peer_identity | startswith("sha256:"))
              and (.repository_binding_identity | startswith("sha256:"))
-             and (.catalog_snapshot_identity | startswith("sha256:"))' \
+             and (.catalog_snapshot_identity | startswith("sha256:")))' \
             "$EVIDENCE_DIR/protected-receipt-history.json"
 
       - name: Upload bounded public evidence

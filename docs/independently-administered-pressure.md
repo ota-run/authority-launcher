@@ -80,6 +80,11 @@ effective process capabilities, or access to Docker/host-control sockets. Its ru
 set `NoNewPrivileges=yes`. The execution account must not be able to connect to either protected
 Ota socket.
 
+The root-owned Launcher service retains `NoNewPrivileges=no` so it can use the canonical protected
+`sudo -n -l -U` policy query for both selected principals. This does not extend to repository code:
+the runner service and every selected execution process independently require and revalidate
+`NoNewPrivileges=1`, empty process capabilities, and the declared principal boundary.
+
 Create `/srv/ota-v3-pressure` as `ota-authority-exec` and place the reviewed pressure contract
 there. Every existing directory and regular file must be owned by that principal, unavailable for
 write by the job principal, free of symlink aliases, and singularly linked. The selected `governed`
@@ -92,15 +97,29 @@ updates disabled, and create the root-owned unit
 `ExecStart=/opt/ota-actions-runner/bin/Runner.Listener run --startuptype service`,
 `User=ota-authority-job`, and
 `Group=ota-authority-job`. Its `[Unit]` section must also contain the exact gate
-`ConditionPathExists=/usr/share/ota/authority-launcher/installation-evidence.json`. Put the
+`ConditionPathExists=/var/lib/ota/authority-launcher-public/installation-evidence.json`. Put the
 required hardening properties in the root-owned drop-in
 `/etc/systemd/system/ota-authority-pressure-runner.service.d/zzzz-ota-pressure-hardening.conf`.
 The service must carry `NoNewPrivileges=yes`, empty supplementary groups and capabilities, the
-fixed runner working directory, and only the narrowly required writable runner state. Do not use
-the runner's generated `actions.runner.*.service`: Launcher admits the exact canonical unit above,
-and every job-principal process must remain inside that unit's cgroup.
+fixed runner working directory, and exactly these `ReadWritePaths` entries:
+`/opt/ota-actions-runner/_diag`, `/opt/ota-actions-runner/_work`, and
+`/var/lib/ota/authority-job-evidence`. The service must also set `ProtectSystem=strict`. The last
+path is the dedicated root-owned, job-group-writable evidence-source root: the job-owned
+run-attempt bundle beneath it is separately captured by root. It does not grant the job write
+authority over the private capture store or public-record root. Launcher rechecks the effective
+`ProtectSystem=strict` and exact writable-path whitelist before provisioning, and Core rechecks it
+before job evidence is created. Do not use the runner's generated `actions.runner.*.service`:
+Launcher admits the exact canonical unit above, and every job-principal process must remain inside
+that unit's cgroup.
 
 ## Provision Outside GitHub Actions
+
+This generic provisioning procedure is for the independently administered governed-invocation
+fixture. Do not use it for Ota Core's secret-delivery service-path custody gate: that gate must
+first queue the exact Core workflow run, record its run context, and then reprovision with both
+`--secret-delivery-pressure-builder-binary` and `--secret-delivery-pressure-request` from the
+[Core service-path runbook](https://github.com/ota-run/ota/blob/b9c5d0b65eaca9d15d975e5913ba16135337e6b7/docs/pressure/secret-delivery-service-path.md).
+Provisioning before the target job is queued cannot produce an accepting run-bound configuration.
 
 Run `systemctl daemon-reload`, confirm the runner remains stopped, then run provisioning as the
 host administrator before registering the runner:
@@ -128,7 +147,7 @@ Provisioning writes the protected installation manifest under `/etc/ota` and a n
 evidence envelope at:
 
 ```text
-/usr/share/ota/authority-launcher/installation-evidence.json
+/var/lib/ota/authority-launcher-public/installation-evidence.json
 ```
 
 The public envelope contains those bounded artifact-derived source revisions plus protected paths
@@ -138,11 +157,50 @@ reusable credentials. The envelope and every parent component are
 root-owned and non-writable; the file is regular, singularly linked, mode `0644`, and exists only
 so the unprivileged workflow can bind retained evidence to the administrator-installed clients.
 
+## Retain Hosted Evidence
+
+GitHub Actions retains the hosted evidence artifact for only 30 days. Preserve the exact public ZIP
+outside Actions retention before treating a run as a durable review record. The completed bounded
+governed-invocation witness is retained at
+[`docs/pressure/retained-artifacts/systemd-v3-independently-administered-34159892077.zip`](pressure/retained-artifacts/systemd-v3-independently-administered-34159892077.zip).
+Its SHA-256 is `0b15512fe736bee4b35a2dd205a5e9e3d68a9af496ee86f812c364b4f322258f`; see the adjacent
+artifact index for its source run, revision, and content limits.
+
+The later replay-store provisioning and runtime-reconciliation witness is retained at
+[`docs/pressure/retained-artifacts/systemd-v3-independently-administered-34241049867.zip`](pressure/retained-artifacts/systemd-v3-independently-administered-34241049867.zip).
+Its SHA-256 is `090f3ac9fa2b516370b8d844520d4759bce877fae7b0f6a541bd5e23539d6496`.
+Run `34241049867`, job `102111003771`, binds Launcher
+`8ca4763c1e5c6ef5ac06c2be5b778c49344c5030`, Protocol
+`e0af492ba8a6fbe01e805c79762909c9cda28198`, and Core
+`f921209561b26f38cdb74c5f20f71e0b6734ae0d`. It proves the fixed replay path is present in the
+exact fresh-state inventory and accepted by effective systemd runtime reconciliation while one
+bounded governed invocation completes with terminal cleanup and one valid protected receipt
+archive. It does not prove capability-observation production routing, provider contact, OIDC
+exchange, secret materialization, or secret delivery.
+
+Runner-group access is intentionally not represented as a run-bound fact. Independently check its
+current GitHub configuration against the exact two-repository and four branch-pinned workflow list
+below; it is mutable operational configuration, not retained hosted-artifact evidence.
+
 ## Register The Runner
 
-Register the repository-scoped GitHub Actions runner for `ota-run/authority-launcher` as
-`ota-authority-job`, install the canonical unit above, provision while that unit is stopped, then
-enable it with these labels:
+Register the runner at the `ota-run` organization level in a dedicated runner group as
+`ota-authority-job`. Restrict that group to exactly `ota-run/authority-launcher` and
+`ota-run/ota`: Launcher owns the protected-runner pressure workflows, while Core owns the
+no-checkout OIDC endpoint-compatibility workflow. A repository-scoped Launcher runner cannot
+execute the Core workflow. Do not grant the group access to other repositories or use it for
+general CI. Because both repositories are public, enable public-repository access only together
+with workflow restrictions. Allow exactly these branch-pinned workflow references:
+
+```text
+ota-run/ota/.github/workflows/secret-delivery-oidc-endpoint-evidence.yml@refs/heads/1.6.28-implementation
+ota-run/authority-launcher/.github/workflows/systemd-v3-independently-administered.yml@refs/heads/1.6.28-implementation
+ota-run/authority-launcher/.github/workflows/systemd-v3-independently-administered-recovery.yml@refs/heads/1.6.28-implementation
+ota-run/authority-launcher/.github/workflows/systemd-v3-independently-administered-recovery-trigger.yml@refs/heads/1.6.28-implementation
+```
+
+Install the canonical unit above, provision while that unit is stopped, then enable it with these
+labels:
 
 ```text
 self-hosted, Linux, X64, ota-authority-independent
@@ -176,6 +234,27 @@ evidence. The exact runner unit is additionally gated by that evidence file, whi
 only after all protected authority services and state are durable. The
 job principal therefore cannot start through the canonical runner service during provisioning;
 the gate opens only when provisioning completes.
+
+## Hosted Evidence Custody
+
+After the separately reviewed provider-free custody correction is provisioned, the root-owned
+capture path watches only the exact final `COMPLETE` marker for the installation-bound workflow run
+and attempt. It does not watch a broad job-writable directory and it must never be started, edited,
+or repointed by the job principal.
+
+The capture service accepts only its closed success set or its separate closed failure-diagnostic
+set. It records a complete failed job only as `failure_diagnostic_set`; malformed, incomplete,
+stale, replayed, substituted, or changing input refuses, and that class can never satisfy the
+`success_set` custody gate. The service copies through descriptor-relative no-follow reads into a
+root-only store, recomputes the bundle digest as root, then atomically publishes one non-secret
+root-owned public capture record.
+
+The Core workflow waits for and reconciles that record against the exact installation, request,
+run, attempt, revisions, and expected capture class. Administrators retrieve retained bytes from
+the root-only store. This is a job-inaccessible root-custodied copy of job-produced evidence, not
+independent attestation of job assertions or immutability against the root administrator. It does
+not validate the job's assertions or authorize OIDC, provider contact, materialization, delivery,
+or selected-work release.
 
 ## Run And Inspect
 
@@ -307,7 +386,7 @@ identity, the exact frozen invocation, one recovery-only client exchange, unchan
 truth, the expected cumulative execution/archive counts, zero invalid archives, no residual active
 or finalization records, no Ota transient scopes, and complete terminal cleanup. It publishes one
 create-new root-owned mode-`0644` record beneath the fixed
-`/usr/share/ota/authority-launcher/recovery-evidence` directory, then removes the pending private
+`/var/lib/ota/authority-launcher-public/recovery-evidence` directory, then removes the pending private
 controller state. Before acknowledging the recovered terminal to Launcher, the constrained client
 hands it to the root controller, which validates and fsyncs a `recovery_observed` state. A crash
 therefore leaves either Launcher’s replayable finalization journal or the exact controller-owned

@@ -57,7 +57,7 @@ producer binding and independently checks the response projection, identity, sig
 key validity, and freshness.
 
 The protected systemd launcher collects the complete ordered
-`ota.authority-launcher.systemd/v3` and `ota.authority-job-principal.systemd/v2` observation sets and
+`ota.authority-launcher.systemd/v4` and `ota.authority-job-principal.systemd/v2` observation sets and
 invokes that producer. It verifies protected installation identities, exact systemd runtime
 properties, process containment, account/sudo/Polkit posture, protected-path and host-socket access,
 and Ota process-access denial before relaying the independently verified signed V3 attestation to
@@ -71,6 +71,36 @@ child, transient scope, and active-slot journal while selected work runs. Core s
 transaction-bound completion over the private session; the launcher persists it before
 acknowledgement, reconciles the observed child exit, removes the exact scope and empty cgroup,
 reaps the child, removes the slot, and only then emits terminal finalization evidence.
+
+With `protected-attestor` enabled, the same protected socket also accepts the closed Protocol
+capability-observation probe. It binds Core's fresh challenge to one exact launcher invocation,
+prepares the stopped Ota child and transient scope, derives the protected capability from retained
+live observations, delegates only projection signing to the Attestor, cleans up the child and
+scope, and returns only the signed public projection. This route does not authorize execution or
+contact OIDC or another provider.
+
+The V4 service retains `ProtectProc=invisible` and `ProcSubset=pid`. On systemd 253 or newer, the
+manager opens `/proc/sys/kernel/random/boot_id` read-only through `OpenFile=` and passes it as
+`ota-boot-id`; the socket unit names its listener `ota-launcher-listener`. Launcher requires exactly
+those two named descriptors for its current process, accepts either descriptor ordering, and
+reobserves the boot descriptor as read-only procfs before capability reconciliation. The selected
+child's complete stopped descriptor table is independently restricted to its six declared roles,
+so the boot descriptor is not inherited. No other service unit receives a wider procfs view.
+
+The pressure provisioner installs fixed root-owned `0400` empty verifier and binding snapshots
+beneath `/etc/ota/secret-delivery`. Launcher opens and retains them before selected-child creation,
+then revalidates their exact descriptors and signed bytes before private V1 snapshot disclosure. A
+separate root-owned replay directory at
+`/var/lib/ota/authority-launcher/authority-snapshot-replay` reserves before disclosure and is
+consumed only after exact V2 or additive V3 binding reconciliation for V1 snapshots. The additive
+raw-store V2 snapshot reserves the same way but is consumed only after exact V4 reconciliation.
+Launcher structurally and cryptographically verifies the retained raw signed stores, then privately
+relays them in the V2 snapshot. Core semantically verifies the complete bounded
+transport-dependency graph and record against its embedded expectation; only the subsequent V4
+binding exchange carries the record identity. V1/V2/V3 substitutes for that V2/V4 route refuse.
+Ordinary non-secret completion does not require these stores. The empty structural snapshots grant
+no verifier or provider authority and prove no provider contact, materialization, or secret
+delivery.
 
 The feature-gated `ota-authority-pressure-peer` binary is an exception for conformance testing
 only. It uses fixed public test keys and deterministic scenarios to exercise protocol v2 through a
@@ -284,6 +314,41 @@ hard refusal because it cannot establish child absence. An exact pre-scope child
 through Linux `pidfd`; a scope-bearing journal additionally requires the exact unit and kernel
 cgroup to be stopped and observed empty. PID reuse, identity mismatch, unsupported cleanup, or any
 uncertain outcome retains the slot and fails closed.
+
+The non-default `secret-delivery-pressure` feature contains the first protected capability
+foundation for V12.1 Step 7. It opens only the fixed verifier and binding stores beneath retained
+directory descriptors with Linux `openat2` no-symlink, no-magic-link, no-mount-crossing, and
+beneath-only resolution; requires the authority directory to be private and both stores to be
+root-owned regular mode-`0400` files; retains exact bytes and descriptor identities; and can observe
+a retained live Unix-stream session descriptor and invocation cgroup before deriving a
+protocol-verified `ProtectedLauncherCapabilityV1`. After signed admission and lease consumption,
+the selected child may either use the immutable V1 binding exchange, request one private V1
+protected-authority snapshot followed by one snapshot-bound V2 or additive V3 binding over that
+same inherited session, or request one canonical raw-store V2 snapshot followed only by V4. V3
+carries one opaque Core-derived transport-dependency record identity. The V2 snapshot privately
+relays the descriptor-bound raw verifier and binding stores, including the administrator-signed
+bundle that retains the complete bounded transport-dependency graph and record expectation.
+Launcher structurally and cryptographically verifies those retained stores before relay; Core
+semantically verifies the complete graph and record against its embedded expectation. Only the
+subsequent V4 binding exchange carries and binds the record identity. Launcher does not interpret
+the graph or prepare transport. V1/V2/V3 substitutes for the V2/V4 route refuse. Launcher derives
+the capability from the exact retained child, scope, cgroup, session, stores, authority context,
+installation evidence, and replay state, then returns one Protocol-reconciled private binding plus
+its signed public projection. The private capability identity never enters the public projection.
+Duplicate, interleaved, reversed, or replayed exchange messages refuse. Non-secret execution still
+proceeds directly to its completion frame. This route does not request an OIDC token, contact
+Google, materialize or inject a secret, publish positive delivery evidence, or activate Step 8.
+
+The same protected observation route loads one administrator-installed
+`ProtectedLauncherAuthorityContextV1` whose file identity is a singular protected-installation
+role. It reconciles the exact installed Launcher and Ota artifacts, source-bound build identities,
+Protocol revision, compatibility range, launcher profile, and Linux/x86_64 target before capability
+use. The root Launcher generates the invocation nonce itself and observes the canonical boot UUID
+through the retained manager-opened V4 descriptor, rechecking its procfs, access-mode, metadata,
+content, and identity immediately before capability reconciliation. Repository, workflow,
+environment, and request values cannot provide those identities. This is context and observation
+ownership only, not provider evidence.
+
 This path permits selected execution only after signed V3 admission and one bounded consumed
 lease. The selected Ota command creates its ordinary transaction-bound crossing receipt/archive;
 launcher terminal evidence separately binds Core's completion to exact child, scope, cgroup, and
@@ -401,6 +466,18 @@ execution-completion, finalization-intent, and terminal-recorded reboot cases as
 protected archives with zero invalid or legacy-unverified archives, unchanged repository state,
 and zero residual child, scope, cgroup, active-slot, or finalization state. Provider attestation
 remains optional stronger hardening and is not implied by this carrier.
+
+Immutable Linux/x64 PID 1
+[run 34241049867](https://github.com/ota-run/authority-launcher/actions/runs/34241049867),
+job `102111003771`, proves the fixed capability-observation replay path is reconciled across the
+fresh managed-state inventory and effective Launcher `ReadWritePaths` at exact Launcher
+`8ca4763c1e5c6ef5ac06c2be5b778c49344c5030`, Protocol
+`e0af492ba8a6fbe01e805c79762909c9cda28198`, and Core
+`f921209561b26f38cdb74c5f20f71e0b6734ae0d`. The same bounded invocation completed with exact
+child, scope, cgroup, and active-slot cleanup and one valid protected receipt archive with zero
+invalid archives. The retained artifact does not prove production capability-observation routing,
+accepted-session provenance, provider contact, OIDC exchange, secret materialization or delivery,
+Step 8, V12.2, or general governance.
 
 Immutable Linux/x64 PID 1
 [run 31758094819](https://github.com/ota-run/authority-launcher/actions/runs/31758094819)

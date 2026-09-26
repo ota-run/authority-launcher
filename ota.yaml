@@ -26,6 +26,8 @@ project:
   description: Trusted Unix launcher boundary for Ota crossing authority
   type: application
 metadata:
+  ota:
+    minimum_version: "1.6.28"
   team: Engineering
   owner: ota
   repo_class: oss
@@ -69,6 +71,9 @@ tasks:
     safe_for_agent: true
   test:
     description: Run the launcher test suite
+    notes: |
+      Runs unit and conformance tests, including feature-gated code where supported. It does not
+      create root-owned state, start systemd units, issue authority, or authorize selected work.
     category: test
     command:
       exe: cargo
@@ -78,6 +83,9 @@ tasks:
     safe_for_agent: true
   verify:
     description: Run the complete local verification suite
+    notes: |
+      This is the only routine verification front door. It proves the local Rust suite, not the
+      separately administered Linux/systemd pressure boundary or provider attestation.
     category: test
     aggregate:
       tasks: [fmt, check, clippy, test]
@@ -86,17 +94,33 @@ workflows:
   default: verify
   verify:
     intent: verification
+    description: Canonical local Rust verification for the launcher source tree
     run:
       task: verify
+    notes: |
+      Use this for source changes. The production carrier requires administrator-owned Linux
+      systemd provisioning outside this repository; use the documented pressure workflows only
+      in that independently administered environment.
 agent:
   entrypoint: verify
   default_task: verify
   safe_tasks: [fmt, check, clippy, test, verify]
   verify_after_changes: [verify]
-  writable_paths: [src, README.md, SECURITY.md, CHANGELOG.md, Cargo.toml, rust-toolchain.toml]
-  protected_paths: [Cargo.lock, ota.yaml, LICENSE]
+  writable_paths: [src, tests, docs, README.md, CHANGELOG.md, Cargo.toml, rust-toolchain.toml]
+  protected_paths: [.github, AGENTS.md, Cargo.lock, ota.yaml, LICENSE, SECURITY.md]
   bootstrap:
     ota:
+      note: This source-distributed launcher requires the reviewed Ota Core revision below; do not substitute a branch or ambient binary for protected-boundary work.
       source:
         kind: git_rev
-        rev: d9d424168b1c1dad48351651c610789e54f74dcf
+        rev: 63297ad95ef156b335a1dfb54090146406077a3f
+  notes: |
+    Start with `ota tasks --safe --use`, then run the selected routine lane through
+    `ota run verify --agent`. The safe surface is limited to local Rust verification.
+    If Ota does not report a lane callable, stop; do not drop `--agent` or invoke Cargo directly.
+
+    Do not invoke pressure binaries, systemd provisioners, broker peers, attestors, protected
+    history services, or protected configuration through raw shell commands. They require the
+    administrator-owned Linux/systemd environment described in README.md and are not agent-safe
+    repository work. A passing `verify` result is not authority issuance, protected deployment,
+    provider attestation, or selected-work evidence.

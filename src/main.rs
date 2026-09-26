@@ -24,6 +24,12 @@
 mod active_slot;
 #[cfg(target_os = "linux")]
 mod archive_attachment;
+#[cfg(all(target_os = "linux", feature = "protected-attestor"))]
+#[allow(dead_code)]
+mod attestation_client;
+#[cfg(all(target_os = "linux", feature = "protected-attestor"))]
+#[allow(dead_code)]
+mod attestor;
 #[cfg(target_os = "linux")]
 mod closed_profile_observations;
 #[cfg(unix)]
@@ -35,11 +41,21 @@ mod installation_manifest;
 #[cfg(target_os = "linux")]
 mod prepared_child;
 #[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
+mod pressure_evidence_capture;
+#[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
 mod pressure_provision;
+#[cfg(all(target_os = "linux", feature = "protected-attestor"))]
+mod protected_authority_snapshot;
+#[cfg(all(target_os = "linux", feature = "protected-attestor"))]
+#[allow(dead_code)]
+mod protected_capability_observation;
 #[cfg(target_os = "linux")]
 mod protected_history;
 #[cfg(target_os = "linux")]
 mod protected_history_service;
+#[cfg(all(target_os = "linux", feature = "protected-attestor"))]
+#[allow(dead_code)]
+mod protected_launcher_capability;
 #[cfg(test)]
 mod reference_peer;
 #[cfg(target_os = "linux")]
@@ -67,6 +83,7 @@ struct Cli {
     command: Command,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Start the protected Ota binary with one authority-bound launcher session.
@@ -114,7 +131,16 @@ enum Command {
         prepared_runner_binary: Option<std::path::PathBuf>,
         #[arg(long)]
         production_client: bool,
+        #[arg(long, requires = "secret_delivery_pressure_request")]
+        secret_delivery_pressure_builder_binary: Option<std::path::PathBuf>,
+        #[arg(long, requires = "secret_delivery_pressure_builder_binary")]
+        secret_delivery_pressure_request: Option<std::path::PathBuf>,
     },
+
+    /// Internal root-only capture of the exact provider-free pressure evidence bundle.
+    #[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
+    #[command(hide = true)]
+    CaptureSecretDeliveryPressureEvidence,
 }
 
 fn main() -> ExitCode {
@@ -139,6 +165,8 @@ fn main() -> ExitCode {
             pressure_client_binary,
             prepared_runner_binary,
             production_client,
+            secret_delivery_pressure_builder_binary,
+            secret_delivery_pressure_request,
         } => pressure_provision::provision(pressure_provision::ProvisionRequest {
             authority_id,
             job_user,
@@ -151,7 +179,11 @@ fn main() -> ExitCode {
             pressure_client_binary,
             prepared_runner_binary,
             production_client,
+            secret_delivery_pressure_builder_binary,
+            secret_delivery_pressure_request,
         }),
+        #[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
+        Command::CaptureSecretDeliveryPressureEvidence => pressure_evidence_capture::capture(),
     };
     match result {
         Ok(code) => ExitCode::from(code),
@@ -287,5 +319,63 @@ mod tests {
         assert!(validate_ota_args(&[String::from("proof"), String::from("replay")]).is_err());
         assert!(validate_ota_args(&[String::from("self-update")]).is_err());
         assert!(validate_ota_args(&[]).is_err());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "systemd-v3-pressure-provision"))]
+    #[test]
+    fn pressure_authority_inputs_are_paired_and_default_to_absent() {
+        fn arguments() -> Vec<&'static str> {
+            vec![
+                "ota-authority-launcher",
+                "provision-systemd-v3-pressure",
+                "--authority-id",
+                "platform-release-authority",
+                "--job-user",
+                "runner",
+                "--execution-user",
+                "ota-execution",
+                "--repository-root",
+                "/srv/ota-v3-pressure",
+                "--launcher-binary",
+                "/tmp/launcher",
+                "--attestor-binary",
+                "/tmp/attestor",
+                "--broker-decision-binary",
+                "/tmp/broker",
+                "--ota-binary",
+                "/tmp/ota",
+                "--pressure-client-binary",
+                "/tmp/client",
+            ]
+        }
+
+        let default = Cli::try_parse_from(arguments()).expect("default pressure arguments");
+        let Command::ProvisionSystemdV3Pressure {
+            secret_delivery_pressure_builder_binary,
+            secret_delivery_pressure_request,
+            ..
+        } = default.command
+        else {
+            panic!("pressure command");
+        };
+        assert!(secret_delivery_pressure_builder_binary.is_none());
+        assert!(secret_delivery_pressure_request.is_none());
+
+        let mut paired = arguments();
+        paired.extend([
+            "--secret-delivery-pressure-builder-binary",
+            "/tmp/builder",
+            "--secret-delivery-pressure-request",
+            "/tmp/request.json",
+        ]);
+        assert!(Cli::try_parse_from(paired).is_ok());
+
+        let mut builder_only = arguments();
+        builder_only.extend(["--secret-delivery-pressure-builder-binary", "/tmp/builder"]);
+        assert!(Cli::try_parse_from(builder_only).is_err());
+
+        let mut request_only = arguments();
+        request_only.extend(["--secret-delivery-pressure-request", "/tmp/request.json"]);
+        assert!(Cli::try_parse_from(request_only).is_err());
     }
 }
