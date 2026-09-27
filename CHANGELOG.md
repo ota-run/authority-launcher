@@ -26,6 +26,14 @@
 
 ## Unreleased
 
+- Pin Authority Protocol `e5fe1c83e562e02f60e27026c7148918bd016155` for its additive private
+  GitHub OIDC capability-relay wire records and zeroizing binary frame owners. This pin alone
+  activates no job-client relay, provider contact, delivery, or selected-work authority.
+- Add the one-use private GitHub OIDC capability relay from the authenticated job client to the
+  exact V2/V4-bound Core child. Launcher spends the turn before issuing one shared non-secret
+  challenge, bounds and correlates the private response, refuses queued duplicates, and requires
+  an exact same-child acknowledgement. This does not contact GitHub or activate Core dispatch.
+
 - Verify V3 pressure installation source revisions from the public installation evidence and
   require its embedded manifest to equal the protected installation manifest. Both hosted jobs
   previously queried fields absent from the private manifest after successful provisioning.

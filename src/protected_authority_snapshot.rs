@@ -1455,7 +1455,7 @@ pub(crate) mod tests {
             workflow_run_id: "34153231585".into(),
             workflow_run_attempt: "1".into(),
             workflow_reference:
-                "ota-run/ota/.github/workflows/secret-delivery-oidc-endpoint-evidence.yml@refs/heads/1.6.28-implementation"
+                "ota-run/ota/.github/workflows/secret-delivery-github-oidc-live.yml@refs/heads/1.6.29-implementation"
                     .into(),
             nonce_commitment: protected_launcher_capability_observation_nonce_commitment_v1(&nonce)
                 .expect("observation nonce commitment"),

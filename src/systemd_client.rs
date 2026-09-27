@@ -22,14 +22,18 @@
 
 //! Production unprivileged client for the fixed systemd protected-launcher socket.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(test)]
+use ota_authority_protocol::ProtectedGithubOidcPrivateReceiveBufferV1;
 use ota_authority_protocol::{
     LAUNCHER_FINALIZATION_ARCHIVE_PERSISTENCE, LAUNCHER_FINALIZATION_ARCHIVE_REQUEST,
     LAUNCHER_FINALIZATION_RECOVERY_REQUEST, LAUNCHER_INVOCATION_REQUEST, LAUNCHER_OUTPUT,
@@ -38,7 +42,10 @@ use ota_authority_protocol::{
     LauncherFinalizationArchiveResponseV1, LauncherFinalizationRecoveryRequestV1,
     LauncherInvocationRequestV1, LauncherOutputFrameV1, LauncherOutputStreamV1,
     LauncherSignedExecutionFinalizationFrameV1, LauncherTerminalFrameV1,
-    LauncherTerminalPersistenceV1, MAX_FRAME_BYTES, SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1,
+    LauncherTerminalPersistenceV1, MAX_FRAME_BYTES,
+    PROTECTED_GITHUB_OIDC_CAPABILITY_RELAY_CHALLENGE_V1,
+    ProtectedGithubOidcCapabilityRelayChallengeV1, ProtectedGithubOidcSecretInputV1,
+    SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1, build_protected_github_oidc_private_frame_v1,
     decode_frame, encode_frame, launcher_finalization_archive_persistence_v1_identity,
     launcher_finalization_archive_request_v1_identity,
     launcher_finalization_archive_response_v1_identity,
@@ -46,6 +53,7 @@ use ota_authority_protocol::{
     launcher_terminal_frame_v1_identity, launcher_terminal_persistence_v1_identity,
     validate_launcher_invocation_request_v1, validate_launcher_output_frame_v1,
     validate_launcher_signed_execution_finalization_frame_v1, validate_launcher_terminal_frame_v1,
+    validate_protected_github_oidc_capability_relay_challenge_v1,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -236,6 +244,7 @@ fn read_session(
 ) -> Result<LauncherTerminalFrameV1, ClientError> {
     let mut next_sequence = 0_u64;
     let mut signed_finalization = None;
+    let mut oidc_capability_relayed = false;
     loop {
         let value: serde_json::Value = read_typed_frame(stream)?;
         match value
@@ -269,6 +278,17 @@ fn read_session(
                 acknowledge_archive(stream, authority_id, request_identity, &frame)?;
                 signed_finalization = Some(frame);
             }
+            Some(PROTECTED_GITHUB_OIDC_CAPABILITY_RELAY_CHALLENGE_V1) => {
+                if oidc_capability_relayed {
+                    return Err(ClientError::Protocol);
+                }
+                let challenge: ProtectedGithubOidcCapabilityRelayChallengeV1 =
+                    serde_json::from_value(value).map_err(|_| ClientError::Protocol)?;
+                validate_protected_github_oidc_capability_relay_challenge_v1(&challenge)
+                    .map_err(|_| ClientError::Protocol)?;
+                relay_github_oidc_capability_from_environment(stream, &challenge)?;
+                oidc_capability_relayed = true;
+            }
             Some(LAUNCHER_TERMINAL) => {
                 let terminal: LauncherTerminalFrameV1 =
                     serde_json::from_value(value).map_err(|_| ClientError::Protocol)?;
@@ -292,6 +312,67 @@ fn read_session(
             _ => return Err(ClientError::Protocol),
         }
     }
+}
+
+fn relay_github_oidc_capability_from_environment(
+    stream: &mut UnixStream,
+    challenge: &ProtectedGithubOidcCapabilityRelayChallengeV1,
+) -> Result<(), ClientError> {
+    validate_github_workflow_context(
+        challenge,
+        std::env::var_os("GITHUB_RUN_ID"),
+        std::env::var_os("GITHUB_RUN_ATTEMPT"),
+    )?;
+    let request_url = protected_oidc_input_from_environment("ACTIONS_ID_TOKEN_REQUEST_URL")?;
+    let bearer = protected_oidc_input_from_environment("ACTIONS_ID_TOKEN_REQUEST_TOKEN")?;
+    relay_github_oidc_capability(stream, challenge, request_url, bearer)
+}
+
+fn protected_oidc_input_from_environment(
+    name: &str,
+) -> Result<ProtectedGithubOidcSecretInputV1, ClientError> {
+    Ok(ProtectedGithubOidcSecretInputV1::new(
+        std::env::var_os(name)
+            .ok_or(ClientError::LocalBoundary)?
+            .into_vec(),
+    ))
+}
+
+fn validate_github_workflow_context(
+    challenge: &ProtectedGithubOidcCapabilityRelayChallengeV1,
+    workflow_run_id: Option<OsString>,
+    workflow_run_attempt: Option<OsString>,
+) -> Result<(), ClientError> {
+    let workflow_run_id = workflow_run_id
+        .and_then(|value| value.into_string().ok())
+        .ok_or(ClientError::LocalBoundary)?;
+    let workflow_run_attempt = workflow_run_attempt
+        .and_then(|value| value.into_string().ok())
+        .ok_or(ClientError::LocalBoundary)?;
+    if workflow_run_id != challenge.workflow_run_id
+        || workflow_run_attempt != challenge.workflow_run_attempt
+    {
+        return Err(ClientError::Protocol);
+    }
+    Ok(())
+}
+
+fn relay_github_oidc_capability(
+    stream: &mut UnixStream,
+    challenge: &ProtectedGithubOidcCapabilityRelayChallengeV1,
+    request_url: ProtectedGithubOidcSecretInputV1,
+    bearer: ProtectedGithubOidcSecretInputV1,
+) -> Result<(), ClientError> {
+    let frame = build_protected_github_oidc_private_frame_v1(
+        &challenge.request_identity,
+        &challenge.nonce,
+        request_url,
+        bearer,
+    )
+    .map_err(|_| ClientError::Protocol)?;
+    stream
+        .write_all(frame.as_wire_bytes())
+        .map_err(|_| ClientError::ServiceUnavailable)
 }
 
 fn acknowledge_archive(
@@ -577,6 +658,55 @@ mod tests {
         );
         assert_eq!(ClientError::Protocol.execution_started(), None);
         assert_eq!(ClientError::ServiceUnavailable.execution_started(), None);
+    }
+
+    #[test]
+    fn job_client_relays_one_correlated_private_oidc_frame() {
+        let (mut client, mut launcher) = UnixStream::pair().unwrap();
+        let challenge = ProtectedGithubOidcCapabilityRelayChallengeV1 {
+            schema_version: 1,
+            message_kind: PROTECTED_GITHUB_OIDC_CAPABILITY_RELAY_CHALLENGE_V1.into(),
+            request_identity: format!("sha256:{}", "ab".repeat(32)),
+            workflow_run_id: "42".into(),
+            workflow_run_attempt: "1".into(),
+            nonce: "cd".repeat(32),
+            max_url_bytes: ota_authority_protocol::MAX_PRIVATE_OIDC_RELAY_URL_BYTES_V1 as u32,
+            max_bearer_bytes: ota_authority_protocol::MAX_PRIVATE_OIDC_RELAY_BEARER_BYTES_V1 as u32,
+        };
+        validate_github_workflow_context(
+            &challenge,
+            Some(OsString::from("42")),
+            Some(OsString::from("1")),
+        )
+        .unwrap();
+        relay_github_oidc_capability(
+            &mut client,
+            &challenge,
+            ProtectedGithubOidcSecretInputV1::new(b"https://example.invalid/id-token".to_vec()),
+            ProtectedGithubOidcSecretInputV1::new(b"private-bearer".to_vec()),
+        )
+        .unwrap();
+        let mut receive = ProtectedGithubOidcPrivateReceiveBufferV1::new();
+        while !receive.unfilled_mut().is_empty() {
+            let count = launcher.read(receive.unfilled_mut()).unwrap();
+            receive.record_read(count).unwrap();
+        }
+        let frame = receive
+            .finish()
+            .unwrap()
+            .correlate(&challenge.request_identity, &challenge.nonce)
+            .unwrap();
+        assert_eq!(frame.url_bytes(), b"https://example.invalid/id-token");
+        assert_eq!(frame.bearer_bytes(), b"private-bearer");
+
+        assert_eq!(
+            validate_github_workflow_context(
+                &challenge,
+                Some(OsString::from("43")),
+                Some(OsString::from("1")),
+            ),
+            Err(ClientError::Protocol)
+        );
     }
 
     #[test]

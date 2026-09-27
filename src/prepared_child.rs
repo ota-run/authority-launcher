@@ -50,8 +50,9 @@ use ota_authority_protocol::{
     LauncherOutputStreamV1, LauncherStartupContinuationV1, LeaseConsumeRequest,
     LeaseConsumeResponsePayload, LeaseConsumptionAdmissionV1, LeaseConsumptionIntentPersistenceV1,
     LeaseConsumptionIntentRelayEvidenceV1, LeaseConsumptionPersistenceV1,
-    LeaseConsumptionRelayEvidenceV1, MAX_FRAME_BYTES, OtaProcessPostureV1,
-    PROTECTED_AUTHORITY_SNAPSHOT_REQUEST, PROTECTED_AUTHORITY_SNAPSHOT_REQUEST_V2,
+    LeaseConsumptionRelayEvidenceV1, MAX_FRAME_BYTES, MAX_PRIVATE_OIDC_RELAY_BEARER_BYTES_V1,
+    MAX_PRIVATE_OIDC_RELAY_URL_BYTES_V1, OtaProcessPostureV1, PROTECTED_AUTHORITY_SNAPSHOT_REQUEST,
+    PROTECTED_AUTHORITY_SNAPSHOT_REQUEST_V2, PROTECTED_GITHUB_OIDC_CAPABILITY_RELAY_REQUEST_V1,
     PROTECTED_LAUNCHER_CAPABILITY_OBSERVATION_REQUEST,
     PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST,
     PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V2,
@@ -59,7 +60,9 @@ use ota_authority_protocol::{
     PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V4, PreparedLeasePayload,
     ProtectedAuthoritySnapshotRequestV1, ProtectedAuthoritySnapshotRequestV2,
     ProtectedAuthoritySnapshotResponseV1, ProtectedAuthoritySnapshotResponseV2,
-    ProtectedLauncherCapabilityObservationRequestV1,
+    ProtectedGithubOidcCapabilityRelayAcknowledgementV1,
+    ProtectedGithubOidcCapabilityRelayChallengeV1, ProtectedGithubOidcCapabilityRelayRequestV1,
+    ProtectedGithubOidcPrivateReceiveBufferV1, ProtectedLauncherCapabilityObservationRequestV1,
     ProtectedLauncherCapabilityObservationResponseV1,
     ProtectedLauncherSecretDeliveryTransactionBindingRequestV1,
     ProtectedLauncherSecretDeliveryTransactionBindingRequestV2,
@@ -80,6 +83,8 @@ use ota_authority_protocol::{
     lease_consumption_intent_relay_evidence_v1_identity, lease_consumption_persistence_v1_identity,
     lease_consumption_relay_evidence_v1_identity, message_identity, ota_process_posture_identity,
     sha256_identity, validate_launcher_output_frame_v1,
+    validate_protected_github_oidc_capability_relay_acknowledgement_v1,
+    validate_protected_github_oidc_capability_relay_request_v1,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -730,7 +735,7 @@ impl PreparedChild {
             stderr,
             LauncherOutputStreamV1::Stderr,
             self.record.invocation_id.clone(),
-            output,
+            Arc::clone(&output),
         );
 
         let mut relay_state = SecretDeliveryRelayState::AwaitPreludeOrLegacyOrCompletion;
@@ -850,6 +855,7 @@ impl PreparedChild {
                         let binding_kind = binding
                             .get("message_kind")
                             .and_then(serde_json::Value::as_str);
+                        let mut v4_exchange = None;
                         let (response, response_sent_marker) = match binding_kind {
                             Some(
                                 PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V2,
@@ -894,13 +900,14 @@ impl PreparedChild {
                             Some(
                                 PROTECTED_LAUNCHER_SECRET_DELIVERY_TRANSACTION_BINDING_REQUEST_V4,
                             ) => {
-                                let request = serde_json::from_value(binding).map_err(|_| {
+                                let request: ProtectedLauncherSecretDeliveryTransactionBindingRequestV4 = serde_json::from_value(binding).map_err(|_| {
                                     PreparedChildError::AuthorizationAdmissionMismatch
                                 })?;
                                 let response = bind_snapshot_secret_delivery_v4(
                                     &request,
                                     &self.launcher_session,
                                 )?;
+                                v4_exchange = Some((request, response.clone()));
                                 (
                                     serde_json::to_value(response).map_err(|_| {
                                         PreparedChildError::AuthorizationAdmissionMismatch
@@ -913,9 +920,35 @@ impl PreparedChild {
                         write_json_frame_blocking(&mut self.launcher_session, &response)
                             .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
                         pressure_v3_stage(response_sent_marker);
-                        let value = read_json_frame_blocking(&mut self.launcher_session)
-                            .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
-                        parse_completion_for_state(value, relay_state)?
+                        let value: serde_json::Value =
+                            read_json_frame_blocking(&mut self.launcher_session)
+                                .map_err(|_| PreparedChildError::ExecutionCompletionUnavailable)?;
+                        if value
+                            .get("message_kind")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(PROTECTED_GITHUB_OIDC_CAPABILITY_RELAY_REQUEST_V1)
+                        {
+                            let (v4_request, v4_response) = v4_exchange
+                                .take()
+                                .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+                            let relay_request = serde_json::from_value(value)
+                                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+                            relay_private_github_oidc_capability(
+                                &relay_request,
+                                &v4_request,
+                                &v4_response,
+                                &output,
+                                client,
+                                &mut self.launcher_session,
+                            )?;
+                            let completion = read_json_frame_blocking(&mut self.launcher_session)
+                                .map_err(|_| {
+                                PreparedChildError::ExecutionCompletionUnavailable
+                            })?;
+                            parse_completion_for_state(completion, relay_state)?
+                        } else {
+                            parse_completion_for_state(value, relay_state)?
+                        }
                     }
                 }
             }
@@ -1006,6 +1039,159 @@ impl PreparedChild {
     pub(crate) fn abandon_for_recovery(mut self) {
         self.pid = 0;
     }
+}
+
+fn relay_private_github_oidc_capability(
+    request: &ProtectedGithubOidcCapabilityRelayRequestV1,
+    v4_request: &ProtectedLauncherSecretDeliveryTransactionBindingRequestV4,
+    v4_response: &ProtectedLauncherSecretDeliveryTransactionBindingResponseV4,
+    output: &Arc<Mutex<(UnixStream, u64)>>,
+    client: &UnixStream,
+    selected_child: &mut UnixStream,
+) -> Result<(), PreparedChildError> {
+    validate_protected_github_oidc_capability_relay_request_v1(request)
+        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+    let challenge = &v4_request.observation.challenge;
+    // Core owns live-route semantics; Launcher binds the request to the exact retained V4 exchange.
+    if request.launcher_request_identity != v4_request.launcher_request_identity
+        || request.startup_continuation_identity != v4_request.startup_continuation_identity
+        || request.session_identity != v4_request.session_identity
+        || request.protected_snapshot_identity != v4_request.protected_snapshot_identity
+        || request.v4_binding_identity != v4_response.binding.identity
+        || request.observation_request_identity != v4_request.observation.identity
+        || request.transaction_candidate_identity
+            != v4_request.secret_transaction_candidate_identity
+        || request.transport_dependency_record_identity
+            != v4_request.transport_dependency_record_identity
+        || request.workflow_reference != challenge.workflow_reference
+        || request.workflow_run_id != challenge.workflow_run_id
+        || request.workflow_run_attempt != challenge.workflow_run_attempt
+    {
+        return Err(PreparedChildError::AuthorizationAdmissionMismatch);
+    }
+
+    let mut nonce = [0_u8; 32];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+    let nonce = lowercase_hex(&nonce);
+    let challenge = ProtectedGithubOidcCapabilityRelayChallengeV1 {
+        schema_version: 1,
+        message_kind: ota_authority_protocol::PROTECTED_GITHUB_OIDC_CAPABILITY_RELAY_CHALLENGE_V1
+            .into(),
+        request_identity: request.identity.clone(),
+        workflow_run_id: request.workflow_run_id.clone(),
+        workflow_run_attempt: request.workflow_run_attempt.clone(),
+        nonce: nonce.clone(),
+        max_url_bytes: MAX_PRIVATE_OIDC_RELAY_URL_BYTES_V1 as u32,
+        max_bearer_bytes: MAX_PRIVATE_OIDC_RELAY_BEARER_BYTES_V1 as u32,
+    };
+    {
+        let mut output = output
+            .lock()
+            .map_err(|_| PreparedChildError::OutputBridgeUnavailable)?;
+        write_json_frame_blocking(&mut output.0, &challenge)
+            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+    }
+    write_json_frame_blocking(selected_child, &challenge)
+        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+
+    let prior_client_timeout = client
+        .read_timeout()
+        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+    let private_deadline = Instant::now() + Duration::from_secs(5);
+    let private_frame = (|| {
+        let mut receive = ProtectedGithubOidcPrivateReceiveBufferV1::new();
+        let mut reader = client;
+        while !receive.unfilled_mut().is_empty() {
+            let remaining = private_deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(PreparedChildError::AuthorizationAdmissionMismatch)?;
+            reader
+                .set_read_timeout(Some(remaining))
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+            let count = reader
+                .read(receive.unfilled_mut())
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+            receive
+                .record_read(count)
+                .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+        }
+        receive
+            .finish()
+            .and_then(|frame| frame.correlate(&request.identity, &nonce))
+            .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)
+    })();
+    client
+        .set_read_timeout(prior_client_timeout)
+        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+    let private_frame = private_frame?;
+    refuse_queued_private_response(client)?;
+    selected_child
+        .write_all(private_frame.as_wire_bytes())
+        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+
+    let prior_child_timeout = selected_child
+        .read_timeout()
+        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+    let acknowledgement = read_json_frame(selected_child, Duration::from_secs(5))
+        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch);
+    selected_child
+        .set_read_timeout(prior_child_timeout)
+        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+    let acknowledgement: ProtectedGithubOidcCapabilityRelayAcknowledgementV1 = acknowledgement?;
+    validate_protected_github_oidc_capability_relay_acknowledgement_v1(&acknowledgement)
+        .map_err(|_| PreparedChildError::AuthorizationAdmissionMismatch)?;
+    if acknowledgement.request_identity != request.identity
+        || acknowledgement.nonce != nonce
+        || acknowledgement.session_identity != request.session_identity
+        || acknowledgement.v4_binding_identity != request.v4_binding_identity
+    {
+        return Err(PreparedChildError::AuthorizationAdmissionMismatch);
+    }
+    refuse_queued_private_response(client)?;
+    Ok(())
+}
+
+fn refuse_queued_private_response(client: &UnixStream) -> Result<(), PreparedChildError> {
+    let mut queued_bytes: libc::c_int = 0;
+    let result = unsafe { libc::ioctl(client.as_raw_fd(), libc::FIONREAD, &mut queued_bytes) };
+    if result != 0 || queued_bytes != 0 {
+        return Err(PreparedChildError::AuthorizationAdmissionMismatch);
+    }
+    loop {
+        let mut observed = 0_u8;
+        let result = unsafe {
+            libc::recv(
+                client.as_raw_fd(),
+                (&mut observed as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if result >= 0 {
+            return Err(PreparedChildError::AuthorizationAdmissionMismatch);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return if error.kind() == io::ErrorKind::WouldBlock {
+            Ok(())
+        } else {
+            Err(PreparedChildError::AuthorizationAdmissionMismatch)
+        };
+    }
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn parse_completion_for_state(
@@ -2422,6 +2608,25 @@ mod tests {
             ),
             Err(PreparedChildError::AuthorizationAdmissionMismatch)
         ));
+    }
+
+    #[test]
+    fn private_oidc_relay_refuses_queued_duplicate_bytes() {
+        let (client, mut peer) = UnixStream::pair().expect("private relay socket pair");
+        assert_eq!(refuse_queued_private_response(&client), Ok(()));
+        peer.write_all(b"duplicate").expect("queue duplicate bytes");
+        assert_eq!(
+            refuse_queued_private_response(&client),
+            Err(PreparedChildError::AuthorizationAdmissionMismatch)
+        );
+
+        let (client, peer) = UnixStream::pair().expect("private relay half-close socket pair");
+        peer.shutdown(std::net::Shutdown::Write)
+            .expect("half-close private relay peer");
+        assert_eq!(
+            refuse_queued_private_response(&client),
+            Err(PreparedChildError::AuthorizationAdmissionMismatch)
+        );
     }
 
     #[cfg(feature = "protected-attestor")]
@@ -3920,6 +4125,68 @@ mod tests {
             let expected_snapshot_response = snapshot_response.clone();
             let expected_v4_response = v4_response.clone();
             let sequence_v4_completion = expected_completion.clone();
+            let mut relay_request = ProtectedGithubOidcCapabilityRelayRequestV1 {
+                schema_version: 1,
+                message_kind: PROTECTED_GITHUB_OIDC_CAPABILITY_RELAY_REQUEST_V1.into(),
+                identity: String::new(),
+                launcher_request_identity: v4_request.launcher_request_identity.clone(),
+                startup_continuation_identity: v4_request.startup_continuation_identity.clone(),
+                session_identity: v4_request.session_identity.clone(),
+                protected_snapshot_identity: v4_request.protected_snapshot_identity.clone(),
+                v4_binding_identity: v4_response.binding.identity.clone(),
+                observation_request_identity: v4_request.observation.identity.clone(),
+                transaction_candidate_identity: v4_request
+                    .secret_transaction_candidate_identity
+                    .clone(),
+                transport_dependency_record_identity: v4_request
+                    .transport_dependency_record_identity
+                    .clone(),
+                workflow_reference: v4_request.observation.challenge.workflow_reference.clone(),
+                workflow_run_id: v4_request.observation.challenge.workflow_run_id.clone(),
+                workflow_run_attempt: v4_request
+                    .observation
+                    .challenge
+                    .workflow_run_attempt
+                    .clone(),
+            };
+            relay_request.identity =
+                ota_authority_protocol::protected_github_oidc_capability_relay_request_v1_identity(
+                    &relay_request,
+                )
+                .expect("V4 relay request identity");
+            let expected_relay_request = relay_request.clone();
+            let (relay_job_release, relay_job_release_receiver) = std::sync::mpsc::channel();
+            let relay_job_thread = thread::spawn(move || {
+                let challenge: ProtectedGithubOidcCapabilityRelayChallengeV1 =
+                    read_json_frame_blocking(&mut pressure_client)
+                        .expect("read private OIDC relay challenge");
+                assert_eq!(challenge.request_identity, expected_relay_request.identity);
+                assert_eq!(
+                    challenge.workflow_run_id,
+                    expected_relay_request.workflow_run_id
+                );
+                assert_eq!(
+                    challenge.workflow_run_attempt,
+                    expected_relay_request.workflow_run_attempt
+                );
+                let frame = ota_authority_protocol::build_protected_github_oidc_private_frame_v1(
+                    &challenge.request_identity,
+                    &challenge.nonce,
+                    ota_authority_protocol::ProtectedGithubOidcSecretInputV1::new(
+                        b"https://example.invalid/oidc".to_vec(),
+                    ),
+                    ota_authority_protocol::ProtectedGithubOidcSecretInputV1::new(
+                        b"private-bearer".to_vec(),
+                    ),
+                )
+                .expect("build correlated private OIDC frame");
+                pressure_client
+                    .write_all(frame.as_wire_bytes())
+                    .expect("write private OIDC frame");
+                relay_job_release_receiver
+                    .recv()
+                    .expect("retain authenticated job peer through relay");
+            });
             let sequence_v4_core_thread = thread::spawn(move || {
                 write_json_frame_blocking(&mut sequence_v4_core, &observation_request)
                     .expect("write V4 observation request");
@@ -3943,6 +4210,43 @@ mod tests {
                     read_json_frame_blocking(&mut sequence_v4_core)
                         .expect("read V4 binding response");
                 assert_eq!(observed_v4, expected_v4_response);
+                write_json_frame_blocking(&mut sequence_v4_core, &relay_request)
+                    .expect("write private OIDC relay request");
+                let challenge: ProtectedGithubOidcCapabilityRelayChallengeV1 =
+                    read_json_frame_blocking(&mut sequence_v4_core)
+                        .expect("read same-child private OIDC relay challenge");
+                assert_eq!(challenge.request_identity, relay_request.identity);
+                assert_eq!(challenge.workflow_run_id, relay_request.workflow_run_id);
+                assert_eq!(
+                    challenge.workflow_run_attempt,
+                    relay_request.workflow_run_attempt
+                );
+                let mut receive = ProtectedGithubOidcPrivateReceiveBufferV1::new();
+                while !receive.unfilled_mut().is_empty() {
+                    let count = sequence_v4_core
+                        .read(receive.unfilled_mut())
+                        .expect("read private OIDC frame");
+                    receive
+                        .record_read(count)
+                        .expect("record private OIDC bytes");
+                }
+                let private_frame = receive
+                    .finish()
+                    .and_then(|frame| frame.correlate(&relay_request.identity, &challenge.nonce))
+                    .expect("correlate same-child private OIDC frame");
+                assert_eq!(private_frame.url_bytes(), b"https://example.invalid/oidc");
+                assert_eq!(private_frame.bearer_bytes(), b"private-bearer");
+
+                let acknowledgement = ProtectedGithubOidcCapabilityRelayAcknowledgementV1 {
+                    schema_version: 1,
+                    message_kind: ota_authority_protocol::PROTECTED_GITHUB_OIDC_CAPABILITY_RELAY_ACKNOWLEDGEMENT_V1.into(),
+                    request_identity: relay_request.identity.clone(),
+                    nonce: challenge.nonce,
+                    session_identity: relay_request.session_identity.clone(),
+                    v4_binding_identity: relay_request.v4_binding_identity.clone(),
+                };
+                write_json_frame_blocking(&mut sequence_v4_core, &acknowledgement)
+                    .expect("write private OIDC relay acknowledgement");
                 write_json_frame_blocking(&mut sequence_v4_core, &sequence_v4_completion)
                     .expect("write V4 sequence completion");
                 let persistence: LauncherExecutionCompletionPersistenceV1 =
@@ -3964,7 +4268,10 @@ mod tests {
                 stdout: Some(sequence_v4_stdout),
                 stderr: Some(sequence_v4_stderr),
             };
-            let (sequence_v4_observed, sequence_v4_exit) = sequence_v4_child
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set inherited job-client timeout");
+            let sequence_v4_result = sequence_v4_child
                 .relay_selected_execution_with_secret_binding(
                     &client,
                     &consumption,
@@ -3985,13 +4292,24 @@ mod tests {
                         Ok(v4_response)
                     },
                     |_| Ok(()),
-                )
-                .expect("same-child framed V4 relay");
+                );
+            relay_job_release
+                .send(())
+                .expect("release authenticated job peer after relay");
+            let (sequence_v4_observed, sequence_v4_exit) =
+                sequence_v4_result.expect("same-child framed V4 relay");
             assert_eq!(sequence_v4_observed, expected_completion);
             assert_eq!(sequence_v4_exit, Some(0));
+            assert_eq!(
+                client.read_timeout().expect("read restored client timeout"),
+                Some(Duration::from_secs(2))
+            );
             sequence_v4_core_thread
                 .join()
                 .expect("same-child V4 sequence core thread");
+            relay_job_thread
+                .join()
+                .expect("same-child private OIDC relay job thread");
 
             for point in [
                 EarlyRefusalPoint::AfterPrelude,
