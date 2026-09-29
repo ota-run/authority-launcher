@@ -3170,7 +3170,9 @@ mod tests {
         }
     }
 
-    fn record_allowed_consumption_intent(active_slot: &mut ActiveSlot) {
+    fn record_allowed_consumption_intent(
+        active_slot: &mut ActiveSlot,
+    ) -> ota_authority_protocol::LeaseConsumptionIntentRelayEvidenceV1 {
         use ota_authority_protocol::{
             AUTHORIZATION_DECISION, AUTHORIZATION_DECISION_ADMISSION,
             AUTHORIZATION_DECISION_DOMAIN_V1, AuthorizationDecisionAdmissionV1,
@@ -3283,8 +3285,83 @@ mod tests {
         intent.identity = lease_consumption_intent_relay_evidence_v1_identity(&intent)
             .expect("consume intent identity");
         active_slot
-            .record_lease_consumption_intent(intent)
+            .record_lease_consumption_intent(intent.clone())
             .expect("durable consume intent");
+        intent
+    }
+
+    fn record_consumption_for_scoped_fixture(
+        active_slot: &mut ActiveSlot,
+    ) -> LeaseConsumptionRelayEvidenceV1 {
+        use ota_authority_protocol::{
+            LEASE_CONSUME_RESPONSE, LEASE_CONSUME_RESPONSE_DOMAIN_V1, LEASE_CONSUMPTION_ADMISSION,
+            LeaseConsumeResponsePayload, LeaseConsumeState, LeaseConsumptionAdmissionV1,
+            SignedBrokerMessage, lease_consumption_admission_v1_identity,
+            lease_consumption_relay_evidence_v1_identity, message_identity,
+        };
+        let intent = record_allowed_consumption_intent(active_slot);
+        let response = SignedBrokerMessage {
+            payload: LeaseConsumeResponsePayload {
+                message_kind: LEASE_CONSUME_RESPONSE.into(),
+                consume_request_identity: intent.consume_request_identity.clone(),
+                binding_identity: intent.consume_request.binding_identity.clone(),
+                lease_identity: intent.prepared_lease_identity.clone(),
+                challenge_nonce_commitment: intent
+                    .consume_request
+                    .challenge_nonce_commitment
+                    .clone(),
+                work_unit_identity: intent.consume_request.work_unit_identity.clone(),
+                crossing_transaction_id: intent.consume_request.crossing_transaction_id.clone(),
+                crossing_transaction_identity: intent
+                    .consume_request
+                    .crossing_transaction_identity
+                    .clone(),
+                state: LeaseConsumeState::Consumed,
+                broker_revision: 2,
+                consumed_at: "2026-09-29T00:00:00Z".into(),
+            },
+            key_id: "fixture-key".into(),
+            algorithm: "ed25519".into(),
+            signature: "fixture-signature".into(),
+        };
+        let response_identity =
+            message_identity(LEASE_CONSUME_RESPONSE_DOMAIN_V1.as_bytes(), &response)
+                .expect("response identity");
+        let mut admission = LeaseConsumptionAdmissionV1 {
+            schema_version: 1,
+            identity: String::new(),
+            message_kind: LEASE_CONSUMPTION_ADMISSION.into(),
+            binding_identity: intent.consume_request.binding_identity.clone(),
+            prepared_lease_identity: intent.prepared_lease_identity.clone(),
+            consume_request_identity: intent.consume_request_identity.clone(),
+            consume_response_identity: response_identity.clone(),
+            work_unit_identity: intent.consume_request.work_unit_identity.clone(),
+            crossing_transaction_id: intent.consume_request.crossing_transaction_id.clone(),
+            crossing_transaction_identity: intent
+                .consume_request
+                .crossing_transaction_identity
+                .clone(),
+        };
+        admission.identity =
+            lease_consumption_admission_v1_identity(&admission).expect("admission identity");
+        let mut evidence = LeaseConsumptionRelayEvidenceV1 {
+            schema_version: 1,
+            identity: String::new(),
+            authorization_decision_relay_identity: intent.authorization_decision_relay_identity,
+            prepared_lease: intent.prepared_lease,
+            prepared_lease_identity: intent.prepared_lease_identity,
+            consume_request: intent.consume_request,
+            consume_request_identity: intent.consume_request_identity,
+            consume_response: response,
+            consume_response_identity: response_identity,
+            admission,
+        };
+        evidence.identity =
+            lease_consumption_relay_evidence_v1_identity(&evidence).expect("consumption identity");
+        active_slot
+            .record_lease_consumption(evidence.clone())
+            .expect("durable consumption");
+        evidence
     }
 
     #[test]
@@ -4193,6 +4270,38 @@ mod tests {
     #[test]
     #[ignore = "requires a root Linux host with a systemd manager that supports transient PID scopes"]
     fn root_systemd_selected_boundary_failure_reaps_exact_child_cgroup_and_active_slot() {
+        exercise_root_selected_failure(None);
+    }
+
+    #[test]
+    #[ignore = "requires root systemd, an isolated network namespace, and OTA_CORE_STS_TEST_BINARY"]
+    fn root_systemd_core_sts_refusals_reap_exact_child_cgroup_and_active_slot() {
+        let core_binary =
+            std::env::var("OTA_CORE_STS_TEST_BINARY").expect("paired Core test executable");
+        // The runner must isolate this fixture from networking before any child is created.
+        assert_ne!(
+            fs::read_link("/proc/self/ns/net").expect("test netns"),
+            fs::read_link("/proc/1/ns/net").expect("host netns")
+        );
+        for fault in [
+            "ExpiredBinding",
+            "ExpiredJwt",
+            "SubstitutedOperation",
+            "SubstitutedTransportRecord",
+            "SubstitutedJwt",
+            "TransportFailure",
+            "Redirect",
+            "DuplicateContentType",
+            "OversizedResponse",
+            "MalformedResponse",
+            "InvalidTokenType",
+        ] {
+            eprintln!("network-disabled Core STS refusal fixture case={fault}");
+            exercise_root_selected_failure(Some((&core_binary, fault)));
+        }
+    }
+
+    fn exercise_root_selected_failure(sts_fixture: Option<(&str, &str)>) {
         assert_eq!(unsafe { libc::geteuid() }, 0, "root is required");
         let temporary = tempdir().expect("temporary directory");
         let active = temporary.path().join("active");
@@ -4216,7 +4325,7 @@ mod tests {
             adapter: ota_authority_protocol::SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1.into(),
             socket_path: PathBuf::from("/run/ota/authority-launcher.sock"),
             socket_group_gid: 1001,
-            ota_binary: PathBuf::from("/bin/true"),
+            ota_binary: PathBuf::from(sts_fixture.map_or("/bin/true", |(binary, _)| binary)),
             environment: BTreeMap::from([(String::from("PATH"), String::from("/usr/bin"))]),
             allowed_repository_roots: vec![temporary.path().into()],
             mappings: vec![crate::config::SystemdPrincipalMappingV1 {
@@ -4249,10 +4358,20 @@ mod tests {
             message_kind: ota_authority_protocol::LAUNCHER_INVOCATION_REQUEST.into(),
             protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
             authority_id: String::from("secret-delivery"),
-            ota_arguments: vec![String::from("run"), String::from("governed")],
+            ota_arguments: if sts_fixture.is_some() {
+                vec![
+                    "--exact".into(),
+                    "broker_session::tests::google_sts_refusal_scoped_child_completion".into(),
+                    "--ignored".into(),
+                    "--nocapture".into(),
+                    "--test-threads=1".into(),
+                ]
+            } else {
+                vec![String::from("run"), String::from("governed")]
+            },
             repository_path: repository_path.to_string_lossy().into_owned(),
         };
-        let executable = std::fs::File::open("/bin/true").expect("test executable");
+        let executable = std::fs::File::open(&config.ota_binary).expect("test executable");
         let scope_manager = SystemdScopeManager::connect().expect("systemd manager");
         let request_identity =
             launcher_invocation_request_identity(&request).expect("launcher request identity");
@@ -4278,7 +4397,7 @@ mod tests {
             working_directory.clone(),
         )
         .expect("active slot");
-        let child = prepare_stopped_child(
+        let mut child = prepare_stopped_child(
             &config,
             &executable,
             &repository,
@@ -4307,21 +4426,118 @@ mod tests {
             .record_scope(scope.clone())
             .expect("record selected scope");
         let child_record = child.record.clone();
+        let (mut client, mut output) = UnixStream::pair().expect("client output pair");
+        let output_thread = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut output, &mut bytes).expect("output drain");
+            bytes
+        });
+        let connected_boundary = sts_fixture.map(|(_, fault)| {
+            let consumption = record_consumption_for_scoped_fixture(&mut active_slot);
+            let mut posture = ota_authority_protocol::OtaProcessPostureV1 {
+                schema_version: 1,
+                identity: String::new(),
+                message_kind: ota_authority_protocol::OTA_PROCESS_POSTURE.into(),
+                pid: child_record.pid,
+                process_start_time_identity: child_record.process_start_time_identity.clone(),
+                ota_binary_identity: child_record.ota_binary_identity.clone(),
+                no_new_privs: true,
+                dumpable: 0,
+                ptracer_clear_applied: true,
+                principal_mapping_identity: principal_mapping.identity.clone(),
+            };
+            posture.identity = ota_authority_protocol::ota_process_posture_identity(&posture)
+                .expect("posture identity");
+            let mut startup = ota_authority_protocol::LauncherStartupContinuationV1 {
+                schema_version: 1,
+                identity: String::new(),
+                message_kind: ota_authority_protocol::LAUNCHER_STARTUP_CONTINUATION.into(),
+                invocation_id: invocation_id.into(),
+                launcher_request_identity: request_identity.clone(),
+                child_process_identity: child_record.identity.clone(),
+                working_directory_identity: working_directory.identity.clone(),
+                process_posture_identity: posture.identity.clone(),
+                principal_mapping_identity: principal_mapping.identity.clone(),
+            };
+            startup.identity =
+                ota_authority_protocol::launcher_startup_continuation_identity(&startup)
+                    .expect("startup identity");
+            child
+                .send_scoped_fixture_inputs(&(
+                    startup.clone(),
+                    consumption.admission.clone(),
+                    fault,
+                ))
+                .expect("private child fixture inputs");
+            (consumption, posture, startup)
+        });
         assert_eq!(
             unsafe { libc::kill(child_record.pid as i32, libc::SIGCONT) },
             0
         );
 
-        assert!(matches!(
-            cleanup_failed_selected_boundary(
-                &config,
+        if let Some((consumption, process_posture, startup_continuation)) = connected_boundary {
+            let installation = ProtectedInstallationManifestV1 {
+                schema_version: 1,
+                identity: identity('a'),
+                launcher_configuration_identity: identity('b'),
+                launcher_profile_identity: identity('c'),
+                job_principal_profile_identity: identity('d'),
+                files: vec![],
+            };
+            let boot_file = File::open("/proc/sys/kernel/random/boot_id").expect("boot descriptor");
+            let peer = ota_authority_launcher::linux_observations::observe_connected_peer(&client)
+                .expect("client peer");
+            let boundary = SelectedBoundary {
                 child,
-                scope.clone(),
+                scope: scope.clone(),
                 active_slot,
-                SystemdServiceError::SelectedExecutionFailed,
-            ),
-            Ok(SystemdServiceError::SelectedExecutionFailed)
-        ));
+                consumption,
+                startup_continuation,
+                principal_mapping,
+                process_posture,
+            };
+            assert!(
+                matches!(
+                    execute_selected_boundary(
+                        SelectedBoundaryExecutionContext {
+                            config: &config,
+                            installation: &installation,
+                            launcher_executable: Path::new("/bin/true"),
+                            boot_file: &boot_file,
+                            peer: &peer,
+                            mapping: &config.mappings[0],
+                            launcher_request: &request,
+                            #[cfg(feature = "protected-attestor")]
+                            protected_authority_stores: None,
+                            #[cfg(feature = "protected-attestor")]
+                            authority_snapshot_replay: None,
+                        },
+                        &mut client,
+                        invocation_id,
+                        &repository,
+                        boundary
+                    ),
+                    Err(SystemdServiceError::FinalizationUnavailable)
+                ),
+                "real Core refusal must persist, reconcile its exit, and take the production missing-archive failure path"
+            );
+        } else {
+            assert!(matches!(
+                cleanup_failed_selected_boundary(
+                    &config,
+                    child,
+                    scope.clone(),
+                    active_slot,
+                    SystemdServiceError::SelectedExecutionFailed,
+                ),
+                Ok(SystemdServiceError::SelectedExecutionFailed)
+            ));
+        }
+        drop(client);
+        let output_bytes = output_thread.join().expect("drained output");
+        assert!(!String::from_utf8_lossy(&output_bytes).contains("synthetic-federated-token"));
+        assert!(!repository_path.join("selected-work-executed").exists());
 
         assert!(!PathBuf::from(format!("/proc/{}", child_record.pid)).exists());
         assert!(

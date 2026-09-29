@@ -1036,6 +1036,14 @@ impl PreparedChild {
     }
 
     #[cfg(test)]
+    pub(crate) fn send_scoped_fixture_inputs<T: Serialize>(
+        &mut self,
+        inputs: &T,
+    ) -> Result<(), PreparedChildError> {
+        write_json_frame_blocking(&mut self.launcher_session, inputs)
+    }
+
+    #[cfg(test)]
     pub(crate) fn abandon_for_recovery(mut self) {
         self.pid = 0;
     }
