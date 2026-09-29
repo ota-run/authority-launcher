@@ -1482,30 +1482,17 @@ fn fail_selected_boundary(
     config: &SystemdLauncherServiceConfigV1,
     stream: &mut UnixStream,
     invocation_id: &str,
-    mut boundary: SelectedBoundary,
+    boundary: SelectedBoundary,
     error: SystemdServiceError,
 ) -> Result<u8, SystemdServiceError> {
-    let scope_cleanup = SystemdScopeManager::connect()
-        .map_err(map_systemd_scope_error)
-        .and_then(|manager| {
-            manager
-                .stop_and_confirm_empty(
-                    &boundary.scope,
-                    &boundary.child.record,
-                    Duration::from_secs(config.maximum_terminal_wait_seconds),
-                )
-                .map_err(map_systemd_scope_error)
-        });
-    let child_cleanup = boundary
-        .child
-        .terminate_and_reap()
-        .map_err(map_prepared_child_error);
-    if scope_cleanup.is_ok() && child_cleanup.is_ok() {
-        boundary
-            .active_slot
-            .finalize()
-            .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
-    }
+    let SelectedBoundary {
+        child,
+        scope,
+        active_slot,
+        ..
+    } = boundary;
+    let terminal_error =
+        cleanup_failed_selected_boundary(config, child, scope, active_slot, error)?;
     write_terminal(
         stream,
         invocation_id,
@@ -1514,7 +1501,34 @@ fn fail_selected_boundary(
         Some(LauncherTerminalStageV1::BoundaryFailed),
         None,
     )?;
-    Err(if scope_cleanup.is_err() {
+    Err(terminal_error)
+}
+
+fn cleanup_failed_selected_boundary(
+    config: &SystemdLauncherServiceConfigV1,
+    mut child: PreparedChild,
+    scope: ota_authority_protocol::LauncherSystemdScopeV1,
+    active_slot: ActiveSlot,
+    error: SystemdServiceError,
+) -> Result<SystemdServiceError, SystemdServiceError> {
+    let scope_cleanup = SystemdScopeManager::connect()
+        .map_err(map_systemd_scope_error)
+        .and_then(|manager| {
+            manager
+                .stop_and_confirm_empty(
+                    &scope,
+                    &child.record,
+                    Duration::from_secs(config.maximum_terminal_wait_seconds),
+                )
+                .map_err(map_systemd_scope_error)
+        });
+    let child_cleanup = child.terminate_and_reap().map_err(map_prepared_child_error);
+    if scope_cleanup.is_ok() && child_cleanup.is_ok() {
+        active_slot
+            .finalize()
+            .map_err(|_| SystemdServiceError::ChildCleanupFailed)?;
+    }
+    Ok(if scope_cleanup.is_err() {
         SystemdServiceError::ScopeCleanupFailed
     } else if child_cleanup.is_err() {
         SystemdServiceError::ChildCleanupFailed
@@ -4174,5 +4188,146 @@ mod tests {
             .expect("retained slot")
             .finalize()
             .expect("test cleanup");
+    }
+
+    #[test]
+    #[ignore = "requires a root Linux host with a systemd manager that supports transient PID scopes"]
+    fn root_systemd_selected_boundary_failure_reaps_exact_child_cgroup_and_active_slot() {
+        assert_eq!(unsafe { libc::geteuid() }, 0, "root is required");
+        let temporary = tempdir().expect("temporary directory");
+        let active = temporary.path().join("active");
+        let repository_path = temporary.path().join("repository");
+        fs::create_dir(&active).expect("active directory");
+        fs::create_dir(&repository_path).expect("repository directory");
+        fs::set_permissions(&active, fs::Permissions::from_mode(0o700))
+            .expect("active permissions");
+        let repository_file = std::fs::File::open(&repository_path).expect("repository descriptor");
+        let repository_metadata = repository_file.metadata().expect("repository metadata");
+        let repository = crate::target_directory::OpenedRepositoryDirectory {
+            descriptor: repository_file.into(),
+            device: repository_metadata.dev(),
+            inode: repository_metadata.ino(),
+            owner_uid: repository_metadata.uid(),
+        };
+        let identity = |character: char| format!("sha256:{}", character.to_string().repeat(64));
+        let config = SystemdLauncherServiceConfigV1 {
+            schema_version: 1,
+            identity: identity('a'),
+            adapter: ota_authority_protocol::SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1.into(),
+            socket_path: PathBuf::from("/run/ota/authority-launcher.sock"),
+            socket_group_gid: 1001,
+            ota_binary: PathBuf::from("/bin/true"),
+            environment: BTreeMap::from([(String::from("PATH"), String::from("/usr/bin"))]),
+            allowed_repository_roots: vec![temporary.path().into()],
+            mappings: vec![crate::config::SystemdPrincipalMappingV1 {
+                authority_id: String::from("secret-delivery"),
+                job_peer: SessionPeer {
+                    uid: 1001,
+                    gid: 1001,
+                },
+                execution: crate::config::RunAs {
+                    uid: 65_534,
+                    gid: 65_534,
+                },
+                closed_profile: None,
+            }],
+            broker_proxy_socket: PathBuf::from("/run/ota/broker-proxy.sock"),
+            broker_proxy_peer: SessionPeer { uid: 0, gid: 0 },
+            service_unit_identity: identity('b'),
+            socket_unit_identity: identity('c'),
+            ota_binary_identity: identity('d'),
+            broker_proxy_identity: identity('e'),
+            broker_proxy_executable_identity: identity('1'),
+            attestor_key_set_identity: identity('f'),
+            attestation_claims: None,
+            maximum_request_bytes: 4096,
+            maximum_active_sessions: 1,
+            maximum_startup_seconds: 5,
+            maximum_terminal_wait_seconds: 30,
+        };
+        let request = LauncherInvocationRequestV1 {
+            message_kind: ota_authority_protocol::LAUNCHER_INVOCATION_REQUEST.into(),
+            protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
+            authority_id: String::from("secret-delivery"),
+            ota_arguments: vec![String::from("run"), String::from("governed")],
+            repository_path: repository_path.to_string_lossy().into_owned(),
+        };
+        let executable = std::fs::File::open("/bin/true").expect("test executable");
+        let scope_manager = SystemdScopeManager::connect().expect("systemd manager");
+        let request_identity =
+            launcher_invocation_request_identity(&request).expect("launcher request identity");
+        let principal_mapping =
+            systemd_principal_mapping(&config, &config.mappings[0]).expect("principal mapping");
+        let mut working_directory = LauncherWorkingDirectoryV1 {
+            schema_version: 1,
+            identity: String::new(),
+            logical_path: request.repository_path.clone(),
+            device: repository.device,
+            inode: repository.inode,
+        };
+        working_directory.identity = launcher_working_directory_identity(&working_directory)
+            .expect("working-directory identity");
+        let invocation_id = "invocation-secret-delivery-selected-failure";
+        let mut active_slot = ActiveSlot::begin(
+            &active,
+            0,
+            temporary.path(),
+            invocation_id,
+            principal_mapping.identity.as_str(),
+            request_identity.as_str(),
+            working_directory.clone(),
+        )
+        .expect("active slot");
+        let child = prepare_stopped_child(
+            &config,
+            &executable,
+            &repository,
+            &config.mappings[0].execution,
+            &PreparedChildBinding {
+                invocation_id,
+                request_identity: request_identity.as_str(),
+                principal_mapping_identity: principal_mapping.identity.as_str(),
+                working_directory_identity: working_directory.identity.as_str(),
+            },
+            request.ota_arguments.as_slice(),
+        )
+        .expect("stopped selected child");
+        active_slot
+            .record_child(child.record.clone())
+            .expect("record selected child");
+        let scope = scope_manager
+            .attach_stopped_child(
+                invocation_id,
+                request_identity.as_str(),
+                &child.record,
+                Duration::from_secs(5),
+            )
+            .expect("selected child scope");
+        active_slot
+            .record_scope(scope.clone())
+            .expect("record selected scope");
+        let child_record = child.record.clone();
+        assert_eq!(
+            unsafe { libc::kill(child_record.pid as i32, libc::SIGCONT) },
+            0
+        );
+
+        assert!(matches!(
+            cleanup_failed_selected_boundary(
+                &config,
+                child,
+                scope.clone(),
+                active_slot,
+                SystemdServiceError::SelectedExecutionFailed,
+            ),
+            Ok(SystemdServiceError::SelectedExecutionFailed)
+        ));
+
+        assert!(!PathBuf::from(format!("/proc/{}", child_record.pid)).exists());
+        assert!(
+            scope_manager.scope_is_terminal_for_test(&scope),
+            "selected failure cleanup must leave the exact scope absent and cgroup empty"
+        );
+        assert_eq!(fs::read_dir(&active).expect("active directory").count(), 0);
     }
 }

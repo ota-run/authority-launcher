@@ -310,6 +310,11 @@ impl SystemdScopeManager {
         ) && cgroup_is_empty_or_absent(expected_control_group)
     }
 
+    #[cfg(test)]
+    pub(crate) fn scope_is_terminal_for_test(&self, expected: &LauncherSystemdScopeV1) -> bool {
+        self.scope_is_terminal(expected.unit_name.as_str(), expected.control_group.as_str())
+    }
+
     fn observe_scope(
         &self,
         invocation_id: &str,
