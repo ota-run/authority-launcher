@@ -4284,6 +4284,7 @@ mod tests {
             fs::read_link("/proc/1/ns/net").expect("host netns")
         );
         for fault in [
+            "None",
             "ExpiredBinding",
             "ExpiredJwt",
             "SubstitutedOperation",
@@ -4295,6 +4296,8 @@ mod tests {
             "OversizedResponse",
             "MalformedResponse",
             "InvalidTokenType",
+            "ResponseExpired",
+            "ResponseJwtExpired",
         ] {
             eprintln!("network-disabled Core STS refusal fixture case={fault}");
             exercise_root_selected_failure(Some((&core_binary, fault)));
