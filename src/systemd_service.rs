@@ -4300,11 +4300,87 @@ mod tests {
             "ResponseJwtExpired",
         ] {
             eprintln!("network-disabled Core STS refusal fixture case={fault}");
-            exercise_root_selected_failure(Some((&core_binary, fault)));
+            exercise_root_selected_failure(Some((
+                &core_binary,
+                fault,
+                "broker_session::tests::google_sts_refusal_scoped_child_completion",
+            )));
         }
     }
 
-    fn exercise_root_selected_failure(sts_fixture: Option<(&str, &str)>) {
+    #[test]
+    #[ignore = "requires root systemd, an isolated network namespace, and OTA_CORE_IAM_TEST_BINARY"]
+    fn root_systemd_core_iam_refusals_reap_exact_child_cgroup_and_active_slot() {
+        let core_binary =
+            std::env::var("OTA_CORE_IAM_TEST_BINARY").expect("paired Core test executable");
+        assert_ne!(
+            fs::read_link("/proc/self/ns/net").expect("test netns"),
+            fs::read_link("/proc/1/ns/net").expect("host netns")
+        );
+        for fault in [
+            "None",
+            "RealClock",
+            "Fraction0",
+            "Fraction6",
+            "Fraction9",
+            "SubstitutedAccount",
+            "SubstitutedSession",
+            "SubstitutedGraph",
+            "SubstitutedRecord",
+            "ExpiredBinding",
+            "ExpiredJwt",
+            "ExpiredSts",
+            "TransactionExpired",
+            "MonotonicExpired",
+            "ClockBackward",
+            "MonotonicBackward",
+            "ClockFailure",
+            "ClockOverflow",
+            "StsResponseDelayed",
+            "TransportFailure",
+            "Redirect",
+            "DuplicateContentType",
+            "MissingContentType",
+            "BadContentType",
+            "OversizedHead",
+            "OversizedResponse",
+            "TruncatedResponse",
+            "ExtraField",
+            "DuplicateField",
+            "EmptyToken",
+            "OversizedToken",
+            "InvalidTimestamp",
+            "ExpiredToken",
+            "ExcessLifetime",
+            "InvalidFraction",
+            "FractionBeyondLimit",
+            "ReadFailure",
+            "ResponseBindingExpired",
+            "ResponseJwtExpired",
+            "ResponseStsExpired",
+            "ResponseTransactionExpired",
+            "ResponseClockBackward",
+            "PostParseExpired",
+            "PostParseTokenExpired",
+            "ValidationBindingExpired",
+            "ValidationJwtExpired",
+            "ValidationStsExpired",
+            "ValidationTransactionExpired",
+            "ValidationClockFailure",
+            "StsValidationBindingExpired",
+            "StsValidationJwtExpired",
+            "StsValidationTransactionExpired",
+        ] {
+            eprintln!("network-disabled Core IAM refusal fixture case={fault}");
+            exercise_root_selected_failure(Some((
+                &core_binary,
+                fault,
+                "broker_session::tests::google_iam_refusal_scoped_child_completion",
+            )));
+        }
+    }
+
+    fn exercise_root_selected_failure(provider_fixture: Option<(&str, &str, &str)>) {
         assert_eq!(unsafe { libc::geteuid() }, 0, "root is required");
         let temporary = tempdir().expect("temporary directory");
         let active = temporary.path().join("active");
@@ -4328,7 +4404,9 @@ mod tests {
             adapter: ota_authority_protocol::SYSTEMD_PROTECTED_LAUNCHER_ADAPTER_V1.into(),
             socket_path: PathBuf::from("/run/ota/authority-launcher.sock"),
             socket_group_gid: 1001,
-            ota_binary: PathBuf::from(sts_fixture.map_or("/bin/true", |(binary, _)| binary)),
+            ota_binary: PathBuf::from(
+                provider_fixture.map_or("/bin/true", |(binary, _, _)| binary),
+            ),
             environment: BTreeMap::from([(String::from("PATH"), String::from("/usr/bin"))]),
             allowed_repository_roots: vec![temporary.path().into()],
             mappings: vec![crate::config::SystemdPrincipalMappingV1 {
@@ -4361,10 +4439,10 @@ mod tests {
             message_kind: ota_authority_protocol::LAUNCHER_INVOCATION_REQUEST.into(),
             protocol_version: SYSTEMD_LAUNCHER_SERVICE_PROTOCOL_V1.into(),
             authority_id: String::from("secret-delivery"),
-            ota_arguments: if sts_fixture.is_some() {
+            ota_arguments: if let Some((_, _, entrypoint)) = provider_fixture {
                 vec![
                     "--exact".into(),
-                    "broker_session::tests::google_sts_refusal_scoped_child_completion".into(),
+                    entrypoint.into(),
                     "--ignored".into(),
                     "--nocapture".into(),
                     "--test-threads=1".into(),
@@ -4435,7 +4513,7 @@ mod tests {
             std::io::Read::read_to_end(&mut output, &mut bytes).expect("output drain");
             bytes
         });
-        let connected_boundary = sts_fixture.map(|(_, fault)| {
+        let connected_boundary = provider_fixture.map(|(_, fault, _)| {
             let consumption = record_consumption_for_scoped_fixture(&mut active_slot);
             let mut posture = ota_authority_protocol::OtaProcessPostureV1 {
                 schema_version: 1,
@@ -4540,6 +4618,7 @@ mod tests {
         drop(client);
         let output_bytes = output_thread.join().expect("drained output");
         assert!(!String::from_utf8_lossy(&output_bytes).contains("synthetic-federated-token"));
+        assert!(!String::from_utf8_lossy(&output_bytes).contains("synthetic-iam-token"));
         assert!(!repository_path.join("selected-work-executed").exists());
 
         assert!(!PathBuf::from(format!("/proc/{}", child_record.pid)).exists());
