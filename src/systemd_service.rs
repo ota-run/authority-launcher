@@ -4370,6 +4370,12 @@ mod tests {
             "StsValidationBindingExpired",
             "StsValidationJwtExpired",
             "StsValidationTransactionExpired",
+            "StsSendPreparationExpired",
+            "StsSendClockFailure",
+            "IamSendPreparationExpired",
+            "IamSendClockFailure",
+            "StsSendPreparationReady",
+            "IamSendPreparationReady",
         ] {
             eprintln!("network-disabled Core IAM refusal fixture case={fault}");
             exercise_root_selected_failure(Some((
